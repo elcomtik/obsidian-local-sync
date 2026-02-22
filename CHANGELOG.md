@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.0.4 — 2026-02-22
+
+### Fixed
+
+- **`src/engine.ts` — history cursor reset on every startup**: `ensureHistoryCursorRow`
+  called `evolu.upsert("_historyCursor", { id, lastTimestamp: null })` on every
+  plugin load. In Evolu's CRDT model this is an explicit write with a current
+  wall-clock timestamp, so it always won over the previously saved cursor value
+  and reset it to null — causing the full `evolu_history` to be replayed from
+  scratch on every session. Fixed by omitting `lastTimestamp` from the upsert so
+  the existing value is preserved on subsequent startups.
+
+- **`src/engine.ts` — self-echo on every poll**: `pollHistoryOnce` previously
+  fetched and re-applied every `fileUpdate` row including those written by this
+  device in the current session. An in-memory `outgoingIds` set now tracks IDs
+  inserted by `flushOutgoingUpdates`; rows found in the set are skipped
+  immediately in `applyFileUpdateRowById`, eliminating redundant `Y.applyUpdate`
+  calls and vault write-backs for our own updates.
+
+- **`src/engine.ts` — N snapshot writes per poll batch**: `applyFileUpdateRowById`
+  previously called `saveLocalSnapshot` after every individual update row,
+  meaning a file that received 100 updates in one poll batch triggered 100 full
+  `Y.encodeStateAsUpdate` + upsert cycles. Snapshot writes are now deferred to
+  the end of the poll loop in `pollHistoryOnce`, saving at most one snapshot per
+  touched file per batch.
+
+### Added
+
+- **`src/main.ts` — relay URL setting with validation**: A new "Relay URL" text
+  field under the "Sync" section lets users configure the WebSocket relay
+  endpoint at runtime. Input is validated to require a `wss://` or `ws://`
+  scheme prefix; invalid values are rejected with a `Notice` and the setting is
+  not saved.
+
 ## 0.0.3 — 2026-02-22
 
 ### Fixed

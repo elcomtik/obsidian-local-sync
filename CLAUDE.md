@@ -69,10 +69,45 @@ Vault file change
 
 **Text files only:** `isTextFile` accepts `.md` and `.txt` only.
 
-### Known issues (from prior analysis)
+### Known issues tracker
 
-- `getOrLoadFileState` reads the vault file twice when bootstrapping from disk (no snapshot); `lastVaultText` should reuse the first read.
-- `stop()` uses `void this.closeDoc(p)` — async flush/snapshot on unload is fire-and-forget and may not complete.
-- `deviceId` in `DEFAULT_SETTINGS` is generated at module load time from `Math.random()`; it is only persisted when `saveSettings()` is called, so it can change across reloads before any setting is saved.
-- `evolu` in `main.ts` is typed `any`; the engine's `Evolu<Database>` typing is correct.
-- Own `fileUpdate` rows are processed on every poll (idempotent via Yjs, but wasteful).
+Legend: ✅ resolved · ⚠ open
+
+#### Bugs
+
+| ID | File | Description | Status |
+|----|------|-------------|--------|
+| BUG-1 | `engine.ts:397` | `getOrLoadFileState` read vault twice on bootstrap (no snapshot path); `lastVaultText` could diverge from Yjs state, producing a spurious diff. | ✅ 0.0.3 |
+| BUG-2 | `main.ts:175` | `deviceId` generated at module-load time was only persisted when a setting was manually changed; reloading before any setting change produced a new ID. | ✅ 0.0.3 |
+| BUG-3 | `engine.ts:149` | `stop()` was synchronous; `closeDoc` calls were fire-and-forget (`void`), so flush and snapshot writes could be lost on plugin unload. | ✅ 0.0.3 |
+| BUG-4 | `engine.ts` | `ensureHistoryCursorRow` upserted `lastTimestamp: null` on every startup — an explicit CRDT write that always beat the persisted value, resetting the cursor and causing full history replay every session. | ✅ 0.0.4 |
+
+#### Architecture
+
+| ID | File | Description | Status |
+|----|------|-------------|--------|
+| ARCH-1 | `engine.ts` | Self-echo: own `fileUpdate` rows are fetched on every poll and re-applied via Yjs (idempotent) then snapshot is saved again — wasted work on every local write. | ✅ 0.0.4 |
+| ARCH-2 | `engine.ts:260` | N+1 query: each history row triggers a separate `applyFileUpdateRowById` query. Up to `historyBatchSize` (default 500) individual DB queries per poll. A join query would collapse this to 1. | ⚠ open |
+| ARCH-3 | `engine.ts` | Snapshot written after every remote update applied. A file receiving 100 updates in one batch triggers 100 full `Y.encodeStateAsUpdate` writes; should defer to end-of-batch. | ✅ 0.0.4 |
+| ARCH-4 | `engine.ts` | No `rename` or `delete` vault event handlers. Renaming a file leaves the old path's Yjs doc alive until LRU evicts it; the new path starts with a fresh doc. Acknowledged in roadmap. | ⚠ open |
+
+#### Quality
+
+| ID | File | Description | Status |
+|----|------|-------------|--------|
+| QUAL-1 | `main.ts:59` | `evolu: any` in the plugin class — all Evolu API calls in `main.ts` (`.appOwner`, `.subscribeError`, `.restoreAppOwner`, `.resetAppOwner`) are unchecked. Engine correctly types it as `Evolu<Database>`. | ⚠ open |
+| QUAL-2 | `engine.ts:276` | `applyFileUpdateRowById(fileUpdateId: any)` — parameter typed `any` instead of the appropriate Evolu ID type. | ⚠ open |
+
+#### Performance
+
+| ID | File | Description | Status |
+|----|------|-------------|--------|
+| PERF-1 | `engine.ts:34` | `toBase64` built binary string one character at a time — call-stack overflow risk on large snapshots, slower than chunked spread. | ✅ 0.0.3 |
+| PERF-2 | `engine.ts:319` | LRU eviction is O(n) scan per eviction. Negligible at `maxOpenDocs=50` but would matter if the limit is raised significantly. | ⚠ open (low) |
+
+#### Security / UX
+
+| ID | File | Description | Status |
+|----|------|-------------|--------|
+| SEC-1 | `main.ts:291` | Mnemonic shown in ephemeral Notice toast — no copy button, visible to bystanders. | ✅ 0.0.2 |
+| SEC-2 | `main.ts` | `relayUrl` setting accepts any string with no `wss:`/`ws:` scheme validation; malformed URL causes a failed connection with no user-facing error. | ✅ 0.0.4 |

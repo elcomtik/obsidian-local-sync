@@ -57,6 +57,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
 
   // Evolu types are complex; we keep "any" to avoid fighting TS in this example.
   evolu: any;
+  closeEvoluDb: (() => void) | null = null;
   engine!: YjsEvoluHistoryEngine;
 
   async onload() {
@@ -86,11 +87,13 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       "plugins",
       this.manifest.id,
     );
-    this.evolu = createEvoluClient(
+    const { evolu, closeDb } = createEvoluClient(
       this.settings.appName,
       this.settings.relayUrl,
       dataDir,
     );
+    this.evolu = evolu;
+    this.closeEvoluDb = closeDb;
 
     if (this.settings.logLevel !== "off") {
       console.log("[obsidian-local-sync] INFO: Evolu client created", {
@@ -170,6 +173,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
 
   onunload() {
     void this.engine?.stop();
+    this.closeEvoluDb?.();
   }
 
   async loadSettings() {
@@ -226,6 +230,29 @@ class LocalSyncSettingTab extends PluginSettingTab {
           new Notice(`Log level set to ${value}`);
         });
       });
+
+    // ----------------------------
+    // Sync
+    // ----------------------------
+    containerEl.createEl("h3", { text: "Sync" });
+
+    new Setting(containerEl)
+      .setName("Relay URL")
+      .setDesc("WebSocket relay endpoint. Changes take effect after reloading Obsidian.")
+      .addText((text) =>
+        text
+          .setPlaceholder("wss://free.evoluhq.com")
+          .setValue(this.plugin.settings.relayUrl)
+          .onChange(async (value) => {
+            const trimmed = value.trim();
+            if (!trimmed.startsWith("wss://") && !trimmed.startsWith("ws://")) {
+              new Notice("Relay URL must start with wss:// or ws://");
+              return;
+            }
+            this.plugin.settings.relayUrl = trimmed;
+            await this.plugin.saveSettings();
+          }),
+      );
 
     // ----------------------------
     // Performance

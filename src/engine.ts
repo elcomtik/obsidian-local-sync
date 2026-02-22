@@ -22,15 +22,27 @@ const levelRank: Record<LogLevel, number> = {
   info: 3,
 };
 
+/**
+ * Runtime configuration for {@link YjsEvoluHistoryEngine}.
+ * All values are hot-swappable via {@link YjsEvoluHistoryEngine.updateConfig}.
+ */
 export type EngineConfig = {
-  historyPollMs: number;      // how often we poll evolu_history
-  historyBatchSize: number;   // max history rows per poll
-  outgoingBatchMs: number;    // min time between sending updates
-  maxOpenDocs: number;        // LRU limit
+  /** Milliseconds between `evolu_history` polls for remote changes. */
+  historyPollMs: number;
+  /** Maximum `evolu_history` rows consumed per poll cycle. */
+  historyBatchSize: number;
+  /** Debounce window (ms) before flushing accumulated Yjs updates to Evolu. */
+  outgoingBatchMs: number;
+  /** Maximum simultaneously open Yjs docs; least-recently-used are evicted above this limit. */
+  maxOpenDocs: number;
 };
 
 const dmp = new DiffMatchPatch();
 
+/**
+ * Encodes a `Uint8Array` to a base64 string.
+ * Uses chunked `String.fromCharCode` to avoid call-stack overflow on large arrays.
+ */
 function toBase64(bytes: Uint8Array): string {
   let bin = "";
   const chunk = 8192;
@@ -40,6 +52,7 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(bin);
 }
 
+/** Decodes a base64 string back to a `Uint8Array`. */
 function fromBase64(b64: string): Uint8Array {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -90,6 +103,28 @@ type FileState = {
   lastUsedMs: number;
 };
 
+/**
+ * Core sync engine for obsidian-local-sync.
+ *
+ * Bridges an Obsidian Vault with Evolu's local-first database using Yjs CRDTs
+ * as the source of truth for each tracked file.
+ *
+ * **Outgoing path** (vault → Evolu):
+ * Vault modify events are diffed against the last known text, applied as Yjs
+ * ops inside a transaction, then batched and flushed as `fileUpdate` rows.
+ *
+ * **Incoming path** (Evolu → vault):
+ * A recurring poll reads new `evolu_history` rows since the stored cursor,
+ * applies each Yjs update to the in-memory doc, and writes the result back to
+ * the vault file.
+ *
+ * **Memory management**:
+ * Open docs are bounded by {@link EngineConfig.maxOpenDocs} using LRU eviction.
+ * Closing a doc flushes pending updates and saves a full Yjs state snapshot to
+ * the local `_fileSnapshot` table before destroying the `Y.Doc`.
+ *
+ * Only `.md` and `.txt` files are tracked.
+ */
 export class YjsEvoluHistoryEngine {
   private vault: Vault;
   private evolu: Evolu<Database>;
@@ -106,6 +141,21 @@ export class YjsEvoluHistoryEngine {
   // Only process remote history when Obsidian is active
   private isActive = true;
 
+  /**
+   * IDs of `fileUpdate` rows written by this engine instance during the current
+   * session.  Used by {@link applyFileUpdateRowById} to skip rows that we
+   * produced ourselves (self-echo suppression).  Only covers the current
+   * process lifetime; rows from previous sessions are still applied once.
+   */
+  private outgoingIds = new Set<string>();
+
+  /**
+   * @param args.vault     Obsidian Vault used for reading and writing files.
+   * @param args.evolu     Typed Evolu client bound to the plugin's {@link Database} schema.
+   * @param args.deviceId  Stable per-device identifier embedded in outgoing update row IDs.
+   * @param args.config    Initial engine configuration (hot-swappable via {@link updateConfig}).
+   * @param args.logLevel  Initial console log verbosity.
+   */
   constructor(args: {
     vault: Vault;
     evolu: Evolu<Database>;
@@ -139,6 +189,13 @@ export class YjsEvoluHistoryEngine {
 
   // ---------- lifecycle ----------
 
+  /**
+   * Initialises the engine: ensures the history cursor row exists in Evolu,
+   * starts the recurring poll timer, and runs an immediate poll to catch up on
+   * any changes received while the plugin was unloaded.
+   *
+   * Safe to call only once per engine instance.
+   */
   async start() {
     try {
       await this.ensureHistoryCursorRow();
@@ -150,6 +207,17 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
+  /**
+   * Shuts down the engine gracefully.
+   *
+   * Stops the poll timer, then for every open doc: cancels its flush timer,
+   * flushes any pending Yjs updates to Evolu, saves a full state snapshot to
+   * `_fileSnapshot`, and destroys the `Y.Doc`. All close operations run in
+   * parallel via `Promise.all` before in-memory state is cleared.
+   *
+   * Called from `ObsidianLocalSyncPlugin.onunload` via `void` — the returned
+   * promise is not awaited by the Obsidian plugin lifecycle.
+   */
   async stop() {
     try {
       this.stopPollingTimer();
@@ -162,6 +230,13 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
+  /**
+   * Hot-swaps the engine configuration without requiring a restart.
+   *
+   * Resets the poll timer to the new interval and enforces the updated LRU
+   * limit immediately, evicting docs if the new `maxOpenDocs` is smaller than
+   * the current open count.
+   */
   async updateConfig(newConfig: EngineConfig) {
     try {
       this.config = newConfig;
@@ -174,17 +249,32 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
+  /** Changes the console log verbosity at runtime. Takes effect immediately. */
   setLogLevel(level: LogLevel) {
     this.logLevel = level;
     this.logInfo("Log level set", level);
   }
 
+  /**
+   * Resumes remote-history polling.
+   *
+   * Called when the Obsidian window regains focus (`window focus` or
+   * `visibilitychange` → visible). Triggers an immediate poll to catch up on
+   * changes received while the engine was inactive.
+   */
   async setActive() {
     this.isActive = true;
     this.logInfo("App active");
     await this.pollHistoryOnce();
   }
 
+  /**
+   * Pauses remote-history polling.
+   *
+   * Called when the Obsidian window loses focus (`window blur` or
+   * `visibilitychange` → hidden). The recurring timer keeps running but each
+   * tick is a no-op while `isActive` is false.
+   */
   setInactive() {
     this.isActive = false;
     this.logInfo("App inactive");
@@ -192,6 +282,22 @@ export class YjsEvoluHistoryEngine {
 
   // ---------- vault -> yjs ----------
 
+  /**
+   * Handles a vault `"modify"` event for a text file.
+   *
+   * Reads the new file content, diffs it against the last known text using
+   * diff-match-patch, and applies minimal insert/delete operations to the
+   * file's `Y.Text` inside a single Yjs transaction. The `"update"` event
+   * emitted by the transaction is queued in `pendingUpdates` and a debounce
+   * flush is scheduled.
+   *
+   * Skips one modify event after each remote write-back (via
+   * `ignoreNextVaultModify`) to prevent a self-echo loop.
+   *
+   * Non-text files (extensions other than `.md` / `.txt`) are silently ignored.
+   *
+   * @param file The modified vault file.
+   */
   async onVaultFileModified(file: TFile) {
     if (!this.isTextFile(file)) return;
 
@@ -260,9 +366,17 @@ export class YjsEvoluHistoryEngine {
         this.logInfo("History poll fetched rows", { count: rows.length });
       }
 
+      const touchedPaths = new Set<string>();
       for (const h of rows) {
         const id = idBytesToId(h.id as unknown as IdBytes);
-        await this.applyFileUpdateRowById(id);
+        const path = await this.applyFileUpdateRowById(id);
+        if (path !== null) touchedPaths.add(path);
+      }
+
+      // Save one snapshot per touched file rather than one per update row.
+      for (const p of touchedPaths) {
+        const st = this.states.get(p);
+        if (st) await this.saveLocalSnapshot(p, st);
       }
 
       if (rows.length > 0) {
@@ -276,7 +390,13 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
-  private async applyFileUpdateRowById(fileUpdateId: any) {
+  private async applyFileUpdateRowById(fileUpdateId: any): Promise<string | null> {
+    // Skip rows we produced ourselves — no need to re-apply our own updates.
+    if (this.outgoingIds.has(fileUpdateId)) {
+      this.logInfo("Skipped own fileUpdate row", { fileUpdateId });
+      return null;
+    }
+
     try {
       const q = this.evolu.createQuery((db) =>
         db
@@ -290,13 +410,13 @@ export class YjsEvoluHistoryEngine {
       const rows = await this.evolu.loadQuery(q);
       if (rows.length === 0) {
         this.logWarn("History referenced missing fileUpdate row", { fileUpdateId });
-        return;
+        return null;
       }
 
       const { path, updateBase64 } = rows[0];
       if (!path || !updateBase64) {
         this.logWarn("fileUpdate row missing fields", { fileUpdateId, path, hasUpdate: !!updateBase64 });
-        return;
+        return null;
       }
 
       const st = await this.getOrLoadFileState(path);
@@ -307,9 +427,10 @@ export class YjsEvoluHistoryEngine {
       this.logInfo("Applied remote update", { path });
 
       await this.writeYjsToVault(path, st);
-      await this.saveLocalSnapshot(path, st);
+      return path;
     } catch (e) {
       this.logError("applyFileUpdateRowById failed", e);
+      return null;
     }
   }
 
@@ -362,7 +483,10 @@ export class YjsEvoluHistoryEngine {
 
   private async ensureHistoryCursorRow() {
     const cursorId = createIdFromString<"HistoryCursor">("history-cursor");
-    this.evolu.upsert("_historyCursor", { id: cursorId, lastTimestamp: null });
+    // Do NOT pass lastTimestamp here — omitting it preserves any existing value.
+    // Passing `null` would be a newer CRDT write and would reset the cursor on
+    // every startup, causing the full history to be replayed each session.
+    this.evolu.upsert("_historyCursor", { id: cursorId });
   }
 
   private async loadHistoryCursor(): Promise<TimestampBytes | null> {
@@ -502,6 +626,7 @@ export class YjsEvoluHistoryEngine {
       );
 
       this.evolu.upsert("fileUpdate", { id, path, updateBase64 });
+      this.outgoingIds.add(id);
 
       this.logInfo("Sent outgoing update", { path, bytes: merged.length });
 
