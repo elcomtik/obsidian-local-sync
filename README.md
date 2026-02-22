@@ -107,6 +107,37 @@ We store incremental updates:
 fileUpdate { id, path, updateBase64 }
 ```
 
+#### Custom Platform Layer (replacing `@evolu/web`)
+
+The standard `@evolu/web` package is designed for browser environments and is
+incompatible with Obsidian's CJS plugin context. Specifically:
+
+- `import.meta.url` is unavailable in CJS — esbuild converts it to `{}`,
+  breaking WASM file resolution and Web Worker creation.
+- SharedWebWorker and OPFS (Origin Private File System) are not available in
+  Obsidian's Electron renderer.
+- The bundled SQLite WASM module (`@evolu/sqlite-wasm`) relies on dynamic
+  `import('module')` calls that fail in Obsidian.
+
+To work around this, we provide our own platform layer using only
+`@evolu/common` and `@evolu/common/local-first`:
+
+| Concern | `@evolu/web` | Our implementation |
+|---|---|---|
+| SQLite engine | WASM + OPFS (`@evolu/sqlite-wasm`) | `sql.js` (asm.js build, pure JS) |
+| DB worker | SharedWebWorker via `import.meta.url` | Main-thread `createDbWorkerForPlatform` |
+| Persistence | OPFS (browser file system) | `fs.writeFileSync` / `fs.readFileSync` to `.db` file in plugin dir |
+| WebSocket | `createWebSocket` from `@evolu/common` | Same |
+| Crypto / RNG | `createRandomBytes` from `@evolu/common` | Same |
+| App reload | `location.replace(url)` | No-op (not applicable in Obsidian) |
+
+This approach follows the same pattern as `@evolu/nodejs` (which uses
+`better-sqlite3` + `createDbWorkerForPlatform`), but substitutes `sql.js` to
+avoid native module compilation issues in Obsidian's Electron environment.
+
+E2EE is fully preserved — encryption is handled in `@evolu/common` at the
+CRDT message level, independent of the platform layer.
+
 ### 3) evolu_history (Incremental Sync)
 We poll `evolu_history` for:
 - table == "fileUpdate"

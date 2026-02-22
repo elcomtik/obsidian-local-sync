@@ -17,7 +17,13 @@ const ctx = await esbuild.context({
   target: "es2020",
   outfile: path.join(outdir, "main.js"),
   external: ["obsidian", "electron"],
-  sourcemap: true
+  sourcemap: true,
+  banner: {
+    js: 'var __yjsFlag = globalThis["__ $YJS$ __"]; delete globalThis["__ $YJS$ __"];',
+  },
+  footer: {
+    js: 'if (__yjsFlag !== undefined) globalThis["__ $YJS$ __"] = __yjsFlag;',
+  }
 });
 
 if (watch) {

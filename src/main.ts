@@ -1,12 +1,14 @@
 
 import {
   App,
+  FileSystemAdapter,
   Notice,
   Plugin,
   PluginSettingTab,
   Setting,
   TFile,
 } from "obsidian";
+import path from "node:path";
 
 import { createEvoluClient } from "./evoluClient";
 import {
@@ -61,9 +63,34 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     await this.loadSettings();
 
     // ----------------------------
+    // Settings UI
+    // ----------------------------
+    this.addSettingTab(new LocalSyncSettingTab(this.app, this));
+
+    try {
+      await this.startEngine();
+    } catch (e) {
+      console.error("[obsidian-local-sync] ERROR: Failed to start engine", e);
+      new Notice("LocalSync: failed to start — check console for details");
+    }
+  }
+
+  private async startEngine() {
+    // ----------------------------
     // Create Evolu client
     // ----------------------------
-    this.evolu = createEvoluClient(this.settings.appName, this.settings.relayUrl);
+    const adapter = this.app.vault.adapter as FileSystemAdapter;
+    const dataDir = path.join(
+      adapter.getBasePath(),
+      this.app.vault.configDir,
+      "plugins",
+      this.manifest.id,
+    );
+    this.evolu = createEvoluClient(
+      this.settings.appName,
+      this.settings.relayUrl,
+      dataDir,
+    );
 
     if (this.settings.logLevel !== "off") {
       console.log("[obsidian-local-sync] INFO: Evolu client created", {
@@ -88,16 +115,12 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     }
 
     // ----------------------------
-    // Log Evolu connection status (non-spammy)
+    // Subscribe to Evolu errors
     // ----------------------------
-    let lastConnectionState: string | null = null;
-    this.evolu.subscribe((state: any) => {
-      const current = state.sync?.status ?? "unknown";
-      if (current !== lastConnectionState) {
-        lastConnectionState = current;
-        if (this.settings.logLevel !== "off") {
-          console.log("[obsidian-local-sync] INFO: Evolu connection state:", current);
-        }
+    this.evolu.subscribeError(() => {
+      const error = this.evolu.getError();
+      if (error) {
+        console.error("[obsidian-local-sync] ERROR: Evolu error:", error);
       }
     });
 
@@ -143,11 +166,6 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
         this.engine.setInactive();
       }
     });
-
-    // ----------------------------
-    // Settings UI
-    // ----------------------------
-    this.addSettingTab(new LocalSyncSettingTab(this.app, this));
   }
 
   onunload() {
@@ -270,57 +288,99 @@ class LocalSyncSettingTab extends PluginSettingTab {
     // ----------------------------
     containerEl.createEl("h3", { text: "Sync Key (Mnemonic)" });
 
-    new Setting(containerEl)
-      .setName("Reveal mnemonic")
-      .setDesc("Copy this to another device to sync the same data.")
-      .addButton((btn) =>
-        btn.setButtonText("Reveal").onClick(async () => {
-          const owner = await this.plugin.evolu.appOwner;
-          // Showing in Notice is simple. For better UX, you can add a textarea + copy button.
-          new Notice(owner.mnemonic);
-        }),
-      );
+    // -- Reveal / copy --
+    const revealSetting = new Setting(containerEl)
+      .setName("Your mnemonic")
+      .setDesc("24-word key — copy this to each device you want to sync.");
 
+    const mnemonicBox = containerEl.createDiv();
+    mnemonicBox.style.display = "none";
+    mnemonicBox.style.marginBottom = "1em";
+
+    const mnemonicInput = mnemonicBox.createEl("input");
+    mnemonicInput.type = "text";
+    mnemonicInput.readOnly = true;
+    mnemonicInput.style.cssText =
+      "width:100%;font-family:var(--font-monospace);font-size:0.85em;box-sizing:border-box;";
+
+    revealSetting
+      .addButton((btn) => {
+        btn.setButtonText("Reveal").onClick(async () => {
+          if (mnemonicBox.style.display === "none") {
+            const owner = await this.plugin.evolu.appOwner;
+            mnemonicInput.value = owner.mnemonic;
+            mnemonicBox.style.display = "";
+            btn.setButtonText("Hide");
+          } else {
+            mnemonicInput.value = "";
+            mnemonicBox.style.display = "none";
+            btn.setButtonText("Reveal");
+          }
+        });
+      })
+      .addButton((btn) => {
+        btn.setButtonText("Copy").onClick(async () => {
+          const owner = await this.plugin.evolu.appOwner;
+          await navigator.clipboard.writeText(owner.mnemonic);
+          new Notice("Mnemonic copied to clipboard");
+        });
+      });
+
+    // -- Restore --
     let restoreValue = "";
 
     new Setting(containerEl)
       .setName("Restore mnemonic")
-      .setDesc("Paste mnemonic here to restore the same synced identity on this device.")
-      .addTextArea((ta) =>
+      .setDesc("Paste your 24-word key to restore an existing identity on this device.")
+      .addTextArea((ta) => {
+        ta.setPlaceholder("word1 word2 word3 …");
+        ta.inputEl.rows = 2;
         ta.onChange((v) => {
           restoreValue = v.trim();
-        }),
-      );
+        });
+      })
+      .addButton((btn) => {
+        btn
+          .setButtonText("Restore")
+          .setCta()
+          .onClick(async () => {
+            if (!restoreValue) {
+              new Notice("Paste your mnemonic first");
+              return;
+            }
+            await this.plugin.evolu.restoreAppOwner(restoreValue);
+            console.log("[obsidian-local-sync] INFO: Evolu owner restored");
+            new Notice("Owner restored. Please restart Obsidian.");
+          });
+      });
 
-    new Setting(containerEl).addButton((btn) =>
-      btn
-        .setButtonText("Restore")
-        .setCta()
-        .onClick(async () => {
-          if (!restoreValue) {
-            new Notice("Paste mnemonic first");
-            return;
-          }
-
-          await this.plugin.evolu.restoreAppOwner(restoreValue);
-          console.log("[obsidian-local-sync] INFO: Evolu owner restored");
-
-          new Notice("Owner restored. Please restart Obsidian.");
-        }),
-    );
+    // -- Reset --
+    let resetPending = false;
 
     new Setting(containerEl)
       .setName("Reset owner (danger)")
-      .setDesc("Deletes local Evolu identity on this device.")
-      .addButton((btn) =>
+      .setDesc("Permanently deletes the Evolu identity on this device.")
+      .addButton((btn) => {
         btn
           .setWarning()
           .setButtonText("Reset")
           .onClick(async () => {
-            await this.plugin.evolu.resetAppOwner();
-            console.warn("[obsidian-local-sync] WARN: Evolu owner reset");
-            new Notice("Owner reset. Please restart Obsidian.");
-          }),
-      );
+            if (!resetPending) {
+              resetPending = true;
+              btn.setButtonText("Confirm reset?");
+              window.setTimeout(() => {
+                if (resetPending) {
+                  resetPending = false;
+                  btn.setButtonText("Reset");
+                }
+              }, 5000);
+            } else {
+              resetPending = false;
+              await this.plugin.evolu.resetAppOwner();
+              console.warn("[obsidian-local-sync] WARN: Evolu owner reset");
+              new Notice("Owner reset. Please restart Obsidian.");
+            }
+          });
+      });
   }
 }
