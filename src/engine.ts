@@ -33,7 +33,10 @@ const dmp = new DiffMatchPatch();
 
 function toBase64(bytes: Uint8Array): string {
   let bin = "";
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
   return btoa(bin);
 }
 
@@ -147,11 +150,11 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
-  stop() {
+  async stop() {
     try {
       this.stopPollingTimer();
       const paths = Array.from(this.states.keys());
-      for (const p of paths) void this.closeDoc(p);
+      await Promise.all(paths.map((p) => this.closeDoc(p)));
       this.states.clear();
       this.logInfo("Engine stopped");
     } catch (e) {
@@ -396,19 +399,18 @@ export class YjsEvoluHistoryEngine {
     const text = doc.getText("content");
 
     const snapshotBase64 = await this.loadLocalSnapshot(path);
-    if (snapshotBase64) {
-      Y.applyUpdate(doc, fromBase64(snapshotBase64));
-    } else {
-      const f = this.vault.getAbstractFileByPath(path);
-      if (f instanceof TFile) {
-        const vaultText = await this.vault.read(f);
-        doc.transact(() => text.insert(0, vaultText));
-      }
-    }
 
     let lastVaultText = "";
-    const f2 = this.vault.getAbstractFileByPath(path);
-    if (f2 instanceof TFile) lastVaultText = await this.vault.read(f2);
+    const f = this.vault.getAbstractFileByPath(path);
+    if (f instanceof TFile) {
+      lastVaultText = await this.vault.read(f);
+    }
+
+    if (snapshotBase64) {
+      Y.applyUpdate(doc, fromBase64(snapshotBase64));
+    } else if (lastVaultText) {
+      doc.transact(() => text.insert(0, lastVaultText));
+    }
 
     const st: FileState = {
       doc,

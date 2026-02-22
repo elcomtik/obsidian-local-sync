@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.0.3 — 2026-02-22
+
+### Fixed
+
+- **`src/engine.ts` — double vault read on doc bootstrap**: `getOrLoadFileState`
+  previously read the vault file twice when no snapshot existed — once to seed
+  the Yjs doc and again to initialise `lastVaultText`. If the file changed
+  between the two reads, `lastVaultText` would diverge from the Yjs state,
+  producing a spurious diff on the next modification. Now read once and reused.
+
+- **`src/engine.ts` — fire-and-forget flush on plugin unload**: `stop()` was
+  synchronous and fired all `closeDoc` calls with `void`, meaning pending Yjs
+  update flushes and snapshot writes could be abandoned before they completed.
+  `stop()` is now `async` and uses `Promise.all` so all outstanding flushes and
+  snapshots are awaited before the in-memory state is cleared.
+
+- **`src/main.ts` — unstable `deviceId` on first install**: `DEFAULT_SETTINGS`
+  generates a random `deviceId` at module-evaluation time. Settings were only
+  persisted when the user manually changed a value, so a restart before any
+  setting was touched would produce a new `deviceId`. `loadSettings` now saves
+  immediately after the first load when no stored `deviceId` is found.
+
+### Improved
+
+- **`src/engine.ts` — `toBase64` chunk size**: The character-by-character loop
+  building the binary string was replaced with a chunked
+  `String.fromCharCode(...subarray)` approach (8 192 bytes per chunk). This
+  avoids call-stack overflow when encoding large Yjs snapshots and is
+  measurably faster for typical vault file sizes.
+
 ## 0.0.2 — 2026-02-22
 
 ### Fixed

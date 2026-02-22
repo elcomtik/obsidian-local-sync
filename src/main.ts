@@ -169,11 +169,16 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   }
 
   onunload() {
-    this.engine?.stop();
+    void this.engine?.stop();
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const saved = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+    // Persist the generated deviceId on first install so it survives restarts.
+    if (!saved?.deviceId) {
+      await this.saveSettings();
+    }
   }
 
   async saveSettings() {
