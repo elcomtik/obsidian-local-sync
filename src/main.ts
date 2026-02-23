@@ -17,6 +17,20 @@ import {
   type LogLevel,
 } from "./engine";
 
+/**
+ * Stop promise from the most recently unloaded plugin instance.
+ *
+ * Obsidian's plugin disable → enable cycle calls `onunload()` synchronously
+ * and then immediately calls `onload()` on the new instance.  `engine.stop()`
+ * is async (it awaits any in-flight poll + flushes open docs), so without this
+ * guard the old instance can still be running its poll when the new instance
+ * starts — both share the vault event bus, leading to phantom vault.modify
+ * calls and spurious outgoing updates.
+ *
+ * `onload()` awaits this before starting the engine; `onunload()` chains onto it.
+ */
+let _previousInstanceStop: Promise<void> = Promise.resolve();
+
 type PluginSettings = {
   relayUrl: string;
   appName: string;
@@ -61,20 +75,51 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   engine!: YjsEvoluHistoryEngine;
   mnemonicCache: string | null = null;
 
+  /**
+   * Set to true the moment onunload() is called.  Checked at every async
+   * resume point in onload/startEngine so a superseded instance bails out
+   * before registering vault event handlers or starting the poll loop.
+   */
+  private _unloaded = false;
+
   async onload() {
+    // Wait for any previous instance to fully stop before starting a new one.
+    // Obsidian calls onunload() + onload() back-to-back; without this guard the
+    // old engine's in-flight poll can still be running when the new engine starts,
+    // causing phantom vault.modify events and spurious outgoing updates.
+    await _previousInstanceStop;
+    if (this._unloaded) return; // unloaded before we even began
+
     await this.loadSettings();
+    if (this._unloaded) return; // unloaded during settings load
 
     // ----------------------------
     // Settings UI
     // ----------------------------
     this.addSettingTab(new LocalSyncSettingTab(this.app, this));
 
-    try {
-      await this.startEngine();
-    } catch (e) {
-      console.error("[obsidian-local-sync] ERROR: Failed to start engine", e);
-      new Notice("LocalSync: failed to start — check console for details");
-    }
+    // Defer engine start until the workspace layout is ready.
+    //
+    // During initial Obsidian startup, vault.getFiles() returns an empty or
+    // incomplete list if called before the workspace finishes indexing files.
+    // auditSnapshotsForOfflineDeletes() calls vault.getFiles() to build the
+    // set of existing paths and treats any snapshot path absent from that set
+    // as an offline delete.  If the vault isn't ready yet, every snapshotted
+    // file is falsely treated as deleted — delete rows are emitted for all
+    // files, and on the next restart the device processes its own delete rows
+    // (outgoingIds cleared) and trashes its local files too.
+    //
+    // onLayoutReady fires synchronously if the workspace is already ready
+    // (on plugin reload mid-session), or deferred until it is (initial boot).
+    this.app.workspace.onLayoutReady(() => {
+      if (this._unloaded) return;
+      this.startEngine().catch((e) => {
+        if (!this._unloaded) {
+          console.error("[obsidian-local-sync] ERROR: Failed to start engine", e);
+          new Notice("LocalSync: failed to start — check console for details");
+        }
+      });
+    });
   }
 
   private async startEngine() {
@@ -137,6 +182,14 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
 
     await this.engine.start();
 
+    // Bail out if onunload() fired while the engine was starting.
+    // Without this check a superseded instance would register vault event
+    // handlers that outlive the instance, firing into a stopped engine.
+    if (this._unloaded) {
+      void this.engine.stop();
+      return;
+    }
+
     // ----------------------------
     // Listen to vault changes
     // ----------------------------
@@ -144,6 +197,22 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       this.app.vault.on("modify", async (file) => {
         if (file instanceof TFile) {
           await this.engine.onVaultFileModified(file);
+        }
+      }),
+    );
+
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (file instanceof TFile) {
+          void this.engine.onVaultFileDeleted(file);
+        }
+      }),
+    );
+
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        if (file instanceof TFile) {
+          void this.engine.onVaultFileRenamed(file, oldPath);
         }
       }),
     );
@@ -169,9 +238,22 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   }
 
   onunload() {
+    // Signal any still-running onload/startEngine to abort at its next
+    // async resume point — prevents a superseded instance from registering
+    // vault event handlers or starting the poll loop after being unloaded.
+    this._unloaded = true;
+
     // Chain closeEvoluDb *after* stop resolves so the cursor write from any
     // in-progress poll is committed to the in-memory DB before we flush to disk.
-    void this.engine?.stop().then(() => this.closeEvoluDb?.());
+    //
+    // Append to the existing chain rather than overwriting it.  Under rapid
+    // consecutive restarts, overwriting would allow instance N+2 to start
+    // before instance N has finished stopping (because N+1's engine may not
+    // have been created yet, making its stop a no-op that resolves immediately).
+    // Chaining ensures every subsequent onload() awaits ALL prior stops.
+    _previousInstanceStop = _previousInstanceStop.then(() =>
+      (this.engine?.stop() ?? Promise.resolve()).then(() => this.closeEvoluDb?.()),
+    );
   }
 
   async loadSettings() {
@@ -238,6 +320,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       this.settings.appName,
       this.settings.relayUrl,
       dataDir,
+      { forceNew: true }, // new mnemonic → new relay WebSocket required
     );
     this.evolu = evolu;
     this.closeEvoluDb = closeDb;

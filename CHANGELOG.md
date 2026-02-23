@@ -1,5 +1,117 @@
 # Changelog
 
+## 0.0.7 — 2026-02-23
+
+### Fixed
+
+- **`src/evoluClient.ts` — leaked WebSocket per plugin reload causes compounding reconnect errors**:
+  `[Symbol.dispose]()` on the Evolu instance is not implemented in `@evolu/common` 7.4.1
+  (throws `"Evolu instance disposal is not yet implemented"`), so there is no way to shut
+  down a live Evolu instance. Every `startEngine()` call previously created a new Evolu
+  instance (and new relay WebSocket) via `createEvoluClient`, leaving all previous instances
+  alive — each one retrying the WebSocket connection indefinitely. After a handful of
+  plugin reloads, many stale instances fired concurrent `WebSocket connection failed`
+  console errors whenever the network was unavailable.
+
+  Fixed by caching the Evolu client at module level in `evoluClient.ts`. Normal
+  disable → enable reloads reuse the same instance (same WebSocket, no new VM). A
+  fresh instance is created only when `restartEngine()` is called after reset/restore,
+  which genuinely needs a new relay connection with the restored identity (`forceNew: true`).
+
+- **`src/main.ts` — catastrophic false-delete-all on startup after hard close**:
+  `onload()` called `startEngine()` directly. `engine.start()` immediately fires
+  `auditSnapshotsForOfflineDeletes()`, which calls `vault.getFiles()` to find which
+  snapshotted paths still exist. During initial Obsidian startup (including after ALT+F4
+  hard close) the vault file index may not be fully populated at `onload()` time —
+  `getFiles()` can return an empty or partial list. The audit then treats every
+  snapshotted file as "deleted while offline" and emits a `fileUpdate { type: "delete" }`
+  row for each. The other device receives those rows and trashes all its files. On the
+  next restart of the originating device, `outgoingIds` is empty (new instance) so it
+  processes its own delete rows and trashes its local files too.
+
+  Fixed by deferring `startEngine()` to `this.app.workspace.onLayoutReady()` — the
+  standard Obsidian API that fires only after the vault file index is fully populated.
+  If the workspace is already ready (mid-session plugin reload) the callback fires
+  synchronously, so there is no delay for normal restarts.
+
+- **`src/engine.ts` — startup scan retransmits all files on every plugin start**:
+  `scanVaultForUnsyncedFiles` called `retransmitCurrentState` for every previously-synced
+  file on every startup. This upserted a new `fileUpdate` row for each file, generating
+  `N` new `evolu_history` entries every time the plugin loaded — regardless of whether
+  any content had changed. Every other device's next poll picked up and processed all
+  those rows, causing unnecessary network traffic and spurious vault writes.
+
+  Fixed by replacing `retransmitCurrentState` in the scan with `getOrLoadFileState`.
+  `getOrLoadFileState` already performs offline-drift detection (vault text ≠ Yjs text
+  → applies diff → queues for normal flush). For unchanged files it does nothing to
+  Evolu at all. Late-joining devices reconstruct state from existing historical rows,
+  which is unaffected by this change.
+
+- **`src/main.ts` — stale instance on plugin reload causes phantom vault events**:
+  Obsidian's disable → enable cycle calls `onunload()` synchronously then immediately
+  calls `onload()` on the new instance. `engine.stop()` is async (awaits in-flight poll
+  + flushes docs), so the old engine was still running its poll when the new engine
+  started. Both instances shared the vault event bus: writes from the dying instance
+  triggered the new instance's `onVaultFileModified`, producing spurious outgoing updates
+  and an apparent echo loop that disappeared only after a full Obsidian restart.
+
+  Fixed with a module-level `_previousInstanceStop` promise. `onunload()` **chains**
+  (`.then()`) onto it rather than overwriting it; `onload()` awaits it before proceeding.
+  Chaining is critical for rapid consecutive restarts: overwriting the promise lets a
+  later instance start before an earlier stop has finished (if the intermediate instance's
+  engine was never created, its `engine?.stop()` is a no-op that resolves immediately,
+  breaking the serialisation). With chaining, `_previousInstanceStop` always represents
+  "every prior instance has stopped" — each `onload()` is guaranteed to start into a
+  fully quiesced state.
+
+- **`src/engine.ts` — echo loop: editing a file causes both devices to loop indefinitely**:
+  `Y.applyUpdate(doc, update)` in the poll loop (incoming remote update) fired the
+  `doc.on("update")` listener, which pushed the received update to `pendingUpdates` and
+  scheduled an outgoing flush. The device then re-transmitted the remote update back to
+  the network. The other device received it, applied it, and echoed it back too — creating
+  an infinite bidirectional loop that could only be stopped by restarting one device's
+  plugin. The loop was most visible after a rapid succession of delete + append edits.
+
+  Fixed by passing `"remote"` as the transaction origin to `Y.applyUpdate`:
+  ```typescript
+  Y.applyUpdate(st.doc, fromBase64(updateBase64), "remote");
+  ```
+  The `doc.on("update")` listener now checks the origin and returns early for remote
+  applies, so only locally-generated ops (vault edits, seeding, drift catch-up) are
+  queued for outgoing transmission.
+
+### Added
+
+- **`src/engine.ts` — Delete and rename propagation (ARCH-4)**:
+  Deleting or renaming a file on one device now propagates to other devices.
+
+  - `fileUpdate` table extended with a nullable `type` column (`null` = content update,
+    `"delete"` = file deleted). Backward compatible — existing rows without `type` are
+    treated as content updates.
+  - `onVaultFileDeleted(file)`: destroys the in-memory Yjs doc, tombstones the snapshot,
+    and emits a `fileUpdate { type: "delete" }` row so other devices trash the file.
+  - `onVaultFileRenamed(file, oldPath)`: re-keys the in-memory doc to the new path,
+    emits a delete row for the old path, and retransmits the full Yjs state under the
+    new path via `retransmitCurrentState`.
+  - `applyFileUpdateRowById` now fetches `type` and, for `"delete"` rows, calls
+    `vault.trash(file, true)` (system trash) instead of applying a Yjs update.
+  - `destroyDoc(path)`: cancels flush timer and destroys Y.Doc without flushing.
+  - `tombstoneSnapshot(path)`: writes `snapshotBase64 = "DELETED"` so re-created paths
+    start fresh. `loadLocalSnapshot` returns `null` for tombstoned entries.
+
+- **`src/engine.ts` — Offline delete/rename detection**:
+  `auditSnapshotsForOfflineDeletes()` runs at startup. Compares all non-tombstone
+  snapshot paths against the current vault — any snapshot without a matching vault file
+  was deleted or renamed while offline. A `fileUpdate { type: "delete" }` row is emitted
+  and the snapshot tombstoned so the audit does not re-fire on subsequent startups.
+
+- **`src/main.ts` — Vault delete and rename event listeners**:
+  `vault.on("delete")` and `vault.on("rename")` registered in `startEngine()`.
+
+- **`README.md` — Limitations section**:
+  Documents intended single-user use case, CRDT merge behaviour for conflicting edits,
+  and the fundamental limitation of concurrent lifecycle+content conflicts (ARCH-6).
+
 ## 0.0.6 — 2026-02-23
 
 ### Improved

@@ -194,18 +194,65 @@ cp -r dist/ <vault>/.obsidian/plugins/obsidian-local-sync/
 
 ---
 
-## Test I — File deletion is not propagated (known limitation, ARCH-4) ✅
+## Test I — File deletion is propagated ✅
 
-**What it tests:** Verifies the current behaviour — deleting a file on one device does **not** remove it on the other device — and documents this as a known limitation pending ARCH-4 (rename/delete event handlers).
+**What it tests:** Deleting a file on one device removes it from the other device's vault.
 
 **Steps:**
 1. Both devices: plugin enabled, same mnemonic, `deleteme.md` exists and is synced on both.
-2. Device A: delete `deleteme.md` (move to trash or permanent delete).
+2. Device A: delete `deleteme.md` (move to trash or permanent delete inside Obsidian).
 3. Wait ~5 seconds.
 
-**Pass criteria (current expected behaviour — not a pass for the feature):**
-- Device B: `deleteme.md` still exists, unmodified. Deletion is **not** propagated.
-- Device A: on next plugin restart, `deleteme.md` does **not** reappear (the file is tracked as deleted in the vault; no Yjs doc exists for it so no content is written back).
+**Pass criteria:**
+- Device A console: `Vault file deleted, propagating {path: 'deleteme.md'}`.
+- Device B console: `Applied remote delete {path: 'deleteme.md'}`.
+- Device B vault: `deleteme.md` is moved to the system trash.
 - No crash, no error in either console.
 
-**Known limitation:** ARCH-4 — no `delete` or `rename` vault event handlers. Deletion propagation is on the roadmap.
+---
+
+## Test J — Rename propagation ✅
+
+**What it tests:** Renaming a file on one device propagates the deletion of the old path and creation of the new path on the other device.
+
+**Steps:**
+1. Both devices: plugin enabled, same mnemonic, `original.md` exists and is synced on both.
+2. Device A: rename `original.md` → `renamed.md` inside Obsidian.
+3. Wait ~5 seconds.
+
+**Pass criteria:**
+- Device A console: `Vault file renamed, propagating {oldPath: 'original.md', newPath: 'renamed.md'}`.
+- Device B console: `Applied remote delete {path: 'original.md'}` + `Applied remote update {path: 'renamed.md'}`.
+- Device B vault: `original.md` is moved to system trash; `renamed.md` exists with the correct content.
+
+---
+
+## Test K — Path re-use after deletion ✅
+
+**What it tests:** A file path can be re-used after deletion without duplicating or corrupting content.
+
+**Steps:**
+1. Both devices: plugin enabled, `reuse.md` synced on both with content `"version 1"`.
+2. Device A: delete `reuse.md`. Wait ~5 s. Confirm Device B moved it to trash.
+3. Device A: create a new `reuse.md` with content `"version 2"`. Wait ~5 s.
+
+**Pass criteria:**
+- Both devices have `reuse.md` containing exactly `"version 2"` — no duplication or prepended old content.
+
+---
+
+## Test L — Offline delete detection ✅
+
+**What it tests:** Deleting a file while the plugin is disabled is detected on the next startup and propagated.
+
+**Steps:**
+1. Both devices: plugin enabled, `offline.md` synced on both.
+2. Device A: **disable plugin**.
+3. Device A: delete `offline.md` manually (file manager or terminal — outside Obsidian).
+4. Device A: **re-enable plugin**. Wait ~5 s.
+
+**Pass criteria:**
+- Device A console: `Startup audit: offline delete detected {path: 'offline.md'}`.
+- Device B console: `Applied remote delete {path: 'offline.md'}`.
+- Device B vault: `offline.md` moved to system trash.
+- Device A: `offline.md` does not reappear on next startup.

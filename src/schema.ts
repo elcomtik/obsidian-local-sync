@@ -11,7 +11,9 @@ export const Schema = {
   fileUpdate: {
     id: FileUpdateId,
     path: Evolu.NonEmptyString1000,
-    updateBase64: Evolu.NonEmptyString
+    updateBase64: Evolu.NonEmptyString,
+    // null = content update (default); "delete" = file was deleted
+    type: Evolu.nullOr(Evolu.NonEmptyString1000)
   },
 
   // -------- local only --------

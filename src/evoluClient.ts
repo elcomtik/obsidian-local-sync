@@ -14,56 +14,82 @@ import { createPersistentSqlJsDriver } from "./sqliteDriver";
 import { Schema } from "./schema";
 
 /**
- * `createEvolu` caches instances by name at the module level.  Each plugin
- * restart must use a unique name so that reset/restore gets a fresh Evolu
- * client (new DB connection + new relay WebSocket with the restored identity).
- * Without this, the second call to `createEvoluClient` returns the stale
- * cached instance — still wired to the old owner's WebSocket — and sync never
- * works after restore.
+ * Custom console passed to Evolu deps.
  *
- * The DB *file* is always named after `appName` (e.g. `obsidian-local-sync.db`).
- * The Evolu instance *cache key* includes a monotonic counter so each call
- * creates a fresh instance.  The `wrappedFactory` ignores the Evolu-provided
- * `name` argument and always opens the fixed `appName` file.
+ * Evolu's `createConsole` unconditionally calls `console.error()` for error-
+ * level messages (the `enableLogging` flag only gates log/warn/info/debug).
+ * When the relay WebSocket cannot connect, Evolu logs its own relay-level
+ * errors via `deps.console.error`, which appear in the Obsidian developer
+ * console as red unhandled errors — alarming but not actionable.
+ *
+ * The raw `"WebSocket connection to 'wss://...' failed"` messages that the
+ * Electron runtime emits *before* any JS handler cannot be intercepted here;
+ * those are a platform concern.  But Evolu's own error-level relay/storage
+ * messages *can* be demoted to warn so they do not flood the error stream.
  */
-let _clientGeneration = 0;
+const evoluConsole = {
+  ...createConsole(),
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  error: (...args: any[]) => {
+    console.warn("[evolu]", ...args);
+  },
+};
 
 /**
- * Creates the Evolu client and returns it together with a `closeDb` callback.
+ * Module-level Evolu client singleton.
  *
- * `closeDb` must be called on plugin unload.  It cancels the sqliteDriver's
- * debounce timer and immediately flushes the in-memory SQLite database to disk,
- * ensuring that the last history cursor and any other pending mutations are
- * persisted before the plugin is torn down.  Without this, changes written in
- * the last {@link SAVE_DEBOUNCE_MS} window would be lost and the cursor would
- * appear reset on the next startup.
+ * `[Symbol.dispose]()` on the Evolu instance is not implemented in
+ * @evolu/common 7.4.1 — calling it throws.  This means there is no way to
+ * fully shut down an Evolu instance: its relay WebSocket keeps reconnecting
+ * until the process exits.
+ *
+ * Consequence: creating a new Evolu instance on every plugin reload leaks the
+ * old WebSocket permanently for the lifetime of the Obsidian process, causing
+ * an ever-growing stack of `WebSocket connection failed` errors in the console.
+ *
+ * Fix: cache the client at module level and reuse it across plugin disable →
+ * enable cycles.  A new client is created only when reset/restore genuinely
+ * needs a fresh relay identity (different mnemonic → different WebSocket
+ * authentication).  The SQLite driver's `flush()` is still called on every
+ * unload to persist the history cursor.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _cached: { evolu: any; flush: () => void } | null = null;
+
+/**
+ * Returns the Evolu client for `appName` / `relayUrl` / `dataDir`, creating
+ * it on the first call and reusing it on subsequent calls with the same
+ * arguments.  Pass `forceNew: true` only when reset/restore needs a fresh
+ * relay connection with a new identity.
+ *
+ * `closeDb` flushes the SQLite driver to disk without closing anything —
+ * safe to call on every plugin unload.
  */
 export function createEvoluClient(
   appName: string,
   relayUrl: string,
   dataDir: string,
+  { forceNew = false }: { forceNew?: boolean } = {},
 ) {
+  if (_cached && !forceNew) {
+    return { evolu: _cached.evolu, closeDb: _cached.flush };
+  }
+
   const dbFileName = SimpleName.orThrow(appName);
 
-  // Capture the driver instance created inside createDbWorkerForPlatform so
-  // we can call [Symbol.dispose] on plugin unload for an immediate disk flush.
-  let disposeDriver: (() => void) | null = null;
+  let flush: () => void = () => {};
 
   const innerFactory = createPersistentSqlJsDriver(dataDir);
   const wrappedFactory: CreateSqliteDriver = async (_name, options) => {
-    // Always open the file named after `appName` — not the session-unique
-    // Evolu instance name — so that restarts read the same persisted DB.
+    // Always open the file named after `appName` — not an Evolu-internal name.
     const driver = await innerFactory(dbFileName, options);
-    // Use flush() rather than [Symbol.dispose]: flush saves to disk without
-    // closing the database, so Evolu's async callbacks can still run after
-    // plugin unload without hitting "Database closed" errors.
-    disposeDriver = () => (driver as any).flush?.();
+    flush = () => (driver as any).flush?.();
     return driver;
   };
 
   const createDbWorker = () =>
     createDbWorkerForPlatform({
-      console: createConsole(),
+      console: evoluConsole,
       createSqliteDriver: wrappedFactory,
       createWebSocket,
       random: createRandom(),
@@ -72,29 +98,30 @@ export function createEvoluClient(
     });
 
   const deps: EvoluDeps = {
-    console: createConsole(),
+    console: evoluConsole,
     createDbWorker,
     randomBytes: createRandomBytes(),
     reloadApp: () => {},
     time: createTime(),
   };
 
-  // Unique instance name per call bypasses Evolu's module-level instance cache.
-  // Generation 0 uses the bare appName (backward-compatible with any persisted
-  // state tied to that name); subsequent restarts append the counter.
-  const generation = _clientGeneration++;
-  const rawName =
-    generation === 0 ? appName : `${appName}-${generation}`.slice(0, 64);
+  // Use a unique name each time forceNew is true so createEvolu's module-level
+  // cache gives us a genuinely fresh instance with a new relay WebSocket.
+  // Normal (non-forceNew) calls always use the bare appName so they hit the
+  // same cache slot — but since we guard with _cached ourselves, createEvolu's
+  // cache is a belt-and-suspenders safety net, not the primary mechanism.
+  const instanceName = forceNew
+    ? `${appName}-${Date.now()}`.slice(0, 64)
+    : appName;
 
   const evolu = createEvolu(deps)(Schema, {
-    name: SimpleName.orThrow(rawName), // unique per call; bypasses module-level cache
+    name: SimpleName.orThrow(instanceName),
     transports: [{ type: "WebSocket", url: relayUrl }],
   });
 
-  return {
-    evolu,
-    closeDb: () => disposeDriver?.(),
-  };
+  const closeDb = () => flush();
+  _cached = { evolu, flush: closeDb };
+  return { evolu, closeDb };
 }
 
 /**

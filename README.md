@@ -49,8 +49,8 @@ This system uses Evolu’s **owner mnemonic** as your sync key.
 1. Install the plugin
 2. Open settings
 3. Paste mnemonic into **Restore**
-4. Click Restore
-5. Restart Obsidian if needed
+4. Click Restore — wait 5 seconds, then click **Confirm restore?** to proceed
+5. Wait a few seconds for initial sync
 
 ---
 
@@ -199,12 +199,49 @@ Single-user multi-device sync for large Obsidian vaults using CRDT incremental u
 
 ---
 
+## ⚠ Known Limitations
+
+### Intended use case
+
+LocalSync is designed for **single-user, multi-device** workflows: one person syncing
+the same vault across a laptop, desktop, and phone. It is **not** designed for
+collaborative real-time editing by multiple people. The CRDT engine prevents data loss,
+but simultaneous edits by different users to the same file may produce unexpected merge
+results and are outside the supported use case.
+
+### Conflicting edits to the same file
+
+If two devices **edit the same file independently** while offline (or before one device
+receives the other's updates), Yjs will CRDT-merge the changes. The result is
+deterministic and lossless, but may not match either device's intent — for example,
+paragraphs added on both sides will both appear in the merged file, possibly interleaved.
+
+This is the same trade-off made by all CRDT-based sync systems. There is no "last writer
+wins" or conflict prompt — both edits are preserved.
+
+### Concurrent lifecycle + content conflicts
+
+If two devices simultaneously perform a **lifecycle event** (delete or rename) and a
+**content edit** on the same file, the outcome is non-deterministic:
+
+- Delete + edit at the same time: the edited version may recreate the deleted file.
+- Rename + edit at the same time: the old path may reappear temporarily alongside the new path.
+
+This is a fundamental property of local-first distributed systems — without a central
+coordinator there is no way to cleanly order conflicting intents. For typical single-user
+workflows this never occurs. Manual cleanup may be needed if these rare conflicts arise.
+
+### Text files only
+
+Only `.md` and `.txt` files are synced.
+
+---
+
 ## 🛣 Roadmap (Future Improvements)
 
 Low priority enhancements:
 - Conflict inspection UI (very low priority)
 - Sync status indicator panel
-- Rename and delete propagation improvements
 - Performance instrumentation
 
 Out of scope:

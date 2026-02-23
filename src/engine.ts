@@ -185,6 +185,13 @@ export class YjsEvoluHistoryEngine {
   private pendingVaultSeedReady = false;
 
   /**
+   * A minimal empty Yjs update (full state of a new empty Y.Doc), base64-encoded.
+   * Used as the `updateBase64` payload for `fileUpdate` rows with `type: "delete"`.
+   * Stored once at construction time to avoid creating a new Y.Doc per delete event.
+   */
+  private readonly emptyYjsUpdateBase64 = toBase64(Y.encodeStateAsUpdate(new Y.Doc()));
+
+  /**
    * @param args.vault     Obsidian Vault used for reading and writing files.
    * @param args.evolu     Typed Evolu client bound to the plugin's {@link Database} schema.
    * @param args.deviceId  Stable per-device identifier embedded in outgoing update row IDs.
@@ -236,11 +243,11 @@ export class YjsEvoluHistoryEngine {
       await this.ensureHistoryCursorRow();
       this.startPollingTimer();
       this.logInfo("Engine started", this.config);
-      // Kick off the scan and the initial poll concurrently.  The scan only
-      // populates pendingVaultSeed (no Yjs mutations), so it is safe to run
-      // alongside the poll.  Deferred seeding (drainPendingVaultSeed) runs
-      // from within the poll loop after the relay has had a chance to deliver
-      // existing history — avoiding the doubled-content bug on reset & restore.
+      // Kick off the audit, scan, and initial poll concurrently.
+      // - auditSnapshotsForOfflineDeletes: detects files deleted/renamed while plugin was off.
+      // - scanVaultForUnsyncedFiles: populates pendingVaultSeed (no Yjs mutations).
+      // - poll: relay delivery; deferred seeding runs after relay is quiet.
+      void this.auditSnapshotsForOfflineDeletes();
       void this.scanVaultForUnsyncedFiles();
       if (this.isActive) this.pollHistoryOnce();
     } catch (e) {
@@ -251,9 +258,11 @@ export class YjsEvoluHistoryEngine {
   /**
    * Background scan run once at startup.
    *
-   * **Files with a local snapshot** (previously synced): retransmit their full
-   * Yjs state so other devices can reconstruct them even if earlier sessions
-   * only ever sent incremental diffs.
+   * **Files with a local snapshot** (previously synced): load the Yjs doc to
+   * detect any offline drift (vault edited while the plugin was not running).
+   * If drift is found, the diff is applied inside {@link getOrLoadFileState},
+   * queued in `pendingUpdates`, and flushed normally — no extra Evolu row is
+   * written on startup for unchanged files.
    *
    * **Files without a snapshot** (never seeded): rather than immediately seeding
    * their vault content into an empty Yjs doc, they are placed in
@@ -282,13 +291,22 @@ export class YjsEvoluHistoryEngine {
           this.pendingVaultSeed.add(file.path);
           deferred++;
         } else {
-          // Has a local snapshot — retransmit full Yjs state.
-          await this.retransmitCurrentState(file.path);
+          // Has a local snapshot — load the doc to detect any offline drift
+          // (vault edited while plugin was off).  If vault text ≠ Yjs text the
+          // diff is applied inside getOrLoadFileState, queued in pendingUpdates,
+          // and flushed normally via the debounce timer.
+          //
+          // We intentionally do NOT call retransmitCurrentState here. That would
+          // write a new Evolu row on every startup even when nothing changed,
+          // creating unnecessary evolu_history entries that every other device
+          // must download and process on its next poll.  Historical rows in Evolu
+          // are sufficient for late-joining devices to reconstruct state.
+          await this.getOrLoadFileState(file.path);
           retransmitted++;
         }
       }
 
-      this.logInfo("Startup scan: done", { retransmitted, deferred, total: files.length });
+      this.logInfo("Startup scan: done", { loaded: retransmitted, deferred, total: files.length });
       this.scanComplete = true;
     } catch (e) {
       this.logError("scanVaultForUnsyncedFiles failed", e);
@@ -321,13 +339,11 @@ export class YjsEvoluHistoryEngine {
 
   /**
    * Encodes the current in-memory Yjs doc state as a full update and upserts a
-   * `fileUpdate` row with a deterministic per-file-per-device ID.  Called by the
-   * startup scan so every device broadcasts its full file state on load.
+   * `fileUpdate` row with a deterministic per-file-per-device ID.
+   * Called after a rename to broadcast the full file state under the new path.
    *
-   * Using a fixed ID means repeated startups update the same Evolu row rather
-   * than creating unbounded new rows.  Remote devices will pick up a new
-   * `evolu_history` entry each time the content changes; Yjs handles repeated
-   * application of the same state idempotently.
+   * Using a fixed ID means repeated calls update the same Evolu row rather than
+   * creating unbounded new rows.
    */
   private async retransmitCurrentState(path: string) {
     try {
@@ -575,7 +591,7 @@ export class YjsEvoluHistoryEngine {
       const q = this.evolu.createQuery((db) =>
         db
           .selectFrom("fileUpdate")
-          .select(["path", "updateBase64"])
+          .select(["path", "updateBase64", "type"])
           .where("id", "=", fileUpdateId)
           .where("isDeleted", "is", null)
           .limit(1),
@@ -587,10 +603,21 @@ export class YjsEvoluHistoryEngine {
         return null;
       }
 
-      const { path, updateBase64 } = rows[0];
+      const { path, updateBase64, type } = rows[0];
       if (!path || !updateBase64) {
         this.logWarn("fileUpdate row missing fields", { fileUpdateId, path, hasUpdate: !!updateBase64 });
         return null;
+      }
+
+      // Handle remote delete.
+      if (type === "delete") {
+        this.destroyDoc(path);
+        this.pendingVaultSeed.delete(path);
+        this.tombstoneSnapshot(path);
+        const f = this.vault.getAbstractFileByPath(path);
+        if (f) await this.vault.trash(f, true);
+        this.logInfo("Applied remote delete", { path });
+        return path;
       }
 
       // Skip our own startup-retransmit rows from previous sessions.
@@ -613,7 +640,10 @@ export class YjsEvoluHistoryEngine {
       const st = await this.getOrLoadFileState(path, { seedFromVault: false });
       this.touch(st);
 
-      Y.applyUpdate(st.doc, fromBase64(updateBase64));
+      // Pass "remote" as the transaction origin so the doc.on("update") listener
+      // can distinguish this apply from a local edit and skip re-queuing it for
+      // outgoing transmission (which would create an echo loop between devices).
+      Y.applyUpdate(st.doc, fromBase64(updateBase64), "remote");
 
       const textAfterApply = st.text.toString();
       this.logInfo("Applied remote update", {
@@ -673,6 +703,25 @@ export class YjsEvoluHistoryEngine {
     } catch (e) {
       this.logError("closeDoc failed", { path, error: e });
     }
+  }
+
+  /**
+   * Cancels any pending flush timer and destroys the Y.Doc for `path` without
+   * flushing pending updates or saving a snapshot.
+   *
+   * Used when the file is being deleted or renamed — we do not want to
+   * retransmit stale content or write a snapshot for a path that no longer
+   * exists in the vault.
+   */
+  private destroyDoc(path: string) {
+    const st = this.states.get(path);
+    if (!st) return;
+    if (st.flushTimer != null) {
+      window.clearTimeout(st.flushTimer);
+      st.flushTimer = null;
+    }
+    st.doc.destroy();
+    this.states.delete(path);
   }
 
   // ---------- history cursor ----------
@@ -745,7 +794,11 @@ export class YjsEvoluHistoryEngine {
       lastUsedMs: Date.now(),
     };
 
-    doc.on("update", (u: Uint8Array) => {
+    doc.on("update", (u: Uint8Array, origin: unknown) => {
+      // Skip updates applied from the poll loop — those are remote updates that
+      // must not be echoed back to the network.  Only locally-generated ops
+      // (vault edits, vault seeding, drift catch-up) should be transmitted.
+      if (origin === "remote") return;
       st.pendingUpdates.push(u);
       this.scheduleOutgoingFlush(path, st);
     });
@@ -796,7 +849,12 @@ export class YjsEvoluHistoryEngine {
 
     const rows = await this.evolu.loadQuery(q);
     if (rows.length === 0) return null;
-    return rows[0].snapshotBase64 ?? null;
+    const val = rows[0].snapshotBase64 ?? null;
+    // "DELETED" is a tombstone written by the delete/rename handlers and the
+    // offline-delete audit.  Treat it as no snapshot so the path is handled
+    // as a brand-new file if it is ever re-created.
+    if (val === "DELETED") return null;
+    return val;
   }
 
   private async saveLocalSnapshot(path: string, st: FileState) {
@@ -804,6 +862,19 @@ export class YjsEvoluHistoryEngine {
     const snapshotBase64 = toBase64(snapshotBytes);
     const id = createIdFromString<"FileSnapshot">(`snapshot:${path}`);
     this.evolu.upsert("_fileSnapshot", { id, path, snapshotBase64 });
+  }
+
+  /**
+   * Writes a tombstone marker to the snapshot row for `path`.
+   *
+   * `loadLocalSnapshot` treats `"DELETED"` as `null`, so if the path is
+   * re-created later it starts fresh without the old Yjs history interfering.
+   * The tombstone also prevents the offline-delete audit from re-emitting a
+   * delete row on every subsequent startup.
+   */
+  private tombstoneSnapshot(path: string) {
+    const id = createIdFromString<"FileSnapshot">(`snapshot:${path}`);
+    this.evolu.upsert("_fileSnapshot", { id, path, snapshotBase64: "DELETED" });
   }
 
   // ---------- writeback ----------
@@ -889,5 +960,149 @@ export class YjsEvoluHistoryEngine {
 
   private isTextFile(file: TFile): boolean {
     return file.extension === "md" || file.extension === "txt";
+  }
+
+  private isTextPath(path: string): boolean {
+    return path.endsWith(".md") || path.endsWith(".txt");
+  }
+
+  // ---------- delete / rename handlers ----------
+
+  /**
+   * Called when the vault fires a `"delete"` event for a text file.
+   *
+   * Destroys the in-memory Yjs doc, tombstones the snapshot so the path is
+   * treated as fresh if re-created, and emits a `fileUpdate { type: "delete" }`
+   * row so other devices trash the file.
+   */
+  async onVaultFileDeleted(file: TFile) {
+    if (!this.isTextFile(file)) return;
+    const path = file.path;
+    try {
+      this.destroyDoc(path);
+      this.pendingVaultSeed.delete(path);
+      this.tombstoneSnapshot(path);
+
+      const id = createIdFromString<"FileUpdate">(
+        `del:${path}:${this.deviceId}:${Date.now()}:${Math.random()}`,
+      );
+      this.evolu.upsert("fileUpdate", {
+        id,
+        path,
+        updateBase64: this.emptyYjsUpdateBase64,
+        type: "delete",
+      });
+      this.outgoingIds.add(id);
+      this.logInfo("Vault file deleted, propagating", { path });
+    } catch (e) {
+      this.logError("onVaultFileDeleted failed", { path, error: e });
+    }
+  }
+
+  /**
+   * Called when the vault fires a `"rename"` event for a text file.
+   *
+   * Propagated as a delete of the old path + a full-state retransmit of the
+   * new path.  The in-memory doc state is re-keyed to the new path so edits
+   * made immediately after the rename are diff'd against the correct baseline.
+   */
+  async onVaultFileRenamed(file: TFile, oldPath: string) {
+    const newPath = file.path;
+    if (!this.isTextPath(oldPath) && !this.isTextPath(newPath)) return;
+    try {
+      // Re-key in-memory state to the new path.
+      const st = this.states.get(oldPath);
+      if (st) {
+        this.states.delete(oldPath);
+        this.states.set(newPath, st);
+        await this.saveLocalSnapshot(newPath, st);
+      }
+
+      this.pendingVaultSeed.delete(oldPath);
+      this.tombstoneSnapshot(oldPath);
+
+      // Propagate the deletion of the old path.
+      const delId = createIdFromString<"FileUpdate">(
+        `del:${oldPath}:${this.deviceId}:${Date.now()}:${Math.random()}`,
+      );
+      this.evolu.upsert("fileUpdate", {
+        id: delId,
+        path: oldPath,
+        updateBase64: this.emptyYjsUpdateBase64,
+        type: "delete",
+      });
+      this.outgoingIds.add(delId);
+
+      // Broadcast full state under the new path.
+      await this.retransmitCurrentState(newPath);
+
+      this.logInfo("Vault file renamed, propagating", { oldPath, newPath });
+    } catch (e) {
+      this.logError("onVaultFileRenamed failed", { oldPath, newPath, error: e });
+    }
+  }
+
+  // ---------- offline delete audit ----------
+
+  /**
+   * Startup audit: detects files that were deleted or renamed while the plugin
+   * was disabled by comparing all non-tombstone snapshots against the current
+   * vault file list.
+   *
+   * Any snapshot path that has no matching vault file is treated as an offline
+   * delete.  A `fileUpdate { type: "delete" }` row is emitted so other devices
+   * trash the file, and the snapshot is tombstoned to prevent re-auditing on
+   * the next startup.
+   *
+   * Called concurrently from `start()` alongside `scanVaultForUnsyncedFiles`.
+   */
+  private async auditSnapshotsForOfflineDeletes() {
+    try {
+      const q = this.evolu.createQuery((db) =>
+        db
+          .selectFrom("_fileSnapshot")
+          .select(["path", "snapshotBase64"])
+          .where("isDeleted", "is", null),
+      );
+      const rows = await this.evolu.loadQuery(q);
+      if (rows.length === 0) return;
+
+      const vaultPaths = new Set(
+        this.vault.getFiles().filter((f) => this.isTextFile(f)).map((f) => f.path),
+      );
+
+      let audited = 0;
+      for (const row of rows) {
+        const path = row.path;
+        if (!path) continue;
+        // Skip already-tombstoned snapshots.
+        if (row.snapshotBase64 === "DELETED") continue;
+        // If the file still exists in the vault, nothing to do.
+        if (vaultPaths.has(path)) continue;
+
+        this.logInfo("Startup audit: offline delete detected", { path });
+        this.destroyDoc(path);
+        this.pendingVaultSeed.delete(path);
+        this.tombstoneSnapshot(path);
+
+        const id = createIdFromString<"FileUpdate">(
+          `del:${path}:${this.deviceId}:${Date.now()}:${Math.random()}`,
+        );
+        this.evolu.upsert("fileUpdate", {
+          id,
+          path,
+          updateBase64: this.emptyYjsUpdateBase64,
+          type: "delete",
+        });
+        this.outgoingIds.add(id);
+        audited++;
+      }
+
+      if (audited > 0) {
+        this.logInfo("Startup audit: done", { offlineDeletes: audited });
+      }
+    } catch (e) {
+      this.logError("auditSnapshotsForOfflineDeletes failed", e);
+    }
   }
 }
