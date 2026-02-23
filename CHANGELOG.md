@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0 — 2026-02-23
+
+First beta release. Core sync, delete/rename propagation, offline detection, and
+CI/CD pipelines for both GitLab and GitHub are all in place.
+
+### Added
+
+- **`.github/workflows/release.yml` — GitHub Actions CI/CD pipeline**:
+  Two-job workflow mirroring the GitLab pipeline. `build` runs on every push
+  (any branch or tag); `release` runs on tag pushes only (`v*`), creating a
+  GitHub Release with the plugin ZIP (`main.js`, `main.js.map`, `manifest.json`)
+  attached as a downloadable asset. `GITHUB_TOKEN` is injected automatically —
+  no secrets configuration required.
+
 ## 0.0.9 — 2026-02-23
 
 ### Improved

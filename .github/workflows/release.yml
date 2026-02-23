@@ -1,0 +1,85 @@
+# .github/workflows/release.yml
+#
+# CI/CD for obsidian-local-sync
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ Every push (any branch or tag)                                           │
+# │   build  — compile TypeScript → dist/ (smoke-test the build)            │
+# ├──────────────────────────────────────────────────────────────────────────┤
+# │ Tag push  (git tag v0.0.9 && git push origin v0.0.9)                    │
+# │   build → release                                                        │
+# │                                                                          │
+# │   release  Zips main.js + main.js.map + manifest.json and attaches it  │
+# │            directly to a GitHub Release (no separate registry needed).  │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# No credentials or secrets need to be configured manually — GITHUB_TOKEN is
+# injected automatically by GitHub Actions.
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+
+jobs:
+  # ─── Build ─────────────────────────────────────────────────────────────────
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm   # speeds up subsequent runs by restoring node_modules cache
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-dist
+          # upload-artifact@v4 strips the common dist/ prefix when all paths share it,
+          # so downstream jobs receive main.js, main.js.map, manifest.json at root.
+          path: |
+            dist/main.js
+            dist/main.js.map
+            dist/manifest.json
+          retention-days: 7
+
+  # ─── Release (tags only) ───────────────────────────────────────────────────
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create a GitHub Release and upload assets
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-dist
+          # no path → files land at workspace root (main.js, main.js.map, manifest.json)
+
+      - name: Create ZIP
+        run: |
+          zip -j "obsidian-local-sync-${{ github.ref_name }}.zip" \
+            main.js \
+            main.js.map \
+            manifest.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "obsidian-local-sync-${{ github.ref_name }}.zip"
+          body: |
+            ## Installation
+
+            1. Download `obsidian-local-sync-${{ github.ref_name }}.zip`.
+            2. Unzip — you get `main.js`, `main.js.map`, and `manifest.json`.
+            3. Copy all three files to `<vault>/.obsidian/plugins/obsidian-local-sync/`.
+            4. Reload Obsidian → enable the plugin.
