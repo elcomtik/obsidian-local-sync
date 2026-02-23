@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.0.6 — 2026-02-23
+
+### Improved
+
+- **`src/main.ts` — Mandatory blocking period for Reset and Restore confirmations**:
+  Both destructive actions (Reset owner, Restore mnemonic) now enforce a
+  mandatory 5-second wait before the confirmation click is accepted. Previously
+  the second click could fire immediately after the first (cancel window, not a
+  safety period). New flow: first click → button shows `"Please wait 5s…"` and
+  a Notice; clicks during the wait are ignored; after 5 s the button changes to
+  `"Confirm reset?"` / `"Confirm restore?"` and a second click executes the
+  action. If no confirmation arrives within 10 s the button auto-reverts to its
+  idle state.
+
+### Added
+
+- **`src/engine.ts` — Startup scan for pre-existing vault files**:
+  Files that existed in the vault before the plugin was installed (or before a
+  new device joined) were never seeded into Evolu because no vault `modify`
+  event ever fired for them. Added `scanVaultForUnsyncedFiles()`, called once
+  from `start()` in the background. It iterates all vault text files, skips any
+  that already have a local `_fileSnapshot` entry (previously synced), and
+  calls `getOrLoadFileState` for the rest. With the BUG-13 fix in place,
+  `getOrLoadFileState` seeds the file's current content into the Yjs doc and
+  schedules an outgoing flush, making the content available to other devices
+  without requiring a manual edit of each file.
+
+### Fixed
+
+- **`src/engine.ts` — reset & restore causes doubled content (Test D)**:
+  After a reset & restore the local `_fileSnapshot` table is empty (DB was
+  wiped). The startup scan took the `snapshot === null` branch for every file
+  and called `getOrLoadFileState` with the default `seedFromVault: true`,
+  inserting vault content into a fresh Yjs doc. The relay then delivered the
+  pre-reset history rows in the next poll and `Y.applyUpdate` applied the same
+  content on top of the already-seeded state — resulting in doubled text.
+
+  Fixed with a **deferred vault seeding** mechanism:
+  - The scan now adds no-snapshot files to `pendingVaultSeed` instead of
+    immediately seeding them.
+  - Each poll cycle that touches a path removes it from `pendingVaultSeed`
+    (relay delivered history → no vault seeding needed).
+  - After the scan completes (`scanComplete = true`) and the relay is quiet
+    (two consecutive polls with the first setting `pendingVaultSeedReady = true`
+    and the second returning zero rows), `drainPendingVaultSeed` seeds only the
+    files the relay never covered — genuinely new files with no remote history.
+  - The `await ongoingPoll` barrier in `start()` is removed; the scan now runs
+    concurrently with the initial poll (the scan only populates the pending set,
+    no Yjs mutations), simplifying the startup sequencing.
+
+- **`src/main.ts` — Performance settings not persisting display on reopen**:
+  The `onChange` callback fires on every keystroke, so intermediate values
+  (e.g. the empty string while editing "50" → "10") could pass numeric
+  validation and be committed to disk. More critically, the committed value
+  was never confirmed to the user — closing and reopening the settings panel
+  showed whatever was last fully saved, which could look like the old value.
+  Switched all four numeric performance settings from `onChange` to a native
+  `"change"` DOM event listener that fires only on blur/Enter. Invalid values
+  now reset the text field to the current saved value and show a `Notice`.
+  Valid values are saved and confirmed with a `Notice` so the user can see the
+  change was applied.
+
+- **`src/engine.ts` — Remote file creation failing: Yjs text empty after applying remote update**:
+  `getOrLoadFileState` seeded a new Yjs doc from vault content via
+  `doc.transact(() => text.insert(0, lastVaultText))` **before** registering
+  the `doc.on("update", …)` listener. The seeding update was therefore never
+  captured in `pendingUpdates` and never sent to Evolu. Remote devices only
+  received incremental diffs (e.g. "insert ' world' at position 5") without
+  the foundational content ("hello" at positions 0–4). Yjs correctly deferred
+  those orphaned operations, leaving `text.toString()` as `""` on the receiving
+  side — which caused `writeYjsToVault` to hit the `newText === lastVaultText`
+  early-return and never write the file.
+
+  Fixed by restructuring `getOrLoadFileState`:
+  1. Apply snapshot **before** the listener (snapshot must not be re-broadcast).
+  2. Register `doc.on("update", …)`.
+  3. Seed initial vault content **after** the listener so the seeding update is
+     captured and transmitted. Remote devices receive the full content first,
+     then subsequent incremental updates integrate correctly.
+
+- **`src/engine.ts` — Remote file creation silently failing when parent folder absent**:
+  If the synced file path contained a subfolder that did not exist on the local
+  device, `vault.create` threw and the error was caught silently. Fixed by
+  creating the missing folder via `vault.createFolder(folderPath)` before
+  `vault.create`. Added `logInfo` at each vault-write branch for observability.
+
+- **`src/engine.ts` — spurious `await` on `void` return of `pollHistoryOnce`**:
+  Two call sites used `await this.pollHistoryOnce()` but `pollHistoryOnce`
+  returns `void`, not a `Promise`, so the `await` was a no-op. Removed the
+  superfluous `await` to eliminate the TypeScript hint 80007 and clarify intent.
+
 ## 0.0.5 — 2026-02-23
 
 ### Fixed

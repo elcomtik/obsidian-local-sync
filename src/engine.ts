@@ -152,6 +152,39 @@ export class YjsEvoluHistoryEngine {
   private outgoingIds = new Set<string>();
 
   /**
+   * Paths of vault files that the startup scan identified as having no local
+   * snapshot (never seeded) but that are NOT immediately seeded from vault.
+   *
+   * Seeding is deferred by one poll cycle so the relay has time to deliver
+   * any existing history for these files before we create a new Yjs state.
+   * Without this, a reset & restore causes the scan to seed vault content
+   * into an empty doc, and then when the relay delivers the pre-reset history
+   * rows in the next poll, both the seeded op and the history op are applied
+   * to the doc → doubled content.
+   *
+   * Files are removed from this set as soon as a poll touches them (history
+   * arrived → no seeding needed).  The remaining files are seeded from vault
+   * after one full quiet poll cycle (relay has quiesced for them).
+   */
+  private pendingVaultSeed = new Set<string>();
+
+  /**
+   * Set to `true` when {@link scanVaultForUnsyncedFiles} has finished
+   * populating {@link pendingVaultSeed}.  Until this is true the poll loop
+   * will not attempt to drain the set (it might not be fully populated yet).
+   */
+  private scanComplete = false;
+
+  /**
+   * Becomes `true` after the first poll cycle that runs *after* the scan is
+   * complete (`scanComplete === true`).  Seeding from {@link pendingVaultSeed}
+   * is only allowed once this is true AND the current poll returns zero rows
+   * (relay is quiet), ensuring at least one full `historyPollMs` window for
+   * relay sync before we decide a file has no remote history.
+   */
+  private pendingVaultSeedReady = false;
+
+  /**
    * @param args.vault     Obsidian Vault used for reading and writing files.
    * @param args.evolu     Typed Evolu client bound to the plugin's {@link Database} schema.
    * @param args.deviceId  Stable per-device identifier embedded in outgoing update row IDs.
@@ -203,9 +236,113 @@ export class YjsEvoluHistoryEngine {
       await this.ensureHistoryCursorRow();
       this.startPollingTimer();
       this.logInfo("Engine started", this.config);
-      if (this.isActive) await this.pollHistoryOnce();
+      // Kick off the scan and the initial poll concurrently.  The scan only
+      // populates pendingVaultSeed (no Yjs mutations), so it is safe to run
+      // alongside the poll.  Deferred seeding (drainPendingVaultSeed) runs
+      // from within the poll loop after the relay has had a chance to deliver
+      // existing history — avoiding the doubled-content bug on reset & restore.
+      void this.scanVaultForUnsyncedFiles();
+      if (this.isActive) this.pollHistoryOnce();
     } catch (e) {
       this.logError("Engine start failed", e);
+    }
+  }
+
+  /**
+   * Background scan run once at startup.
+   *
+   * **Files with a local snapshot** (previously synced): retransmit their full
+   * Yjs state so other devices can reconstruct them even if earlier sessions
+   * only ever sent incremental diffs.
+   *
+   * **Files without a snapshot** (never seeded): rather than immediately seeding
+   * their vault content into an empty Yjs doc, they are placed in
+   * {@link pendingVaultSeed}.  Seeding is deferred until after the first poll
+   * returns zero rows, giving the relay a full `historyPollMs` window to deliver
+   * any existing history for those files.  This prevents doubled content on
+   * reset & restore: without the deferral the scan seeds vault content, and when
+   * the relay delivers pre-reset history rows in the next poll the same text is
+   * applied again on top.
+   */
+  private async scanVaultForUnsyncedFiles() {
+    try {
+      const files = this.vault.getFiles().filter((f) => this.isTextFile(f));
+      this.logInfo("Startup scan: begin", { total: files.length });
+      let retransmitted = 0;
+      let deferred = 0;
+
+      for (const file of files) {
+        if (!this.isActive) break;
+        const snapshot = await this.loadLocalSnapshot(file.path);
+
+        if (snapshot === null) {
+          // Never been seeded. Defer vault seeding until relay has had a chance
+          // to deliver existing history for this file.
+          this.logInfo("Startup scan: deferring new file seed", { path: file.path });
+          this.pendingVaultSeed.add(file.path);
+          deferred++;
+        } else {
+          // Has a local snapshot — retransmit full Yjs state.
+          await this.retransmitCurrentState(file.path);
+          retransmitted++;
+        }
+      }
+
+      this.logInfo("Startup scan: done", { retransmitted, deferred, total: files.length });
+      this.scanComplete = true;
+    } catch (e) {
+      this.logError("scanVaultForUnsyncedFiles failed", e);
+      this.scanComplete = true; // allow drain even if scan errored
+    }
+  }
+
+  /**
+   * Seeds files from {@link pendingVaultSeed} that have not yet been touched by
+   * a poll cycle (i.e. the relay has not delivered any history for them).
+   *
+   * Called after a poll returns zero rows once {@link pendingVaultSeedReady} is
+   * true.  Files already removed from `pendingVaultSeed` by
+   * {@link applyFileUpdateRowById} (history arrived → no seeding needed) are
+   * skipped automatically by the set iteration.
+   */
+  private async drainPendingVaultSeed() {
+    if (this.pendingVaultSeed.size === 0) return;
+    this.logInfo("Startup scan: seeding deferred files", { count: this.pendingVaultSeed.size });
+    for (const path of this.pendingVaultSeed) {
+      if (!this.isActive) break;
+      // Only seed if not already opened by poll (early-return in getOrLoadFileState)
+      if (!this.states.has(path)) {
+        this.logInfo("Startup scan: seeding new file", { path });
+        await this.getOrLoadFileState(path); // seedFromVault: true (default)
+      }
+      this.pendingVaultSeed.delete(path);
+    }
+  }
+
+  /**
+   * Encodes the current in-memory Yjs doc state as a full update and upserts a
+   * `fileUpdate` row with a deterministic per-file-per-device ID.  Called by the
+   * startup scan so every device broadcasts its full file state on load.
+   *
+   * Using a fixed ID means repeated startups update the same Evolu row rather
+   * than creating unbounded new rows.  Remote devices will pick up a new
+   * `evolu_history` entry each time the content changes; Yjs handles repeated
+   * application of the same state idempotently.
+   */
+  private async retransmitCurrentState(path: string) {
+    try {
+      const st = await this.getOrLoadFileState(path);
+      const updateBytes = Y.encodeStateAsUpdate(st.doc);
+      const updateBase64 = toBase64(updateBytes);
+      // Deterministic: one permanent row per file per device for startup full-state.
+      const id = createIdFromString<"FileUpdate">(
+        `startup-retransmit:${path}:${this.deviceId}`,
+      );
+      this.evolu.upsert("fileUpdate", { id, path, updateBase64 });
+      this.outgoingIds.add(id);
+      this.logInfo("Startup scan: retransmitted", { path, bytes: updateBytes.length });
+    } catch (e) {
+      this.logError("retransmitCurrentState failed", { path, error: e });
     }
   }
 
@@ -285,7 +422,7 @@ export class YjsEvoluHistoryEngine {
   async setActive() {
     this.isActive = true;
     this.logInfo("App active");
-    await this.pollHistoryOnce();
+    this.pollHistoryOnce();
   }
 
   /**
@@ -388,7 +525,11 @@ export class YjsEvoluHistoryEngine {
         for (const h of rows) {
           const id = idBytesToId(h.id as unknown as IdBytes);
           const path = await this.applyFileUpdateRowById(id);
-          if (path !== null) touchedPaths.add(path);
+          if (path !== null) {
+            touchedPaths.add(path);
+            // History arrived for this path — no need to seed from vault.
+            this.pendingVaultSeed.delete(path);
+          }
         }
 
         // Save one snapshot per touched file rather than one per update row.
@@ -400,6 +541,20 @@ export class YjsEvoluHistoryEngine {
         if (rows.length > 0) {
           const lastTs = rows[rows.length - 1].timestamp as unknown as TimestampBytes;
           await this.saveHistoryCursor(lastTs);
+        }
+
+        // Deferred vault seeding: once the scan has finished populating
+        // pendingVaultSeed (scanComplete) and at least one subsequent poll
+        // cycle has elapsed (pendingVaultSeedReady), seed any files the relay
+        // did not deliver history for.  We only drain when the current batch
+        // is empty (relay is quiet) so we don't seed a file mid-stream while
+        // its history rows are still arriving.
+        if (this.scanComplete) {
+          if (!this.pendingVaultSeedReady) {
+            this.pendingVaultSeedReady = true;
+          } else if (rows.length === 0) {
+            await this.drainPendingVaultSeed();
+          }
         }
       } catch (e) {
         this.logError("pollHistoryOnce failed", e);
@@ -438,12 +593,34 @@ export class YjsEvoluHistoryEngine {
         return null;
       }
 
-      const st = await this.getOrLoadFileState(path);
+      // Skip our own startup-retransmit rows from previous sessions.
+      //
+      // startup-retransmit uses a deterministic ID so Evolu upserts the same row
+      // each startup.  outgoingIds only suppresses rows written in the *current*
+      // session; in the next session the row's history timestamp falls after the
+      // saved cursor, so the poll would re-apply it — reverting any vault edits
+      // made while the plugin was paused between sessions.
+      const myRetransmitId = createIdFromString<"FileUpdate">(
+        `startup-retransmit:${path}:${this.deviceId}`,
+      );
+      if (fileUpdateId === myRetransmitId) {
+        this.logInfo("Skipped own startup-retransmit row", { path });
+        return null;
+      }
+
+      // Don't seed from vault — history replay provides the content.
+      // Seeding here would cause doubled content after reset & restore.
+      const st = await this.getOrLoadFileState(path, { seedFromVault: false });
       this.touch(st);
 
       Y.applyUpdate(st.doc, fromBase64(updateBase64));
 
-      this.logInfo("Applied remote update", { path });
+      const textAfterApply = st.text.toString();
+      this.logInfo("Applied remote update", {
+        path,
+        yjsTextLength: textAfterApply.length,
+        lastVaultTextLength: st.lastVaultText.length,
+      });
 
       await this.writeYjsToVault(path, st);
       return path;
@@ -532,7 +709,10 @@ export class YjsEvoluHistoryEngine {
 
   // ---------- snapshots ----------
 
-  private async getOrLoadFileState(path: string): Promise<FileState> {
+  private async getOrLoadFileState(
+    path: string,
+    { seedFromVault = true }: { seedFromVault?: boolean } = {},
+  ): Promise<FileState> {
     const existing = this.states.get(path);
     if (existing) return existing;
 
@@ -549,10 +729,10 @@ export class YjsEvoluHistoryEngine {
       lastVaultText = await this.vault.read(f);
     }
 
+    // Apply snapshot BEFORE registering the update listener so the restored
+    // state is not re-broadcast to other devices (they already have it).
     if (snapshotBase64) {
       Y.applyUpdate(doc, fromBase64(snapshotBase64));
-    } else if (lastVaultText) {
-      doc.transact(() => text.insert(0, lastVaultText));
     }
 
     const st: FileState = {
@@ -569,6 +749,34 @@ export class YjsEvoluHistoryEngine {
       st.pendingUpdates.push(u);
       this.scheduleOutgoingFlush(path, st);
     });
+
+    // After the listener is registered, reconcile vault state with Yjs state.
+    //
+    // Case 1 — snapshot exists but vault was edited while the plugin was not
+    // running ("paused" state): the restored Yjs doc has the old content while
+    // the vault file has newer edits.  Apply the diff so the catch-up edit is
+    // captured in pendingUpdates and transmitted to other devices.
+    //
+    // Case 2 — no snapshot: the file has never been seeded into Yjs.  Insert
+    // the full vault content so it becomes the founding Yjs state and is
+    // transmitted to other devices.  Only done when seedFromVault is true
+    // (false when called from poll context to avoid doubling content with
+    // history replay).
+    if (snapshotBase64 && lastVaultText) {
+      const yjsText = text.toString();
+      if (yjsText !== lastVaultText) {
+        this.logInfo("getOrLoadFileState: vault drifted from snapshot, applying catch-up diff", {
+          path,
+          yjsLen: yjsText.length,
+          vaultLen: lastVaultText.length,
+        });
+        doc.transact(() => {
+          applyBetterDiffToYText(text, yjsText, lastVaultText);
+        });
+      }
+    } else if (!snapshotBase64 && lastVaultText && seedFromVault) {
+      doc.transact(() => text.insert(0, lastVaultText));
+    }
 
     this.states.set(path, st);
     return st;
@@ -603,16 +811,40 @@ export class YjsEvoluHistoryEngine {
   private async writeYjsToVault(path: string, st: FileState) {
     try {
       const newText = st.text.toString();
-      if (newText === st.lastVaultText) return;
-
-      let f = this.vault.getAbstractFileByPath(path);
-
-      if (!(f instanceof TFile)) {
-        await this.vault.create(path, newText);
-        st.lastVaultText = newText;
+      this.logInfo("writeYjsToVault: enter", {
+        path,
+        newTextLen: newText.length,
+        lastVaultTextLen: st.lastVaultText.length,
+        unchanged: newText === st.lastVaultText,
+      });
+      if (newText === st.lastVaultText) {
+        this.logInfo("writeYjsToVault: no change, skipping", { path });
         return;
       }
 
+      let f = this.vault.getAbstractFileByPath(path);
+      this.logInfo("writeYjsToVault: vault lookup", { path, fileFound: f instanceof TFile });
+
+      if (!(f instanceof TFile)) {
+        // Create parent folder(s) if the path contains a directory component
+        // that doesn't exist on this device yet.
+        const slashIdx = path.lastIndexOf("/");
+        if (slashIdx > 0) {
+          const folderPath = path.substring(0, slashIdx);
+          if (!this.vault.getAbstractFileByPath(folderPath)) {
+            this.logInfo("writeYjsToVault: creating folder", { folderPath });
+            await this.vault.createFolder(folderPath);
+          }
+        }
+
+        this.logInfo("writeYjsToVault: creating file", { path, chars: newText.length });
+        await this.vault.create(path, newText);
+        st.lastVaultText = newText;
+        this.logInfo("writeYjsToVault: file created", { path });
+        return;
+      }
+
+      this.logInfo("writeYjsToVault: modifying file", { path, chars: newText.length });
       st.ignoreNextVaultModify = true;
       await this.vault.modify(f, newText);
       st.lastVaultText = newText;

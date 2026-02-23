@@ -320,58 +320,74 @@ class LocalSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("History poll interval (ms)")
       .setDesc("How often to check for remote changes.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.historyPollMs))
-          .onChange(async (value) => {
-            const n = Number(value);
-            if (!Number.isFinite(n) || n < 100) return;
-            this.plugin.settings.historyPollMs = Math.floor(n);
-            await this.plugin.applyEngineConfigFromSettings();
-          }),
-      );
+      .addText((text) => {
+        text.setValue(String(this.plugin.settings.historyPollMs));
+        text.inputEl.addEventListener("change", async () => {
+          const n = Number(text.inputEl.value);
+          if (!Number.isFinite(n) || n < 100) {
+            text.setValue(String(this.plugin.settings.historyPollMs));
+            new Notice("Poll interval must be at least 100 ms");
+            return;
+          }
+          this.plugin.settings.historyPollMs = Math.floor(n);
+          await this.plugin.applyEngineConfigFromSettings();
+          new Notice(`Poll interval set to ${this.plugin.settings.historyPollMs} ms`);
+        });
+      });
 
     new Setting(containerEl)
       .setName("History batch size")
       .setDesc("Max history rows processed per poll.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.historyBatchSize))
-          .onChange(async (value) => {
-            const n = Number(value);
-            if (!Number.isFinite(n) || n < 10) return;
-            this.plugin.settings.historyBatchSize = Math.floor(n);
-            await this.plugin.applyEngineConfigFromSettings();
-          }),
-      );
+      .addText((text) => {
+        text.setValue(String(this.plugin.settings.historyBatchSize));
+        text.inputEl.addEventListener("change", async () => {
+          const n = Number(text.inputEl.value);
+          if (!Number.isFinite(n) || n < 10) {
+            text.setValue(String(this.plugin.settings.historyBatchSize));
+            new Notice("Batch size must be at least 10");
+            return;
+          }
+          this.plugin.settings.historyBatchSize = Math.floor(n);
+          await this.plugin.applyEngineConfigFromSettings();
+          new Notice(`Batch size set to ${this.plugin.settings.historyBatchSize}`);
+        });
+      });
 
     new Setting(containerEl)
       .setName("Outgoing batch interval (ms)")
       .setDesc("Minimum time between sending Yjs updates.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.outgoingBatchMs))
-          .onChange(async (value) => {
-            const n = Number(value);
-            if (!Number.isFinite(n) || n < 50) return;
-            this.plugin.settings.outgoingBatchMs = Math.floor(n);
-            await this.plugin.applyEngineConfigFromSettings();
-          }),
-      );
+      .addText((text) => {
+        text.setValue(String(this.plugin.settings.outgoingBatchMs));
+        text.inputEl.addEventListener("change", async () => {
+          const n = Number(text.inputEl.value);
+          if (!Number.isFinite(n) || n < 50) {
+            text.setValue(String(this.plugin.settings.outgoingBatchMs));
+            new Notice("Outgoing interval must be at least 50 ms");
+            return;
+          }
+          this.plugin.settings.outgoingBatchMs = Math.floor(n);
+          await this.plugin.applyEngineConfigFromSettings();
+          new Notice(`Outgoing interval set to ${this.plugin.settings.outgoingBatchMs} ms`);
+        });
+      });
 
     new Setting(containerEl)
       .setName("Max open Yjs docs (LRU)")
       .setDesc("How many files keep Yjs state in memory.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.maxOpenDocs))
-          .onChange(async (value) => {
-            const n = Number(value);
-            if (!Number.isFinite(n) || n < 5) return;
-            this.plugin.settings.maxOpenDocs = Math.floor(n);
-            await this.plugin.applyEngineConfigFromSettings();
-          }),
-      );
+      .addText((text) => {
+        text.setValue(String(this.plugin.settings.maxOpenDocs));
+        text.inputEl.addEventListener("change", async () => {
+          const n = Number(text.inputEl.value);
+          if (!Number.isFinite(n) || n < 5) {
+            text.setValue(String(this.plugin.settings.maxOpenDocs));
+            new Notice("Max open docs must be at least 5");
+            return;
+          }
+          this.plugin.settings.maxOpenDocs = Math.floor(n);
+          await this.plugin.applyEngineConfigFromSettings();
+          new Notice(`Max open docs set to ${this.plugin.settings.maxOpenDocs}`);
+        });
+      });
 
     // ----------------------------
     // Evolu Sync Key (Mnemonic)
@@ -427,6 +443,16 @@ class LocalSyncSettingTab extends PluginSettingTab {
 
     // -- Restore --
     let restoreValue = "";
+    let restorePending = false;
+    let restoreReady = false;
+
+    const resetRestoreState = () => {
+      restorePending = false;
+      restoreReady = false;
+      btn_restore.setButtonText("Restore");
+    };
+
+    let btn_restore: any;
 
     new Setting(containerEl)
       .setName("Restore mnemonic")
@@ -439,6 +465,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
         });
       })
       .addButton((btn) => {
+        btn_restore = btn;
         btn
           .setButtonText("Restore")
           .setCta()
@@ -447,38 +474,79 @@ class LocalSyncSettingTab extends PluginSettingTab {
               new Notice("Paste your mnemonic first");
               return;
             }
-            await this.plugin.prepareForOwnerChange();
-            await this.plugin.evolu.restoreAppOwner(restoreValue, { reload: false });
-            this.plugin.mnemonicCache = restoreValue;
-            console.log("[obsidian-local-sync] INFO: Evolu owner restored");
-            await this.plugin.restartEngine();
-            new Notice("Owner restored — engine restarted.");
-            this.display();
+            // If already confirmed and ready — execute
+            if (restoreReady) {
+              restorePending = false;
+              restoreReady = false;
+              btn.setButtonText("Restore");
+              await this.plugin.prepareForOwnerChange();
+              await this.plugin.evolu.restoreAppOwner(restoreValue, { reload: false });
+              this.plugin.mnemonicCache = restoreValue;
+              console.log("[obsidian-local-sync] INFO: Evolu owner restored");
+              await this.plugin.restartEngine();
+              new Notice("Owner restored — engine restarted.");
+              this.display();
+              return;
+            }
+            // If waiting period is in progress — ignore
+            if (restorePending) return;
+
+            // First click — start mandatory 5s wait
+            const hasFiles = this.plugin.app.vault
+              .getFiles()
+              .some((f) => f.extension === "md" || f.extension === "txt");
+
+            restorePending = true;
+            restoreReady = false;
+            btn.setButtonText("Please wait 5s…");
+            new Notice(
+              hasFiles
+                ? "⚠️ Your vault has existing notes. Restoring into a non-empty vault will " +
+                  "CRDT-merge local and synced content — files at the same path on both " +
+                  "sides will have their text concatenated. " +
+                  "Confirm restore in 5 seconds."
+                : "⚠️ Restoring mnemonic — confirm in 5 seconds.",
+              5000,
+            );
+            window.setTimeout(() => {
+              if (restorePending) {
+                restoreReady = true;
+                btn.setButtonText("Confirm restore?");
+                // Auto-cancel after 10s if not confirmed
+                window.setTimeout(() => {
+                  if (restorePending && restoreReady) resetRestoreState();
+                }, 10000);
+              }
+            }, 5000);
           });
       });
 
     // -- Reset --
     let resetPending = false;
+    let resetReady = false;
+
+    const resetResetState = () => {
+      resetPending = false;
+      resetReady = false;
+      btn_reset.setButtonText("Reset");
+    };
+
+    let btn_reset: any;
 
     new Setting(containerEl)
       .setName("Reset owner (danger)")
       .setDesc("Permanently deletes the Evolu identity on this device.")
       .addButton((btn) => {
+        btn_reset = btn;
         btn
           .setWarning()
           .setButtonText("Reset")
           .onClick(async () => {
-            if (!resetPending) {
-              resetPending = true;
-              btn.setButtonText("Confirm reset?");
-              window.setTimeout(() => {
-                if (resetPending) {
-                  resetPending = false;
-                  btn.setButtonText("Reset");
-                }
-              }, 5000);
-            } else {
+            // If already confirmed and ready — execute
+            if (resetReady) {
               resetPending = false;
+              resetReady = false;
+              btn.setButtonText("Reset");
               await this.plugin.prepareForOwnerChange();
               // Use restoreAppOwner with a fresh mnemonic instead of resetAppOwner.
               // resetAppOwner only drops tables without calling initializeDb, so
@@ -491,7 +559,26 @@ class LocalSyncSettingTab extends PluginSettingTab {
               await this.plugin.restartEngine();
               new Notice("Owner reset — engine restarted.");
               this.display();
+              return;
             }
+            // If waiting period is in progress — ignore
+            if (resetPending) return;
+
+            // First click — start mandatory 5s wait
+            resetPending = true;
+            resetReady = false;
+            btn.setButtonText("Please wait 5s…");
+            new Notice("⚠️ This will permanently delete the Evolu identity on this device. Confirm reset in 5 seconds.", 5000);
+            window.setTimeout(() => {
+              if (resetPending) {
+                resetReady = true;
+                btn.setButtonText("Confirm reset?");
+                // Auto-cancel after 10s if not confirmed
+                window.setTimeout(() => {
+                  if (resetPending && resetReady) resetResetState();
+                }, 10000);
+              }
+            }, 5000);
           });
       });
   }
