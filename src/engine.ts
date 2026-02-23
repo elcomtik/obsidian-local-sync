@@ -137,6 +137,8 @@ export class YjsEvoluHistoryEngine {
 
   private pollTimer: number | null = null;
   private isPolling = false;
+  /** Resolves when the current poll cycle completes. Awaited by stop(). */
+  private ongoingPoll: Promise<void> = Promise.resolve();
 
   // Only process remote history when Obsidian is active
   private isActive = true;
@@ -218,11 +220,29 @@ export class YjsEvoluHistoryEngine {
    * Called from `ObsidianLocalSyncPlugin.onunload` via `void` — the returned
    * promise is not awaited by the Obsidian plugin lifecycle.
    */
-  async stop() {
+  async stop(flush = true) {
     try {
       this.stopPollingTimer();
-      const paths = Array.from(this.states.keys());
-      await Promise.all(paths.map((p) => this.closeDoc(p)));
+      // Wait for any in-progress poll to finish so its cursor write is included
+      // in the final DB flush.  Without this, the cursor update from the last
+      // poll can arrive after closeEvoluDb() has already flushed, and the cursor
+      // would revert on the next session — causing full history replay again.
+      await this.ongoingPoll;
+      if (flush) {
+        const paths = Array.from(this.states.keys());
+        await Promise.all(paths.map((p) => this.closeDoc(p)));
+      } else {
+        // Discard in-memory Yjs docs without writing to Evolu. Used when the
+        // Evolu DB is being reset/restored and any upserts would hit a
+        // partially-re-initialised DB, causing SqliteErrors.
+        for (const st of this.states.values()) {
+          if (st.flushTimer != null) {
+            window.clearTimeout(st.flushTimer);
+            st.flushTimer = null;
+          }
+          st.doc.destroy();
+        }
+      }
       this.states.clear();
       this.logInfo("Engine stopped");
     } catch (e) {
@@ -338,56 +358,55 @@ export class YjsEvoluHistoryEngine {
     this.pollTimer = null;
   }
 
-  private async pollHistoryOnce() {
-    if (!this.isActive) return;
-    if (this.isPolling) return;
-
+  private pollHistoryOnce() {
+    if (!this.isActive || this.isPolling) return;
     this.isPolling = true;
+    this.ongoingPoll = (async () => {
+      try {
+        const cursor = await this.loadHistoryCursor();
 
-    try {
-      const cursor = await this.loadHistoryCursor();
+        const q = this.evolu.createQuery((db) => {
+          let qb = db
+            .selectFrom("evolu_history")
+            .select(["table", "id", "column", "timestamp"])
+            .where("table", "==", "fileUpdate")
+            .where("column", "==", "updateBase64");
 
-      const q = this.evolu.createQuery((db) => {
-        let qb = db
-          .selectFrom("evolu_history")
-          .select(["table", "id", "column", "timestamp"])
-          .where("table", "==", "fileUpdate")
-          .where("column", "==", "updateBase64");
+          if (cursor != null) qb = qb.where("timestamp", ">", cursor);
 
-        if (cursor != null) qb = qb.where("timestamp", ">", cursor);
+          return qb.orderBy("timestamp", "asc").limit(this.config.historyBatchSize);
+        });
 
-        return qb.orderBy("timestamp", "asc").limit(this.config.historyBatchSize);
-      });
+        const rows = await this.evolu.loadQuery(q);
 
-      const rows = await this.evolu.loadQuery(q);
+        // Log only if something happened.
+        if (rows.length > 0) {
+          this.logInfo("History poll fetched rows", { count: rows.length });
+        }
 
-      // Log only if something happened.
-      if (rows.length > 0) {
-        this.logInfo("History poll fetched rows", { count: rows.length });
+        const touchedPaths = new Set<string>();
+        for (const h of rows) {
+          const id = idBytesToId(h.id as unknown as IdBytes);
+          const path = await this.applyFileUpdateRowById(id);
+          if (path !== null) touchedPaths.add(path);
+        }
+
+        // Save one snapshot per touched file rather than one per update row.
+        for (const p of touchedPaths) {
+          const st = this.states.get(p);
+          if (st) await this.saveLocalSnapshot(p, st);
+        }
+
+        if (rows.length > 0) {
+          const lastTs = rows[rows.length - 1].timestamp as unknown as TimestampBytes;
+          await this.saveHistoryCursor(lastTs);
+        }
+      } catch (e) {
+        this.logError("pollHistoryOnce failed", e);
+      } finally {
+        this.isPolling = false;
       }
-
-      const touchedPaths = new Set<string>();
-      for (const h of rows) {
-        const id = idBytesToId(h.id as unknown as IdBytes);
-        const path = await this.applyFileUpdateRowById(id);
-        if (path !== null) touchedPaths.add(path);
-      }
-
-      // Save one snapshot per touched file rather than one per update row.
-      for (const p of touchedPaths) {
-        const st = this.states.get(p);
-        if (st) await this.saveLocalSnapshot(p, st);
-      }
-
-      if (rows.length > 0) {
-        const lastTs = rows[rows.length - 1].timestamp as unknown as TimestampBytes;
-        await this.saveHistoryCursor(lastTs);
-      }
-    } catch (e) {
-      this.logError("pollHistoryOnce failed", e);
-    } finally {
-      this.isPolling = false;
-    }
+    })();
   }
 
   private async applyFileUpdateRowById(fileUpdateId: any): Promise<string | null> {

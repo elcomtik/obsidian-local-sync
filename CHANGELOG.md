@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.0.5 — 2026-02-23
+
+### Fixed
+
+- **`src/main.ts` — `TypeError: getAppOwner is not a function` on plugin start**:
+  A previous fix introduced `this.evolu.getAppOwner()` based on Context7
+  documentation that described a newer Evolu API version. The installed
+  `@evolu/common` 7.4.1 does not have this method — the correct API is
+  `await evolu.appOwner`, a `Promise<AppOwner>` property. Fixed in all three
+  call sites: the startup owner log in `startEngine`, the Reveal button handler,
+  and the Copy button handler.
+
+- **`src/main.ts` — stale mnemonic shown in Reveal/Copy after reset or restore**:
+  `evolu.appOwner` is a `Promise.withResolvers()` promise that resolves only
+  once — after reset/restore it still holds the old owner's mnemonic. Added a
+  `mnemonicCache: string | null` field to the plugin class. The Restore and Reset
+  handlers now store the new mnemonic in the cache; Reveal and Copy buttons read
+  `mnemonicCache ?? evolu.appOwner.mnemonic` so they always reflect the current
+  identity.
+
+- **`src/engine.ts` — history cursor not saved on plugin unload, causing full
+  replay on every restart after restore**: `onunload()` called `closeEvoluDb()`
+  independently of `engine.stop()`. If a poll was in progress, its cursor write
+  arrived via Evolu's `queueMicrotask` path after the DB had already been flushed
+  to disk — so the cursor reverted and the full history was replayed next session.
+
+  Fixed with two changes:
+  1. `pollHistoryOnce()` is refactored from `async` to a sync wrapper that stores
+     the running poll's `Promise` in `this.ongoingPoll`.
+  2. `stop()` now `await`s `this.ongoingPoll` before flushing, ensuring the
+     cursor write from any in-flight poll is committed to the in-memory DB before
+     `closeEvoluDb()` saves it to disk.
+  3. `onunload()` chains `closeEvoluDb` after `stop()` resolves:
+     `void this.engine?.stop().then(() => this.closeEvoluDb?.())`.
+
+- **`src/evoluClient.ts` — sync never works after mnemonic restore**:
+  `createEvolu` keeps a module-level `Map` of instances keyed by app name. When
+  `restartEngine()` called `createEvoluClient(appName, ...)` a second time, Evolu
+  returned the **cached stale instance** — still wired to the old owner's relay
+  WebSocket. The new sql.js driver (reading the restored DB) was created but
+  never used, so the correct owner identity was never registered with the sync
+  layer and relay messages were silently dropped.
+
+  Fixed by introducing a module-level `_clientGeneration` counter in
+  `evoluClient.ts`. Each call to `createEvoluClient` appends the generation to
+  the Evolu instance name (e.g. `obsidian-local-sync-1`), guaranteeing a cache
+  miss and a truly fresh Evolu client. The sql.js driver still opens the fixed
+  `appName.db` file regardless of the session-unique instance name, so the
+  restored DB state is always read correctly.
+
+- **`src/main.ts` — relay WebSocket retains old owner identity after restore**:
+  `restartEngine()` previously only replaced the engine while reusing the
+  existing Evolu client. After `restoreAppOwner` the in-memory DB held the new
+  owner but the relay WebSocket session still authenticated with the old write
+  key, so sync never completed. `restartEngine()` now fully tears down and
+  recreates the Evolu client (flush → new `createEvoluClient` → new relay
+  connection) before starting the new engine.
+
 ## 0.0.4 — 2026-02-22
 
 ### Fixed

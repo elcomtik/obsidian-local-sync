@@ -10,7 +10,7 @@ import {
 } from "obsidian";
 import path from "node:path";
 
-import { createEvoluClient } from "./evoluClient";
+import { createEvoluClient, generateMnemonic } from "./evoluClient";
 import {
   YjsEvoluHistoryEngine,
   type EngineConfig,
@@ -59,6 +59,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   evolu: any;
   closeEvoluDb: (() => void) | null = null;
   engine!: YjsEvoluHistoryEngine;
+  mnemonicCache: string | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -106,15 +107,11 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // ----------------------------
     // Log Evolu owner state
     // ----------------------------
-    try {
+    if (this.settings.logLevel !== "off") {
       const owner = await this.evolu.appOwner;
-      if (this.settings.logLevel !== "off") {
-        console.log("[obsidian-local-sync] INFO: Evolu owner loaded", {
-          hasMnemonic: !!owner?.mnemonic,
-        });
-      }
-    } catch (e) {
-      console.error("[obsidian-local-sync] ERROR: Failed to load Evolu owner", e);
+      console.log("[obsidian-local-sync] INFO: Evolu owner loaded", {
+        hasMnemonic: !!owner?.mnemonic,
+      });
     }
 
     // ----------------------------
@@ -172,8 +169,9 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   }
 
   onunload() {
-    void this.engine?.stop();
-    this.closeEvoluDb?.();
+    // Chain closeEvoluDb *after* stop resolves so the cursor write from any
+    // in-progress poll is committed to the in-memory DB before we flush to disk.
+    void this.engine?.stop().then(() => this.closeEvoluDb?.());
   }
 
   async loadSettings() {
@@ -192,6 +190,66 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   async applyEngineConfigFromSettings() {
     await this.saveSettings();
     await this.engine.updateConfig(toEngineConfig(this.settings));
+  }
+
+  /**
+   * Prepare for a reset/restore: stop the engine without flushing, then wait a
+   * macrotask tick so all pending Evolu microtasks (processMutationQueue) drain
+   * before the caller issues the reset/restore to the DB worker.
+   *
+   * Evolu's DB worker runs on the main thread (no real Worker). Calling
+   * dbWorker.postMessage("reset") drops all tables synchronously. Any mutation
+   * that was queued via queueMicrotask fires *after* the drop but in the same
+   * macrotask, hitting the now-empty DB and producing a SqliteError. The
+   * setTimeout(0) forces those microtasks to flush before the caller proceeds.
+   */
+  async prepareForOwnerChange() {
+    await this.engine.stop(false);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  /**
+   * Restart the engine after reset/restore.
+   *
+   * The old Evolu client's WebSocket relay connection was established with the
+   * previous owner identity.  After restoreAppOwner the in-memory DB has the
+   * new identity, but the relay session still uses the old write key — so sync
+   * never authenticates and evolu_history stays empty.  We must flush the new
+   * DB state to disk, then tear down and recreate the full Evolu client so the
+   * new client opens a fresh relay connection with the restored identity.
+   *
+   * The vault event handlers were registered once in startEngine and all read
+   * this.engine at call-time, so replacing the field is enough.
+   */
+  async restartEngine() {
+    // Flush the new DB state (written by restoreAppOwner) to disk.
+    this.closeEvoluDb?.();
+    this.closeEvoluDb = null;
+
+    // Recreate the Evolu client: fresh DB connection + new relay WebSocket.
+    const adapter = this.app.vault.adapter as FileSystemAdapter;
+    const dataDir = path.join(
+      adapter.getBasePath(),
+      this.app.vault.configDir,
+      "plugins",
+      this.manifest.id,
+    );
+    const { evolu, closeDb } = createEvoluClient(
+      this.settings.appName,
+      this.settings.relayUrl,
+      dataDir,
+    );
+    this.evolu = evolu;
+    this.closeEvoluDb = closeDb;
+
+    this.engine = new YjsEvoluHistoryEngine({
+      vault: this.app.vault,
+      evolu: this.evolu,
+      deviceId: this.settings.deviceId,
+      config: toEngineConfig(this.settings),
+      logLevel: this.settings.logLevel,
+    });
+    await this.engine.start();
   }
 }
 
@@ -339,8 +397,11 @@ class LocalSyncSettingTab extends PluginSettingTab {
       .addButton((btn) => {
         btn.setButtonText("Reveal").onClick(async () => {
           if (mnemonicBox.style.display === "none") {
-            const owner = await this.plugin.evolu.appOwner;
-            mnemonicInput.value = owner.mnemonic;
+            const mnemonic =
+              this.plugin.mnemonicCache ??
+              (await this.plugin.evolu.appOwner)?.mnemonic ??
+              "(no owner)";
+            mnemonicInput.value = mnemonic;
             mnemonicBox.style.display = "";
             btn.setButtonText("Hide");
           } else {
@@ -352,8 +413,14 @@ class LocalSyncSettingTab extends PluginSettingTab {
       })
       .addButton((btn) => {
         btn.setButtonText("Copy").onClick(async () => {
-          const owner = await this.plugin.evolu.appOwner;
-          await navigator.clipboard.writeText(owner.mnemonic);
+          const mnemonic =
+            this.plugin.mnemonicCache ??
+            (await this.plugin.evolu.appOwner)?.mnemonic;
+          if (!mnemonic) {
+            new Notice("No owner found");
+            return;
+          }
+          await navigator.clipboard.writeText(mnemonic);
           new Notice("Mnemonic copied to clipboard");
         });
       });
@@ -380,9 +447,13 @@ class LocalSyncSettingTab extends PluginSettingTab {
               new Notice("Paste your mnemonic first");
               return;
             }
-            await this.plugin.evolu.restoreAppOwner(restoreValue);
+            await this.plugin.prepareForOwnerChange();
+            await this.plugin.evolu.restoreAppOwner(restoreValue, { reload: false });
+            this.plugin.mnemonicCache = restoreValue;
             console.log("[obsidian-local-sync] INFO: Evolu owner restored");
-            new Notice("Owner restored. Please restart Obsidian.");
+            await this.plugin.restartEngine();
+            new Notice("Owner restored — engine restarted.");
+            this.display();
           });
       });
 
@@ -408,9 +479,18 @@ class LocalSyncSettingTab extends PluginSettingTab {
               }, 5000);
             } else {
               resetPending = false;
-              await this.plugin.evolu.resetAppOwner();
+              await this.plugin.prepareForOwnerChange();
+              // Use restoreAppOwner with a fresh mnemonic instead of resetAppOwner.
+              // resetAppOwner only drops tables without calling initializeDb, so
+              // internal tables (evolu_history etc.) are missing after reset.
+              // restoreAppOwner drops + re-initialises the full DB schema.
+              const newMnemonic = generateMnemonic();
+              await this.plugin.evolu.restoreAppOwner(newMnemonic, { reload: false });
+              this.plugin.mnemonicCache = newMnemonic;
               console.warn("[obsidian-local-sync] WARN: Evolu owner reset");
-              new Notice("Owner reset. Please restart Obsidian.");
+              await this.plugin.restartEngine();
+              new Notice("Owner reset — engine restarted.");
+              this.display();
             }
           });
       });
