@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.9 — 2026-02-23
+
+### Improved
+
+- **`.gitlab-ci.yml` — include `main.js.map` in release ZIP**:
+  The sourcemap is now bundled alongside `main.js` and `manifest.json` in the
+  release package. When the sourcemap is present in the plugin folder, the
+  Obsidian developer console automatically maps stack frames back to the original
+  TypeScript source, making bug reports significantly easier to diagnose.
+
 ## 0.0.8 — 2026-02-23
 
 ### Added
