@@ -1,8 +1,39 @@
 # Changelog
 
+## 0.0.8 — 2026-02-23
+
+### Added
+
+- **`.gitlab-ci.yml` — GitLab CI/CD pipeline**:
+  Three-stage pipeline: `build` (every push) → `publish` + `release` (tag pushes only).
+  - `build`: runs `npm ci && npm run build`; exposes `dist/main.js` and
+    `dist/manifest.json` as short-lived job artifacts.
+  - `publish`: zips the plugin files and uploads to the **GitLab Generic Package
+    Registry** under a versioned path — permanent, downloadable link.
+  - `release`: uses `release-cli` to create a **GitLab Release** entry (Deploy →
+    Releases) with the ZIP download link and inline installation instructions.
+
+  Trigger a release with: `git tag v0.0.8 && git push origin v0.0.8`. No credentials
+  or CI variables need manual configuration — `CI_JOB_TOKEN`, `CI_API_V4_URL`, and
+  `CI_PROJECT_ID` are injected automatically by GitLab.
+
 ## 0.0.7 — 2026-02-23
 
 ### Fixed
+
+- **`src/evoluClient.ts` — Evolu error-level relay logs appear as console errors**:
+  `createConsole()` from `@evolu/common` unconditionally calls `console.error()` for
+  error-level messages — the `enableLogging` flag only gates `warn`/`log`/`debug`.
+  Relay and WebSocket reconnect failures logged by Evolu via `deps.console.error`
+  therefore showed up as red unhandled errors in the Obsidian developer console,
+  alarming but not actionable (the relay retries automatically).
+
+  Fixed by replacing both `createConsole()` calls in `createEvoluClient` (passed to
+  `createDbWorkerForPlatform` and to `EvoluDeps`) with a custom `evoluConsole` object
+  that spreads `createConsole()` but overrides `error` to call `console.warn("[evolu]",
+  ...)` instead. The raw `"WebSocket connection to 'wss://...' failed"` messages emitted
+  by the Electron runtime before any JS handler runs are a platform concern and cannot
+  be suppressed via this mechanism.
 
 - **`src/evoluClient.ts` — leaked WebSocket per plugin reload causes compounding reconnect errors**:
   `[Symbol.dispose]()` on the Evolu instance is not implemented in `@evolu/common` 7.4.1
