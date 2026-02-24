@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.1 — 2026-02-24
+
+### Fixed
+
+- **`src/sqliteDriver.ts`, `src/main.ts` — plugin fails to load on Android (BUG-22)**:
+  `sqliteDriver.ts` imported `node:fs` and `node:path` directly; `main.ts` used
+  `FileSystemAdapter.getBasePath()` combined with `path.join()` to compute the
+  database path.  Android's Obsidian app runs in a WebView with no Node.js
+  runtime — both imports threw `ReferenceError` on module evaluation, preventing
+  the plugin from loading at all.
+
+  Fixed by replacing all `fs`/`path` usage with a `PlatformIO` interface
+  (`readFile: () => Promise<Uint8Array | null>`, `writeFile: (data: Uint8Array) =>
+  Promise<void>`).  Both methods are implemented via `app.vault.adapter.readBinary`
+  / `writeBinary` — Obsidian's cross-platform `DataAdapter` API, which works
+  identically on desktop (backed by Node `fs` internally) and mobile (backed by
+  Capacitor file access).  The `flush()` call in `sqliteDriver.ts` is now async
+  and properly awaited in `restartEngine()`.
+
+- **`esbuild.config.mjs` — `ReferenceError: process is not defined` on Android (BUG-23)**:
+  esbuild `platform:"node"` caused it to resolve `msgpackr` to its Node.js entry
+  point (`msgpackr/node-index.js`), which executes
+  `process.env.MSGPACKR_NATIVE_ACCELERATION_DISABLED` at module load time —
+  before any polyfill could run.  On Android `process` is not a global, so the
+  bundle crashed immediately.
+
+  A `globalThis.process` polyfill prepended to the banner was insufficient:
+  the identifier `process` is emitted directly in the module scope by esbuild
+  and the runtime lookup on Android did not reach `globalThis`.
+
+  Fixed by switching esbuild to `platform:"browser"`, which causes it to resolve
+  packages using their `browser` export condition.  `msgpackr` ships a dedicated
+  browser entry (`./index.js`) that contains no Node globals.  All remaining node
+  built-ins (`node:fs`, `node:crypto`, etc.) are explicitly marked as `external`;
+  they appear only inside sql.js's `if(ca)` guard where
+  `ca = globalThis.process?.versions?.node` — always falsy on Android, so those
+  code paths are never executed.  The `require` surface in the bundle dropped from
+  9 node built-ins to 2.
+
 ## 0.1.0 — 2026-02-23
 
 First beta release. Core sync, delete/rename propagation, offline detection, and

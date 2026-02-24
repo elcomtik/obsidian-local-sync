@@ -10,7 +10,7 @@ import {
 import { createOwnerSecret, ownerSecretToMnemonic } from "@evolu/common/local-first";
 import { createDbWorkerForPlatform } from "@evolu/common/local-first";
 import type { CreateSqliteDriver, EvoluDeps } from "@evolu/common";
-import { createPersistentSqlJsDriver } from "./sqliteDriver";
+import { createPersistentSqlJsDriver, type PlatformIO } from "./sqliteDriver";
 import { Schema } from "./schema";
 
 /**
@@ -54,36 +54,36 @@ const evoluConsole = {
  * unload to persist the history cursor.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _cached: { evolu: any; flush: () => void } | null = null;
+let _cached: { evolu: any; flush: () => Promise<void> } | null = null;
 
 /**
- * Returns the Evolu client for `appName` / `relayUrl` / `dataDir`, creating
- * it on the first call and reusing it on subsequent calls with the same
- * arguments.  Pass `forceNew: true` only when reset/restore needs a fresh
- * relay connection with a new identity.
+ * Returns the Evolu client for `appName` / `relayUrl`, creating it on the
+ * first call and reusing it on subsequent calls.  Pass `forceNew: true` only
+ * when reset/restore needs a fresh relay connection with a new identity.
  *
  * `closeDb` flushes the SQLite driver to disk without closing anything —
  * safe to call on every plugin unload.
+ *
+ * `io` provides platform-independent file I/O for the SQLite database.
+ * Use `app.vault.adapter.readBinary/writeBinary` on both desktop and mobile
+ * (Obsidian's DataAdapter API is available on all platforms).
  */
 export function createEvoluClient(
   appName: string,
   relayUrl: string,
-  dataDir: string,
+  io: PlatformIO,
   { forceNew = false }: { forceNew?: boolean } = {},
 ) {
   if (_cached && !forceNew) {
     return { evolu: _cached.evolu, closeDb: _cached.flush };
   }
 
-  const dbFileName = SimpleName.orThrow(appName);
+  let flush: () => Promise<void> = async () => {};
 
-  let flush: () => void = () => {};
-
-  const innerFactory = createPersistentSqlJsDriver(dataDir);
+  const innerFactory = createPersistentSqlJsDriver(io);
   const wrappedFactory: CreateSqliteDriver = async (_name, options) => {
-    // Always open the file named after `appName` — not an Evolu-internal name.
-    const driver = await innerFactory(dbFileName, options);
-    flush = () => (driver as any).flush?.();
+    const driver = await innerFactory(_name, options);
+    flush = async () => { await (driver as any).flush?.(); };
     return driver;
   };
 
@@ -121,7 +121,7 @@ export function createEvoluClient(
 
   const closeDb = () => flush();
   _cached = { evolu, flush: closeDb };
-  return { evolu, closeDb };
+  return { evolu, closeDb };  // closeDb: () => Promise<void>
 }
 
 /**

@@ -1,7 +1,5 @@
 import initSqlJs from "sql.js/dist/sql-asm.js";
 import type { CreateSqliteDriver } from "@evolu/common";
-import fs from "node:fs";
-import path from "node:path";
 
 let sqlPromise: ReturnType<typeof initSqlJs> | null = null;
 
@@ -15,35 +13,39 @@ function getSql() {
 const SAVE_DEBOUNCE_MS = 5_000;
 
 /**
- * Creates an Evolu `CreateSqliteDriver` factory backed by sql.js (asm.js) with
- * file-based persistence via Node.js `fs`.
+ * Platform-independent file I/O for the SQLite database.
  *
- * The returned factory, when called by Evolu with a database name:
- * 1. Loads an existing `<name>.db` file from `dataDir` on open, or starts a
- *    fresh in-memory database if the file does not exist.
- * 2. After each mutation that modifies at least one row, arms a
- *    {@link SAVE_DEBOUNCE_MS}-millisecond debounce save to disk.
- * 3. On `[Symbol.dispose]`: cancels any pending debounce, immediately flushes
- *    the database to disk, then closes the sql.js instance.
+ * On desktop, implemented via Obsidian's DataAdapter (backed by Node fs).
+ * On mobile (Android/iOS), implemented via the mobile vault adapter.
+ * Both platforms expose the same DataAdapter API — no direct Node.js imports.
+ */
+export type PlatformIO = {
+  readFile: () => Promise<Uint8Array | null>;
+  writeFile: (data: Uint8Array) => Promise<void>;
+};
+
+/**
+ * Creates an Evolu `CreateSqliteDriver` factory backed by sql.js (asm.js) with
+ * file-based persistence via the platform-independent `io` abstraction.
+ *
+ * 1. On open: loads the existing DB file via `io.readFile()`, or starts fresh.
+ * 2. After each mutation: arms a {@link SAVE_DEBOUNCE_MS}-ms debounce write.
+ * 3. On `flush()`: cancels the debounce and immediately awaits the write.
+ *    Call this on plugin unload to guarantee the cursor and recent mutations
+ *    are persisted before the process can be interrupted.
  *
  * This replaces `@evolu/web`, which is incompatible with Obsidian's CJS plugin
  * context (`import.meta.url` unavailable, no SharedWebWorker, no OPFS).
- *
- * @param dataDir Absolute directory path where `.db` files are stored.
- *                Typically `<vault>/.obsidian/plugins/obsidian-local-sync/`.
  */
-export function createPersistentSqlJsDriver(
-  dataDir: string,
-): CreateSqliteDriver {
-  return async (name, options) => {
+export function createPersistentSqlJsDriver(io: PlatformIO): CreateSqliteDriver {
+  return async (_name, options) => {
     const SQL = await getSql();
 
-    const dbPath = path.join(dataDir, `${String(name)}.db`);
-    let existingData: Buffer | null = null;
+    let existingData: Uint8Array | null = null;
     try {
-      existingData = fs.readFileSync(dbPath);
+      existingData = await io.readFile();
     } catch {
-      // No existing database — start fresh
+      // No existing database — start fresh.
     }
 
     const db =
@@ -57,18 +59,15 @@ export function createPersistentSqlJsDriver(
     let isFlushed = false;
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-    function saveToDisk() {
-      if (isDisposed) return;
-      try {
-        const data = db.export();
-        fs.writeFileSync(dbPath, Buffer.from(data));
-      } catch (e) {
+    function saveToDisk(): void {
+      if (isDisposed || isFlushed) return;
+      const data = db.export();
+      io.writeFile(data).catch((e) => {
         console.error("[obsidian-local-sync] ERROR: Failed to save database", e);
-      }
+      });
     }
 
     function scheduleSave() {
-      // Don't arm new saves after the plugin has been unloaded.
       if (isFlushed || isDisposed) return;
       if (saveTimer) return;
       saveTimer = setTimeout(() => {
@@ -78,8 +77,8 @@ export function createPersistentSqlJsDriver(
     }
 
     /**
-     * Cancels any pending debounce timer and immediately writes the current
-     * in-memory database to disk, **without** closing the sql.js instance.
+     * Cancels any pending debounce timer and immediately awaits a write of the
+     * current in-memory database, **without** closing the sql.js instance.
      *
      * Call this on plugin unload.  After returning, the driver enters a "sealed"
      * state: in-memory queries and mutations still succeed (so Evolu's async
@@ -87,14 +86,19 @@ export function createPersistentSqlJsDriver(
      * prevents a stale old-plugin-instance from overwriting the new instance's
      * cursor and mutation state on disk.
      */
-    function flushToDisk() {
+    async function flushToDisk(): Promise<void> {
       if (isDisposed) return;
       if (saveTimer) {
         clearTimeout(saveTimer);
         saveTimer = null;
       }
-      saveToDisk();
-      isFlushed = true;
+      isFlushed = true; // Seal before IO — prevents new saves from arming.
+      const data = db.export();
+      try {
+        await io.writeFile(data);
+      } catch (e) {
+        console.error("[obsidian-local-sync] ERROR: Failed to save database", e);
+      }
     }
 
     return {
@@ -102,9 +106,8 @@ export function createPersistentSqlJsDriver(
 
       exec: (query, isMutation) => {
         // After dispose the sql.js DB is closed; return empty results rather
-        // than letting db.run/exec throw "Database closed" which would bubble
-        // up as an Evolu SqliteError on every relay message received by a stale
-        // plugin instance.
+        // than letting db.run/exec throw "Database closed" on every relay
+        // message received by a stale plugin instance.
         if (isDisposed) return { rows: [], changes: 0 };
 
         if (isMutation) {
@@ -140,7 +143,13 @@ export function createPersistentSqlJsDriver(
           clearTimeout(saveTimer);
           saveTimer = null;
         }
-        saveToDisk();
+        if (!isFlushed) {
+          // Export before closing DB, then write asynchronously.
+          const data = db.export();
+          io.writeFile(data).catch((e) => {
+            console.error("[obsidian-local-sync] ERROR: Failed to save database", e);
+          });
+        }
         db.close();
       },
     };

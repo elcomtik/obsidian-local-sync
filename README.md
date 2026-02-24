@@ -15,6 +15,22 @@ This is an experimental local-first architecture for syncing Markdown files incr
 
 ---
 
+## 📱 Platform Support
+
+| Platform | Status |
+|----------|--------|
+| macOS (desktop) | ✅ Supported |
+| Linux (desktop) | ✅ Supported |
+| Windows (desktop) | ✅ Supported |
+| Android (mobile) | ✅ Supported |
+| iOS (mobile) | 🔲 Untested |
+
+The plugin uses Obsidian's cross-platform `DataAdapter` API for all file I/O,
+so it runs on both Electron (desktop) and the mobile WebView without any
+platform-specific code paths.
+
+---
+
 ## 🚀 Quick Start
 
 ### Build

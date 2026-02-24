@@ -1,16 +1,15 @@
 
 import {
   App,
-  FileSystemAdapter,
   Notice,
   Plugin,
   PluginSettingTab,
   Setting,
   TFile,
 } from "obsidian";
-import path from "node:path";
 
 import { createEvoluClient, generateMnemonic } from "./evoluClient";
+import type { PlatformIO } from "./sqliteDriver";
 import {
   YjsEvoluHistoryEngine,
   type EngineConfig,
@@ -71,7 +70,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
 
   // Evolu types are complex; we keep "any" to avoid fighting TS in this example.
   evolu: any;
-  closeEvoluDb: (() => void) | null = null;
+  closeEvoluDb: (() => Promise<void>) | null = null;
   engine!: YjsEvoluHistoryEngine;
   mnemonicCache: string | null = null;
 
@@ -122,21 +121,43 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     });
   }
 
+  /**
+   * Returns platform-independent file I/O for the plugin's SQLite database.
+   *
+   * Obsidian's `DataAdapter` API (`readBinary` / `writeBinary`) is available
+   * on both desktop (FileSystemAdapter, backed by Node fs) and mobile
+   * (MobileAdapter, backed by Capacitor).  Using it here removes all direct
+   * `node:fs` / `node:path` imports from the plugin bundle, which allows the
+   * plugin to load on Android and iOS where those Node globals do not exist.
+   *
+   * The DB file lives at `<vault>/<configDir>/plugins/<pluginId>/<appName>.db`
+   * — the same directory Obsidian already created for the plugin.
+   */
+  private buildIO(appName: string): PlatformIO {
+    const dbPath = `${this.app.vault.configDir}/plugins/${this.manifest.id}/${appName}.db`;
+    return {
+      readFile: async () => {
+        try {
+          const buf = await this.app.vault.adapter.readBinary(dbPath);
+          return new Uint8Array(buf);
+        } catch {
+          return null; // File does not exist yet — start with a fresh DB.
+        }
+      },
+      writeFile: async (data: Uint8Array) => {
+        await this.app.vault.adapter.writeBinary(dbPath, data.buffer as ArrayBuffer);
+      },
+    };
+  }
+
   private async startEngine() {
     // ----------------------------
     // Create Evolu client
     // ----------------------------
-    const adapter = this.app.vault.adapter as FileSystemAdapter;
-    const dataDir = path.join(
-      adapter.getBasePath(),
-      this.app.vault.configDir,
-      "plugins",
-      this.manifest.id,
-    );
     const { evolu, closeDb } = createEvoluClient(
       this.settings.appName,
       this.settings.relayUrl,
-      dataDir,
+      this.buildIO(this.settings.appName),
     );
     this.evolu = evolu;
     this.closeEvoluDb = closeDb;
@@ -305,21 +326,14 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
    */
   async restartEngine() {
     // Flush the new DB state (written by restoreAppOwner) to disk.
-    this.closeEvoluDb?.();
+    await this.closeEvoluDb?.();
     this.closeEvoluDb = null;
 
     // Recreate the Evolu client: fresh DB connection + new relay WebSocket.
-    const adapter = this.app.vault.adapter as FileSystemAdapter;
-    const dataDir = path.join(
-      adapter.getBasePath(),
-      this.app.vault.configDir,
-      "plugins",
-      this.manifest.id,
-    );
     const { evolu, closeDb } = createEvoluClient(
       this.settings.appName,
       this.settings.relayUrl,
-      dataDir,
+      this.buildIO(this.settings.appName),
       { forceNew: true }, // new mnemonic → new relay WebSocket required
     );
     this.evolu = evolu;
