@@ -145,8 +145,8 @@ export class YjsEvoluHistoryEngine {
 
   /**
    * IDs of `fileUpdate` rows written by this engine instance during the current
-   * session.  Used by {@link applyFileUpdateRowById} to skip rows that we
-   * produced ourselves (self-echo suppression).  Only covers the current
+   * session.  Used by {@link pollHistoryOnce} to skip rows that we produced
+   * ourselves (self-echo suppression).  Only covers the current
    * process lifetime; rows from previous sessions are still applied once.
    */
   private outgoingIds = new Set<string>();
@@ -329,7 +329,7 @@ export class YjsEvoluHistoryEngine {
    *
    * Called after a poll returns zero rows once {@link pendingVaultSeedReady} is
    * true.  Files already removed from `pendingVaultSeed` by
-   * {@link applyFileUpdateRowById} (history arrived → no seeding needed) are
+   * {@link pollHistoryOnce} (history arrived → no seeding needed) are
    * skipped automatically by the set iteration.
    */
   private async drainPendingVaultSeed() {
@@ -527,10 +527,15 @@ export class YjsEvoluHistoryEngine {
       try {
         const cursor = await this.loadHistoryCursor();
 
-        const q = this.evolu.createQuery((db) => {
+        // Step 1: Fetch history row IDs in timestamp order.
+        // Must use the original "==" operator for evolu_history columns
+        // (Evolu's internal convention) and keep the two-step id lookup:
+        // evolu_history.id is stored as BLOB, while fileUpdate.id is TEXT,
+        // so a direct JOIN would never match — we convert bytes→string first.
+        const histQ = this.evolu.createQuery((db) => {
           let qb = db
             .selectFrom("evolu_history")
-            .select(["table", "id", "column", "timestamp"])
+            .select(["id", "timestamp"])
             .where("table", "==", "fileUpdate")
             .where("column", "==", "updateBase64");
 
@@ -539,22 +544,128 @@ export class YjsEvoluHistoryEngine {
           return qb.orderBy("timestamp", "asc").limit(this.config.historyBatchSize);
         });
 
-        const rows = await this.evolu.loadQuery(q);
+        const histRows = await this.evolu.loadQuery(histQ);
 
-        // Log only if something happened.
-        if (rows.length > 0) {
-          this.logInfo("History poll fetched rows", { count: rows.length });
+        if (histRows.length === 0) {
+          // Deferred vault seeding (relay is quiet).
+          if (this.scanComplete) {
+            if (!this.pendingVaultSeedReady) {
+              this.pendingVaultSeedReady = true;
+            } else {
+              await this.drainPendingVaultSeed();
+            }
+          }
+          return;
         }
 
+        this.logInfo("History poll fetched rows", { count: histRows.length });
+
+        // Step 2: Convert blob IDs to string IDs and batch-fetch all fileUpdate
+        // rows in a single query (one round-trip instead of N).
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const stringIds = histRows.map((h) => idBytesToId(h.id as unknown as IdBytes)) as any;
+
+        const fileUpdateQ = this.evolu.createQuery((db) =>
+          (db as any)
+            .selectFrom("fileUpdate")
+            .select(["id", "path", "updateBase64", "type"])
+            .where("id", "in", stringIds)
+            .where("isDeleted", "is", null),
+        );
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const fileUpdateRows = (await this.evolu.loadQuery(fileUpdateQ)) as ReadonlyArray<any>;
+        const rowMap = new Map<string, { path: string; updateBase64: string; type: string | null }>(
+          fileUpdateRows
+            .filter((r) => r.id && r.path && r.updateBase64)
+            .map((r) => [r.id as string, { path: r.path as string, updateBase64: r.updateBase64 as string, type: (r.type as string | null) ?? null }]),
+        );
+
+        // Step 3: Look-ahead — for each path, record the index of its LAST
+        // delete row in the batch.  Content writes are skipped only when a
+        // delete appears at a LATER index (avoids suppressing writes for files
+        // that were deleted and then re-created in the same batch).
+        const lastDeleteIdx = new Map<string, number>();
+        histRows.forEach((h, idx) => {
+          const r = rowMap.get(idBytesToId(h.id as unknown as IdBytes));
+          if (r?.type === "delete") lastDeleteIdx.set(r.path, idx);
+        });
+
+        // Step 4: Process rows in timestamp order.
         const touchedPaths = new Set<string>();
-        for (const h of rows) {
+
+        for (const [rowIdx, h] of histRows.entries()) {
           const id = idBytesToId(h.id as unknown as IdBytes);
-          const path = await this.applyFileUpdateRowById(id);
-          if (path !== null) {
-            touchedPaths.add(path);
-            // History arrived for this path — no need to seed from vault.
-            this.pendingVaultSeed.delete(path);
+
+          // Skip rows we produced ourselves in this session.
+          if (this.outgoingIds.has(id)) {
+            this.logInfo("Skipped own fileUpdate row", { id });
+            continue;
           }
+
+          const r = rowMap.get(id);
+          if (!r) {
+            // Row missing from fileUpdate (different device's encrypted data, or
+            // soft-deleted).  Skip silently — not an error.
+            continue;
+          }
+
+          const { path, updateBase64, type } = r;
+
+          // ── Delete row ──────────────────────────────────────────────────
+          if (type === "delete") {
+            this.destroyDoc(path);
+            this.pendingVaultSeed.delete(path);
+            this.tombstoneSnapshot(path);
+            const f = this.vault.getAbstractFileByPath(path);
+            if (f) {
+              this.pendingRemoteDeletes.add(path);
+              try {
+                await this.vault.trash(f, true);
+              } finally {
+                this.pendingRemoteDeletes.delete(path);
+              }
+            }
+            this.logInfo("Applied remote delete", { path });
+            touchedPaths.add(path);
+            continue;
+          }
+
+          // ── Content update ───────────────────────────────────────────────
+          // Skip our own startup-retransmit rows from previous sessions.
+          // outgoingIds only covers the current session; retransmit rows use a
+          // deterministic ID that persists across restarts.
+          const myRetransmitId = createIdFromString<"FileUpdate">(
+            `startup-retransmit:${path}:${this.deviceId}`,
+          );
+          if (id === myRetransmitId) {
+            this.logInfo("Skipped own startup-retransmit row", { path });
+            continue;
+          }
+
+          const st = await this.getOrLoadFileState(path, { seedFromVault: false });
+          this.touch(st);
+
+          // Pass "remote" as origin so doc.on("update") skips re-queuing this
+          // for outgoing transmission (echo-loop prevention).
+          Y.applyUpdate(st.doc, fromBase64(updateBase64), "remote");
+
+          this.logInfo("Applied remote update", {
+            path,
+            yjsTextLength: st.text.toString().length,
+            lastVaultTextLength: st.lastVaultText.length,
+          });
+
+          if ((lastDeleteIdx.get(path) ?? -1) > rowIdx) {
+            // A delete for this path appears at a later position in the batch —
+            // skip the vault write to avoid the Obsidian metadata-race (ARCH-2).
+            this.logInfo("Skipping vault write, delete follows in batch", { path });
+          } else {
+            await this.writeYjsToVault(path, st);
+          }
+
+          touchedPaths.add(path);
+          this.pendingVaultSeed.delete(path);
         }
 
         // Save one snapshot per touched file rather than one per update row.
@@ -563,23 +674,15 @@ export class YjsEvoluHistoryEngine {
           if (st) await this.saveLocalSnapshot(p, st);
         }
 
-        if (rows.length > 0) {
-          const lastTs = rows[rows.length - 1].timestamp as unknown as TimestampBytes;
-          await this.saveHistoryCursor(lastTs);
-        }
+        const lastTs = histRows[histRows.length - 1].timestamp as unknown as TimestampBytes;
+        await this.saveHistoryCursor(lastTs);
 
-        // Deferred vault seeding: once the scan has finished populating
-        // pendingVaultSeed (scanComplete) and at least one subsequent poll
-        // cycle has elapsed (pendingVaultSeedReady), seed any files the relay
-        // did not deliver history for.  We only drain when the current batch
-        // is empty (relay is quiet) so we don't seed a file mid-stream while
-        // its history rows are still arriving.
+        // Deferred vault seeding: drain only when the relay is quiet.
         if (this.scanComplete) {
           if (!this.pendingVaultSeedReady) {
             this.pendingVaultSeedReady = true;
-          } else if (rows.length === 0) {
-            await this.drainPendingVaultSeed();
           }
+          // (rows.length > 0, so we don't drain this cycle)
         }
       } catch (e) {
         this.logError("pollHistoryOnce failed", e);
@@ -587,93 +690,6 @@ export class YjsEvoluHistoryEngine {
         this.isPolling = false;
       }
     })();
-  }
-
-  private async applyFileUpdateRowById(fileUpdateId: any): Promise<string | null> {
-    // Skip rows we produced ourselves — no need to re-apply our own updates.
-    if (this.outgoingIds.has(fileUpdateId)) {
-      this.logInfo("Skipped own fileUpdate row", { fileUpdateId });
-      return null;
-    }
-
-    try {
-      const q = this.evolu.createQuery((db) =>
-        db
-          .selectFrom("fileUpdate")
-          .select(["path", "updateBase64", "type"])
-          .where("id", "=", fileUpdateId)
-          .where("isDeleted", "is", null)
-          .limit(1),
-      );
-
-      const rows = await this.evolu.loadQuery(q);
-      if (rows.length === 0) {
-        this.logWarn("History referenced missing fileUpdate row", { fileUpdateId });
-        return null;
-      }
-
-      const { path, updateBase64, type } = rows[0];
-      if (!path || !updateBase64) {
-        this.logWarn("fileUpdate row missing fields", { fileUpdateId, path, hasUpdate: !!updateBase64 });
-        return null;
-      }
-
-      // Handle remote delete.
-      if (type === "delete") {
-        this.destroyDoc(path);
-        this.pendingVaultSeed.delete(path);
-        this.tombstoneSnapshot(path);
-        const f = this.vault.getAbstractFileByPath(path);
-        if (f) {
-          this.pendingRemoteDeletes.add(path);
-          try {
-            await this.vault.trash(f, true);
-          } finally {
-            this.pendingRemoteDeletes.delete(path);
-          }
-        }
-        this.logInfo("Applied remote delete", { path });
-        return path;
-      }
-
-      // Skip our own startup-retransmit rows from previous sessions.
-      //
-      // startup-retransmit uses a deterministic ID so Evolu upserts the same row
-      // each startup.  outgoingIds only suppresses rows written in the *current*
-      // session; in the next session the row's history timestamp falls after the
-      // saved cursor, so the poll would re-apply it — reverting any vault edits
-      // made while the plugin was paused between sessions.
-      const myRetransmitId = createIdFromString<"FileUpdate">(
-        `startup-retransmit:${path}:${this.deviceId}`,
-      );
-      if (fileUpdateId === myRetransmitId) {
-        this.logInfo("Skipped own startup-retransmit row", { path });
-        return null;
-      }
-
-      // Don't seed from vault — history replay provides the content.
-      // Seeding here would cause doubled content after reset & restore.
-      const st = await this.getOrLoadFileState(path, { seedFromVault: false });
-      this.touch(st);
-
-      // Pass "remote" as the transaction origin so the doc.on("update") listener
-      // can distinguish this apply from a local edit and skip re-queuing it for
-      // outgoing transmission (which would create an echo loop between devices).
-      Y.applyUpdate(st.doc, fromBase64(updateBase64), "remote");
-
-      const textAfterApply = st.text.toString();
-      this.logInfo("Applied remote update", {
-        path,
-        yjsTextLength: textAfterApply.length,
-        lastVaultTextLength: st.lastVaultText.length,
-      });
-
-      await this.writeYjsToVault(path, st);
-      return path;
-    } catch (e) {
-      this.logError("applyFileUpdateRowById failed", e);
-      return null;
-    }
   }
 
   // ---------- LRU ----------

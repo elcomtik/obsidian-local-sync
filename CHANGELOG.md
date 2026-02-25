@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.3 — 2026-02-25
+
+### Changed
+
+- **`src/engine.ts` — N+1 query reduced to 2 (ARCH-2)**:
+  Previously, `pollHistoryOnce` fetched history row IDs from `evolu_history`
+  and then issued a separate DB query per row to look up `path`, `updateBase64`,
+  and `type` from `fileUpdate` (`applyFileUpdateRowById`).  A batch of 500
+  rows produced 501 DB round-trips per poll cycle.
+
+  A `JOIN` between the two tables was not possible: `evolu_history.id` is
+  stored as a SQLite BLOB while `fileUpdate.id` is TEXT.  A BLOB/TEXT join
+  predicate never matches in SQLite.
+
+  Replaced with two queries: the original `evolu_history` query to fetch IDs
+  in timestamp order, followed by one `fileUpdate WHERE id IN (...)` batch
+  query to fetch all row fields at once.  `applyFileUpdateRowById` has been
+  removed — its logic is now inlined in the poll loop.
+
+  A **look-ahead pass** pre-scans the batch before processing begins.  For
+  each path it records the index of the last delete row in the batch.  A
+  content write (`vault.modify` / `vault.create`) is skipped only when a
+  delete row for the same path appears at a **later** index — not when the
+  delete is earlier (which would be a delete-then-recreate sequence).  This
+  eliminates the Obsidian internal metadata race that logged spurious
+  `"File does not exist"` console errors when a content update and a
+  subsequent delete for the same file appeared in the same poll batch, while
+  correctly syncing files that were deleted and then re-created.
+
 ## 0.1.2 — 2026-02-25
 
 ### Fixed
