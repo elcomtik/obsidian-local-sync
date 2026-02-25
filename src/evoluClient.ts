@@ -9,7 +9,8 @@ import {
 } from "@evolu/common";
 import { createOwnerSecret, ownerSecretToMnemonic } from "@evolu/common/local-first";
 import { createDbWorkerForPlatform } from "@evolu/common/local-first";
-import type { CreateSqliteDriver, EvoluDeps } from "@evolu/common";
+import type { CreateSqliteDriver, Evolu, EvoluDeps, Mnemonic } from "@evolu/common";
+import type { Database } from "./schema";
 import { createPersistentSqlJsDriver, type PlatformIO } from "./sqliteDriver";
 import { Schema } from "./schema";
 
@@ -53,8 +54,7 @@ const evoluConsole = {
  * authentication).  The SQLite driver's `flush()` is still called on every
  * unload to persist the history cursor.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _cached: { evolu: any; flush: () => Promise<void> } | null = null;
+let _cached: { evolu: Evolu<Database>; flush: () => Promise<void> } | null = null;
 
 /**
  * Returns the Evolu client for `appName` / `relayUrl`, creating it on the
@@ -131,7 +131,7 @@ export function createEvoluClient(
  * `resetAppOwner`, which skips `initializeDb` and leaves internal Evolu tables
  * missing).
  */
-export function generateMnemonic(): string {
+export function generateMnemonic(): Mnemonic {
   const randomBytes = createRandomBytes();
   const secret = createOwnerSecret({ randomBytes });
   return ownerSecretToMnemonic(secret);

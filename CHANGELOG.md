@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.4 — 2026-02-25
+
+### Changed
+
+- **`src/engine.ts` — O(1) LRU eviction (PERF-2)**:
+  LRU eviction previously scanned all open docs on every eviction to find the
+  oldest entry.  JavaScript's `Map` preserves insertion order, so LRU order can
+  be maintained for free: `touch(path, st)` deletes and re-inserts the entry to
+  move it to the end (most-recently-used).  `enforceLruLimit` now takes the
+  first entry (least-recently-used) directly — O(1) regardless of `maxOpenDocs`.
+  The `lastUsedMs` timestamp field has been removed from `FileState`.
+
+- **`src/main.ts` / `src/evoluClient.ts` — eliminate remaining `any` types (QUAL-1)**:
+  `btn_restore` and `btn_reset` in the settings tab typed as `ButtonComponent`.
+  `_cached.evolu` in `evoluClient.ts` typed as `Evolu<Database>`.  No functional
+  change; type-checker now covers all Evolu API call sites in the plugin.
+
 ## 0.1.3 — 2026-02-25
 
 ### Changed

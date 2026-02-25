@@ -1,6 +1,8 @@
 
 # Obsidian LocalSync
 
+[![CI](https://github.com/elcomtik/obsidian-local-sync/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/elcomtik/obsidian-local-sync/actions/workflows/release.yml)
+
 Single-user, multi-device file sync for Obsidian using:
 
 - **Yjs** → CRDT document engine (source of truth)
@@ -265,6 +267,12 @@ Out of scope:
 - Extra encryption layer
 - Background workers
 - Snapshot compaction
+
+---
+
+## 🤝 Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

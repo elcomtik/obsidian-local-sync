@@ -117,7 +117,7 @@ Legend: ✅ resolved · ⚠ open
 
 | ID | File | Description | Status |
 |----|------|-------------|--------|
-| QUAL-1 | `main.ts:59` | `evolu: any` in the plugin class — all Evolu API calls in `main.ts` (`.appOwner`, `.subscribeError`, `.restoreAppOwner`, `.resetAppOwner`) are unchecked. Engine correctly types it as `Evolu<Database>`. | ⚠ open |
+| QUAL-1 | `main.ts` / `evoluClient.ts` | `evolu: any` in the plugin class — all Evolu API calls in `main.ts` (`.appOwner`, `.subscribeError`, `.restoreAppOwner`) were unchecked. Fixed: field typed as `Evolu<Database>`, `mnemonicCache` typed as `Mnemonic | null`, user-input restore string validated via `Mnemonic.orThrow()` at the call site. `btn_restore`/`btn_reset` typed as `ButtonComponent`. `_cached.evolu` in `evoluClient.ts` typed as `Evolu<Database>`. | ✅ 0.1.4 |
 | QUAL-2 | `engine.ts` | `applyFileUpdateRowById(fileUpdateId: any)` — parameter typed `any`. Method removed in 0.1.3 (ARCH-2); inline loop uses typed locals. | ✅ 0.1.3 |
 
 #### Performance
@@ -125,7 +125,7 @@ Legend: ✅ resolved · ⚠ open
 | ID | File | Description | Status |
 |----|------|-------------|--------|
 | PERF-1 | `engine.ts:34` | `toBase64` built binary string one character at a time — call-stack overflow risk on large snapshots, slower than chunked spread. | ✅ 0.0.3 |
-| PERF-2 | `engine.ts:319` | LRU eviction is O(n) scan per eviction. Negligible at `maxOpenDocs=50` but would matter if the limit is raised significantly. | ⚠ open (low) |
+| PERF-2 | `engine.ts` | LRU eviction was O(n) scan per eviction. Fixed: `states` Map insertion order used as LRU order; `touch(path, st)` re-inserts at end; eviction takes first entry — O(1). `lastUsedMs` field removed from `FileState`. | ✅ 0.1.4 |
 
 #### Security / UX
 

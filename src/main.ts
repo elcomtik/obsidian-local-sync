@@ -6,10 +6,14 @@ import {
   PluginSettingTab,
   Setting,
   TFile,
+  type ButtonComponent,
 } from "obsidian";
 
 import { createEvoluClient, generateMnemonic } from "./evoluClient";
 import type { PlatformIO } from "./sqliteDriver";
+import { Mnemonic } from "@evolu/common";
+import type { Evolu } from "@evolu/common";
+import type { Database } from "./schema";
 import {
   YjsEvoluHistoryEngine,
   type EngineConfig,
@@ -68,11 +72,10 @@ function toEngineConfig(s: PluginSettings): EngineConfig {
 export default class ObsidianLocalSyncPlugin extends Plugin {
   settings!: PluginSettings;
 
-  // Evolu types are complex; we keep "any" to avoid fighting TS in this example.
-  evolu: any;
+  evolu!: Evolu<Database>;
   closeEvoluDb: (() => Promise<void>) | null = null;
   engine!: YjsEvoluHistoryEngine;
-  mnemonicCache: string | null = null;
+  mnemonicCache: Mnemonic | null = null;
 
   /**
    * Set to true the moment onunload() is called.  Checked at every async
@@ -553,7 +556,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
       btn_restore.setButtonText("Restore");
     };
 
-    let btn_restore: any;
+    let btn_restore: ButtonComponent;
 
     new Setting(containerEl)
       .setName("Restore mnemonic")
@@ -581,8 +584,9 @@ class LocalSyncSettingTab extends PluginSettingTab {
               restoreReady = false;
               btn.setButtonText("Restore");
               await this.plugin.prepareForOwnerChange();
-              await this.plugin.evolu.restoreAppOwner(restoreValue, { reload: false });
-              this.plugin.mnemonicCache = restoreValue;
+              const parsed = Mnemonic.orThrow(restoreValue);
+              await this.plugin.evolu.restoreAppOwner(parsed, { reload: false });
+              this.plugin.mnemonicCache = parsed;
               console.log("[obsidian-local-sync] INFO: Evolu owner restored");
               await this.plugin.restartEngine();
               new Notice("Owner restored — engine restarted.");
@@ -632,7 +636,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
       btn_reset.setButtonText("Reset");
     };
 
-    let btn_reset: any;
+    let btn_reset: ButtonComponent;
 
     new Setting(containerEl)
       .setName("Reset owner (danger)")

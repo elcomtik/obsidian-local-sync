@@ -99,8 +99,6 @@ type FileState = {
   pendingUpdates: Uint8Array[];
   flushTimer: number | null;
 
-  // LRU
-  lastUsedMs: number;
 };
 
 /**
@@ -488,7 +486,7 @@ export class YjsEvoluHistoryEngine {
     try {
       const newVaultText = await this.vault.read(file);
       const st = await this.getOrLoadFileState(path);
-      this.touch(st);
+      this.touch(path, st);
 
       if (st.ignoreNextVaultModify) {
         st.ignoreNextVaultModify = false;
@@ -644,7 +642,7 @@ export class YjsEvoluHistoryEngine {
           }
 
           const st = await this.getOrLoadFileState(path, { seedFromVault: false });
-          this.touch(st);
+          this.touch(path, st);
 
           // Pass "remote" as origin so doc.on("update") skips re-queuing this
           // for outgoing transmission (echo-loop prevention).
@@ -694,22 +692,16 @@ export class YjsEvoluHistoryEngine {
 
   // ---------- LRU ----------
 
-  private touch(st: FileState) {
-    st.lastUsedMs = Date.now();
+  private touch(path: string, st: FileState) {
+    // Re-insert at end of Map so iteration order = LRU → MRU.
+    this.states.delete(path);
+    this.states.set(path, st);
   }
 
   private async enforceLruLimit() {
     while (this.states.size > this.config.maxOpenDocs) {
-      let oldestPath: string | null = null;
-      let oldestMs = Infinity;
-
-      for (const [path, st] of this.states.entries()) {
-        if (st.lastUsedMs < oldestMs) {
-          oldestMs = st.lastUsedMs;
-          oldestPath = path;
-        }
-      }
-
+      // First entry is the least-recently-used.
+      const oldestPath = this.states.keys().next().value as string | undefined;
       if (!oldestPath) return;
 
       await this.closeDoc(oldestPath);
@@ -823,7 +815,6 @@ export class YjsEvoluHistoryEngine {
       ignoreNextVaultModify: false,
       pendingUpdates: [],
       flushTimer: null,
-      lastUsedMs: Date.now(),
     };
 
     doc.on("update", (u: Uint8Array, origin: unknown) => {
