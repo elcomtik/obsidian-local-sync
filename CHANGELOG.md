@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.2 — 2026-02-25
+
+### Fixed
+
+- **`src/engine.ts` — delete echo loop on seeding (BUG-24)**:
+  When `applyFileUpdateRowById` processed a remote delete and called
+  `vault.trash()`, Obsidian fired the vault `"delete"` event synchronously.
+  This triggered `onVaultFileDeleted`, which emitted a new `fileUpdate { type:
+  "delete" }` row back to the relay.  A device that was just seeding (receiving
+  history for the first time) would echo every delete it processed — if another
+  device had since re-created the file at the same path, the echo caused it to
+  be deleted again.
+
+  Same class of bug as BUG-17 (content echo loop, fixed in 0.0.7 via
+  `ignoreNextVaultModify`).  Fixed by adding a `pendingRemoteDeletes:
+  Set<string>` to `YjsEvoluHistoryEngine`:  the path is added before
+  `vault.trash()` and removed in a `finally` block;  `onVaultFileDeleted`
+  returns early without emitting if the path is present in this set.
+
 ## 0.1.1 — 2026-02-24
 
 ### Fixed

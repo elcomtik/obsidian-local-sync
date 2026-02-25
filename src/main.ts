@@ -138,10 +138,14 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     return {
       readFile: async () => {
         try {
+          // Check existence first: on Android, readBinary emits a native-level
+          // "File does not exist" error to the console before the JS exception
+          // propagates, causing noisy but harmless log spam on first startup.
+          if (!(await this.app.vault.adapter.exists(dbPath))) return null;
           const buf = await this.app.vault.adapter.readBinary(dbPath);
           return new Uint8Array(buf);
         } catch {
-          return null; // File does not exist yet — start with a fresh DB.
+          return null;
         }
       },
       writeFile: async (data: Uint8Array) => {

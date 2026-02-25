@@ -169,6 +169,15 @@ export class YjsEvoluHistoryEngine {
   private pendingVaultSeed = new Set<string>();
 
   /**
+   * Paths for which a remote delete is currently being applied (i.e. we are
+   * about to call `vault.trash()`).  While a path is in this set, the vault
+   * `"delete"` event fired by the trash call is suppressed in
+   * {@link onVaultFileDeleted} so we do not echo the delete back to the relay.
+   * Mirrors the `ignoreNextVaultModify` pattern used for content updates.
+   */
+  private pendingRemoteDeletes = new Set<string>();
+
+  /**
    * Set to `true` when {@link scanVaultForUnsyncedFiles} has finished
    * populating {@link pendingVaultSeed}.  Until this is true the poll loop
    * will not attempt to drain the set (it might not be fully populated yet).
@@ -615,7 +624,14 @@ export class YjsEvoluHistoryEngine {
         this.pendingVaultSeed.delete(path);
         this.tombstoneSnapshot(path);
         const f = this.vault.getAbstractFileByPath(path);
-        if (f) await this.vault.trash(f, true);
+        if (f) {
+          this.pendingRemoteDeletes.add(path);
+          try {
+            await this.vault.trash(f, true);
+          } finally {
+            this.pendingRemoteDeletes.delete(path);
+          }
+        }
         this.logInfo("Applied remote delete", { path });
         return path;
       }
@@ -978,6 +994,7 @@ export class YjsEvoluHistoryEngine {
   async onVaultFileDeleted(file: TFile) {
     if (!this.isTextFile(file)) return;
     const path = file.path;
+    if (this.pendingRemoteDeletes.has(path)) return; // remote-initiated trash — suppress echo
     try {
       this.destroyDoc(path);
       this.pendingVaultSeed.delete(path);
