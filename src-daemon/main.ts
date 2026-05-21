@@ -65,6 +65,10 @@ if (mnemonic) {
     await closeDb();
     ({ evolu, closeDb } = createEvoluClient(appName, relayUrl, io, { forceNew: true }));
   }
+} else {
+  console.warn(
+    "[obsidian-local-sync] WARN: LOCALSYNC_MNEMONIC is not set; using the existing local DB owner or creating a new isolated owner if the DB is empty.",
+  );
 }
 
 evolu.subscribeError(() => {
@@ -96,17 +100,16 @@ const watcher = chokidar.watch(vaultRoot, {
   atomic: true,
   usePolling,
   interval: pollIntervalMs,
-  ignored: (absolutePath, stats) => {
-    if (stats?.isDirectory()) return false;
-    const vaultPath = safeToVaultPath(vault, absolutePath);
-    return vaultPath === null ? false : !isTrackedVaultPath(vaultPath, localSyncConfig);
-  },
+  ignored: (absolutePath) => isIgnoredWatchPath(vault, absolutePath),
 });
 
 watcher
   .on("add", (absolutePath) => void onChanged(absolutePath))
   .on("change", (absolutePath) => void onChanged(absolutePath))
   .on("unlink", (absolutePath) => void onDeleted(absolutePath))
+  .on("ready", () => {
+    console.log("[obsidian-local-sync] INFO: Watcher ready");
+  })
   .on("error", (error) => {
     console.error("[obsidian-local-sync] ERROR: Watcher failed", error);
   });
@@ -126,12 +129,14 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 async function onChanged(absolutePath: string) {
   const vaultPath = safeToVaultPath(vault, absolutePath);
   if (vaultPath === null) return;
+  console.log("[obsidian-local-sync] INFO: Vault file changed", { path: vaultPath });
   await engine.onVaultFileChanged(vaultPath);
 }
 
 async function onDeleted(absolutePath: string) {
   const vaultPath = safeToVaultPath(vault, absolutePath);
   if (vaultPath === null) return;
+  console.log("[obsidian-local-sync] INFO: Vault file deleted", { path: vaultPath });
   await engine.onVaultFileDeleted(vaultPath);
 }
 
@@ -150,6 +155,12 @@ function safeToVaultPath(vault: NodeFsVaultAdapter, absolutePath: string): strin
   } catch {
     return null;
   }
+}
+
+function isIgnoredWatchPath(vault: NodeFsVaultAdapter, absolutePath: string): boolean {
+  const vaultPath = safeToVaultPath(vault, absolutePath);
+  if (vaultPath === null || vaultPath === "") return false;
+  return vaultPath.split("/").some((part) => part.startsWith("."));
 }
 
 function readRequiredEnv(name: string): string {

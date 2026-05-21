@@ -8,7 +8,8 @@
     "build:plugin": "node esbuild.plugin.config.mjs",
     "build:daemon": "node esbuild.daemon.config.mjs",
     "dev": "node esbuild.plugin.config.mjs --watch",
-    "dev:daemon": "node esbuild.daemon.config.mjs --watch"
+    "dev:daemon": "node esbuild.daemon.config.mjs --watch",
+    "smoke:daemon": "npm run build:daemon && node scripts/smoke-daemon.mjs"
   },
   "dependencies": {
     "@evolu/common": "7.4.1",

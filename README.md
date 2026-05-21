@@ -42,6 +42,11 @@ npm install
 npm run build
 ```
 
+### Daemon
+
+The Node.js daemon build watches a vault directory outside Obsidian and is
+intended for container/Kubernetes deployment. See [docs/daemon.md](docs/daemon.md).
+
 ### Install into a vault
 
 Copy the `dist/` folder to:

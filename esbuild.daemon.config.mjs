@@ -16,7 +16,7 @@ const ctx = await esbuild.context({
   outfile: path.join(outdir, "main.js"),
   sourcemap: true,
   banner: {
-    js: "#!/usr/bin/env node",
+    js: '#!/usr/bin/env node\nimport { createRequire as __createRequire } from "node:module";\nconst require = __createRequire(import.meta.url);',
   },
 });
 
