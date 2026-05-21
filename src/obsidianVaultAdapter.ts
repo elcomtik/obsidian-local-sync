@@ -1,5 +1,5 @@
 import { TFile, Vault } from "obsidian";
-import type { VaultAdapter, VaultFile } from "./vaultAdapter";
+import type { VaultAdapter, VaultFile } from "../src-core/vaultAdapter";
 
 export class ObsidianVaultAdapter implements VaultAdapter {
   constructor(private readonly vault: Vault) {}
@@ -47,4 +47,3 @@ export class ObsidianVaultAdapter implements VaultAdapter {
     await this.vault.createFolder(path);
   }
 }
-

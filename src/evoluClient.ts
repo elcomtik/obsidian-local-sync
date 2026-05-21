@@ -10,9 +10,9 @@ import {
 import { createOwnerSecret, ownerSecretToMnemonic } from "@evolu/common/local-first";
 import { createDbWorkerForPlatform } from "@evolu/common/local-first";
 import type { CreateSqliteDriver, Evolu, EvoluDeps, Mnemonic } from "@evolu/common";
-import type { Database } from "./schema";
+import type { Database } from "../src-core/schema";
 import { createPersistentSqlJsDriver, type PlatformIO } from "./sqliteDriver";
-import { Schema } from "./schema";
+import { Schema } from "../src-core/schema";
 
 /**
  * Custom console passed to Evolu deps.

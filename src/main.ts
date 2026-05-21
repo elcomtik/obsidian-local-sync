@@ -13,12 +13,12 @@ import { createEvoluClient, generateMnemonic } from "./evoluClient";
 import type { PlatformIO } from "./sqliteDriver";
 import { Mnemonic } from "@evolu/common";
 import type { Evolu } from "@evolu/common";
-import type { Database } from "./schema";
+import type { Database } from "../src-core/schema";
 import {
   YjsEvoluHistoryEngine,
   type EngineConfig,
   type LogLevel,
-} from "./engine";
+} from "../src-core/engine";
 import { ObsidianVaultAdapter } from "./obsidianVaultAdapter";
 
 /**
