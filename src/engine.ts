@@ -42,6 +42,8 @@ export type EngineConfig = {
   maxOpenDocs: number;
 };
 
+export type ReconcileResult = "loaded" | "deferred" | "skipped";
+
 const dmp = new DiffMatchPatch();
 
 /**
@@ -277,20 +279,9 @@ export class YjsEvoluHistoryEngine {
   /**
    * Background scan run once at startup.
    *
-   * **Files with a local snapshot** (previously synced): load the Yjs doc to
-   * detect any offline drift (vault edited while the plugin was not running).
-   * If drift is found, the diff is applied inside {@link getOrLoadFileState},
-   * queued in `pendingUpdates`, and flushed normally — no extra Evolu row is
-   * written on startup for unchanged files.
-   *
-   * **Files without a snapshot** (never seeded): rather than immediately seeding
-   * their vault content into an empty Yjs doc, they are placed in
-   * {@link pendingVaultSeed}.  Seeding is deferred until after the first poll
-   * returns zero rows, giving the relay a full `historyPollMs` window to deliver
-   * any existing history for those files.  This prevents doubled content on
-   * reset & restore: without the deferral the scan seeds vault content, and when
-   * the relay delivers pre-reset history rows in the next poll the same text is
-   * applied again on top.
+   * Uses {@link reconcileVaultFile} rather than pretending every vault file was
+   * modified. Files with snapshots are loaded to detect offline drift; files
+   * without snapshots are deferred until after the relay has gone quiet.
    */
   private async scanVaultForUnsyncedFiles() {
     try {
@@ -303,26 +294,11 @@ export class YjsEvoluHistoryEngine {
 
       for (const file of files) {
         if (!this.isActive) break;
-        const snapshot = await this.loadLocalSnapshot(file.path);
+        const result = await this.reconcileVaultFile(file.path);
 
-        if (snapshot === null) {
-          // Never been seeded. Defer vault seeding until relay has had a chance
-          // to deliver existing history for this file.
-          this.logInfo("Startup scan: deferring new file seed", { path: file.path });
-          this.pendingVaultSeed.add(file.path);
+        if (result === "deferred") {
           deferred++;
-        } else {
-          // Has a local snapshot — load the doc to detect any offline drift
-          // (vault edited while plugin was off).  If vault text ≠ Yjs text the
-          // diff is applied inside getOrLoadFileState, queued in pendingUpdates,
-          // and flushed normally via the debounce timer.
-          //
-          // We intentionally do NOT call retransmitCurrentState here. That would
-          // write a new Evolu row on every startup even when nothing changed,
-          // creating unnecessary evolu_history entries that every other device
-          // must download and process on its next poll.  Historical rows in Evolu
-          // are sufficient for late-joining devices to reconstruct state.
-          await this.getOrLoadFileState(file.path);
+        } else if (result === "loaded") {
           retransmitted++;
         }
       }
@@ -333,6 +309,31 @@ export class YjsEvoluHistoryEngine {
       this.logError("scanVaultForUnsyncedFiles failed", e);
       this.scanComplete = true; // allow drain even if scan errored
     }
+  }
+
+  /**
+   * Reconciles one vault file during startup without treating it as a fresh
+   * modify event.
+   *
+   * **Existing snapshot:** load the Yjs doc and compare its text with vault
+   * content. If vault content drifted while the engine was stopped, the diff is
+   * applied inside {@link getOrLoadFileState} and flushed normally.
+   *
+   * **No snapshot:** defer seeding until after a quiet relay poll so existing
+   * remote history has a chance to arrive first.
+   */
+  async reconcileVaultFile(path: string): Promise<ReconcileResult> {
+    if (!isTrackedVaultPath(path, this.localSyncConfig)) return "skipped";
+
+    const snapshot = await this.loadLocalSnapshot(path);
+    if (snapshot === null) {
+      this.logInfo("Startup scan: deferring new file seed", { path });
+      this.pendingVaultSeed.add(path);
+      return "deferred";
+    }
+
+    await this.getOrLoadFileState(path);
+    return "loaded";
   }
 
   /**
