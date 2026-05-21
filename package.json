@@ -6,10 +6,13 @@
   "scripts": {
     "build": "npm run build:plugin",
     "build:plugin": "node esbuild.plugin.config.mjs",
-    "dev": "node esbuild.plugin.config.mjs --watch"
+    "build:daemon": "node esbuild.daemon.config.mjs",
+    "dev": "node esbuild.plugin.config.mjs --watch",
+    "dev:daemon": "node esbuild.daemon.config.mjs --watch"
   },
   "dependencies": {
     "@evolu/common": "7.4.1",
+    "chokidar": "^5.0.0",
     "diff-match-patch": "^1.0.5",
     "sql.js": "^1.14.0",
     "yjs": "^13.6.27"

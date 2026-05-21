@@ -104,7 +104,7 @@ type FileState = {
 
   // outgoing update batching
   pendingUpdates: Uint8Array[];
-  flushTimer: number | null;
+  flushTimer: ReturnType<typeof setTimeout> | null;
 
 };
 
@@ -141,7 +141,7 @@ export class YjsEvoluHistoryEngine {
 
   private states = new Map<string, FileState>();
 
-  private pollTimer: number | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
   private isPolling = false;
   /** Resolves when the current poll cycle completes. Awaited by stop(). */
   private ongoingPoll: Promise<void> = Promise.resolve();
@@ -412,7 +412,7 @@ export class YjsEvoluHistoryEngine {
         // partially-re-initialised DB, causing SqliteErrors.
         for (const st of this.states.values()) {
           if (st.flushTimer != null) {
-            window.clearTimeout(st.flushTimer);
+            clearTimeout(st.flushTimer);
             st.flushTimer = null;
           }
           st.doc.destroy();
@@ -522,13 +522,13 @@ export class YjsEvoluHistoryEngine {
   // ---------- polling ----------
 
   private startPollingTimer() {
-    this.pollTimer = window.setInterval(() => {
+    this.pollTimer = setInterval(() => {
       if (this.isActive) void this.pollHistoryOnce();
     }, this.config.historyPollMs);
   }
 
   private stopPollingTimer() {
-    if (this.pollTimer != null) window.clearInterval(this.pollTimer);
+    if (this.pollTimer != null) clearInterval(this.pollTimer);
     this.pollTimer = null;
   }
 
@@ -729,7 +729,7 @@ export class YjsEvoluHistoryEngine {
 
     try {
       if (st.flushTimer != null) {
-        window.clearTimeout(st.flushTimer);
+        clearTimeout(st.flushTimer);
         st.flushTimer = null;
       }
 
@@ -754,7 +754,7 @@ export class YjsEvoluHistoryEngine {
     const st = this.states.get(path);
     if (!st) return;
     if (st.flushTimer != null) {
-      window.clearTimeout(st.flushTimer);
+      clearTimeout(st.flushTimer);
       st.flushTimer = null;
     }
     st.doc.destroy();
@@ -959,7 +959,7 @@ export class YjsEvoluHistoryEngine {
   private scheduleOutgoingFlush(path: string, st: FileState) {
     if (st.flushTimer != null) return;
 
-    st.flushTimer = window.setTimeout(async () => {
+    st.flushTimer = setTimeout(async () => {
       st.flushTimer = null;
       await this.flushOutgoingUpdates(path, st);
     }, this.config.outgoingBatchMs);
