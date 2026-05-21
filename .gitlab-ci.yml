@@ -4,7 +4,8 @@
 #
 # ┌──────────────────────────────────────────────────────────────────────────┐
 # │ Every push                                                               │
-# │   build  — compile TypeScript → dist/ and dist-daemon/                  │
+# │   quality-gate — typecheck, plugin build, daemon smoke test             │
+# │   build        — compile TypeScript → dist/ and dist-daemon/            │
 # ├──────────────────────────────────────────────────────────────────────────┤
 # │ Tag push  (git tag v0.0.8 && git push origin v0.0.8)                    │
 # │   build → docker-build → docker-push-release → publish → release         │
@@ -25,16 +26,30 @@ include:
   - { project: elcomtik/ci-templates, file: docker/publish.yml, ref: v0.4.3 }
 
 stages:
+  - test
   - build
   - push
   - publish
   - release
+
+# ─── Quality Gate ────────────────────────────────────────────────────────────
+
+quality-gate:
+  stage: test
+  image: node:22-alpine
+  script:
+    - npm ci
+    - npx tsc --noEmit
+    - npm run build:plugin
+    - npm run smoke:daemon
 
 # ─── Build ───────────────────────────────────────────────────────────────────
 
 build:
   stage: build
   image: node:22-alpine
+  needs:
+    - quality-gate
   script:
     - npm ci
     - npm run build:plugin
@@ -54,6 +69,8 @@ build:
 
 docker-build:
   stage: build
+  needs:
+    - quality-gate
 
 # ─── Publish to Package Registry (tags only) ─────────────────────────────────
 
