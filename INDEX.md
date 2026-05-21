@@ -1,7 +1,9 @@
 # obsidian-local-sync — Project Index
 
 > Single-user, multi-device vault sync using Yjs CRDT + Evolu local-first DB.
-> See [README.md](README.md) for architecture overview, [CLAUDE.md](CLAUDE.md) for AI assistant guidance, [CHANGELOG.md](CHANGELOG.md) for release history.
+> See [README.md](README.md) for architecture overview, [CLAUDE.md](CLAUDE.md) for AI assistant guidance, [CHANGELOG.md](CHANGELOG.md) for release history, and [../docs/README.md](../docs/README.md) for workspace context.
+
+Workspace PRD: [Basic Memory LocalSync](../docs/prd/basic-memory-localsync.md)
 
 ---
 
