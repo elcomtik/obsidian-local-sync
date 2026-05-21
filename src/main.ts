@@ -19,6 +19,7 @@ import {
   type EngineConfig,
   type LogLevel,
 } from "./engine";
+import { ObsidianVaultAdapter } from "./obsidianVaultAdapter";
 
 /**
  * Stop promise from the most recently unloaded plugin instance.
@@ -201,7 +202,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // Create Engine
     // ----------------------------
     this.engine = new YjsEvoluHistoryEngine({
-      vault: this.app.vault,
+      vault: new ObsidianVaultAdapter(this.app.vault),
       evolu: this.evolu,
       deviceId: this.settings.deviceId,
       config: toEngineConfig(this.settings),
@@ -224,7 +225,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("modify", async (file) => {
         if (file instanceof TFile) {
-          await this.engine.onVaultFileModified(file);
+          await this.engine.onVaultFileChanged(file.path);
         }
       }),
     );
@@ -232,7 +233,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
         if (file instanceof TFile) {
-          void this.engine.onVaultFileDeleted(file);
+          void this.engine.onVaultFileDeleted(file.path);
         }
       }),
     );
@@ -240,7 +241,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         if (file instanceof TFile) {
-          void this.engine.onVaultFileRenamed(file, oldPath);
+          void this.engine.onVaultFileRenamed(oldPath, file.path);
         }
       }),
     );
@@ -347,7 +348,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     this.closeEvoluDb = closeDb;
 
     this.engine = new YjsEvoluHistoryEngine({
-      vault: this.app.vault,
+      vault: new ObsidianVaultAdapter(this.app.vault),
       evolu: this.evolu,
       deviceId: this.settings.deviceId,
       config: toEngineConfig(this.settings),

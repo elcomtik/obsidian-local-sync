@@ -1,10 +1,15 @@
-
-import { TFile, Vault } from "obsidian";
 import * as Y from "yjs";
 import DiffMatchPatch from "diff-match-patch";
 import type { Evolu, IdBytes, TimestampBytes } from "@evolu/common";
 import { createIdFromString, idBytesToId } from "@evolu/common";
 import type { Database } from "./schema";
+import type { LocalSyncConfig } from "./pathPolicy";
+import {
+  DEFAULT_LOCAL_SYNC_CONFIG,
+  isTrackedVaultFile,
+  isTrackedVaultPath,
+} from "./pathPolicy";
+import type { VaultAdapter } from "./vaultAdapter";
 
 /**
  * Logging levels (simple).
@@ -104,7 +109,7 @@ type FileState = {
 /**
  * Core sync engine for obsidian-local-sync.
  *
- * Bridges an Obsidian Vault with Evolu's local-first database using Yjs CRDTs
+ * Bridges a vault adapter with Evolu's local-first database using Yjs CRDTs
  * as the source of truth for each tracked file.
  *
  * **Outgoing path** (vault → Evolu):
@@ -124,11 +129,12 @@ type FileState = {
  * Only `.md` and `.txt` files are tracked.
  */
 export class YjsEvoluHistoryEngine {
-  private vault: Vault;
+  private vault: VaultAdapter;
   private evolu: Evolu<Database>;
   private deviceId: string;
 
   private config: EngineConfig;
+  private localSyncConfig: LocalSyncConfig;
   private logLevel: LogLevel;
 
   private states = new Map<string, FileState>();
@@ -199,23 +205,25 @@ export class YjsEvoluHistoryEngine {
   private readonly emptyYjsUpdateBase64 = toBase64(Y.encodeStateAsUpdate(new Y.Doc()));
 
   /**
-   * @param args.vault     Obsidian Vault used for reading and writing files.
+   * @param args.vault     Runtime vault adapter used for reading and writing files.
    * @param args.evolu     Typed Evolu client bound to the plugin's {@link Database} schema.
    * @param args.deviceId  Stable per-device identifier embedded in outgoing update row IDs.
    * @param args.config    Initial engine configuration (hot-swappable via {@link updateConfig}).
    * @param args.logLevel  Initial console log verbosity.
    */
   constructor(args: {
-    vault: Vault;
+    vault: VaultAdapter;
     evolu: Evolu<Database>;
     deviceId: string;
     config: EngineConfig;
+    localSyncConfig?: LocalSyncConfig;
     logLevel: LogLevel;
   }) {
     this.vault = args.vault;
     this.evolu = args.evolu;
     this.deviceId = args.deviceId;
     this.config = args.config;
+    this.localSyncConfig = args.localSyncConfig ?? DEFAULT_LOCAL_SYNC_CONFIG;
     this.logLevel = args.logLevel;
   }
 
@@ -254,8 +262,12 @@ export class YjsEvoluHistoryEngine {
       // - auditSnapshotsForOfflineDeletes: detects files deleted/renamed while plugin was off.
       // - scanVaultForUnsyncedFiles: populates pendingVaultSeed (no Yjs mutations).
       // - poll: relay delivery; deferred seeding runs after relay is quiet.
-      void this.auditSnapshotsForOfflineDeletes();
-      void this.scanVaultForUnsyncedFiles();
+      if (this.localSyncConfig.startupScan) {
+        void this.auditSnapshotsForOfflineDeletes();
+        void this.scanVaultForUnsyncedFiles();
+      } else {
+        this.scanComplete = true;
+      }
       if (this.isActive) this.pollHistoryOnce();
     } catch (e) {
       this.logError("Engine start failed", e);
@@ -282,7 +294,9 @@ export class YjsEvoluHistoryEngine {
    */
   private async scanVaultForUnsyncedFiles() {
     try {
-      const files = this.vault.getFiles().filter((f) => this.isTextFile(f));
+      const files = (await this.vault.listFiles()).filter((f) =>
+        isTrackedVaultFile(f, this.localSyncConfig),
+      );
       this.logInfo("Startup scan: begin", { total: files.length });
       let retransmitted = 0;
       let deferred = 0;
@@ -476,15 +490,14 @@ export class YjsEvoluHistoryEngine {
    *
    * Non-text files (extensions other than `.md` / `.txt`) are silently ignored.
    *
-   * @param file The modified vault file.
+   * @param path The modified vault file path.
    */
-  async onVaultFileModified(file: TFile) {
-    if (!this.isTextFile(file)) return;
-
-    const path = file.path;
+  async onVaultFileChanged(path: string) {
+    if (!isTrackedVaultPath(path, this.localSyncConfig)) return;
 
     try {
-      const newVaultText = await this.vault.read(file);
+      const newVaultText = await this.vault.readText(path);
+      if (newVaultText === null) return;
       const st = await this.getOrLoadFileState(path);
       this.touch(path, st);
 
@@ -501,7 +514,7 @@ export class YjsEvoluHistoryEngine {
       st.lastVaultText = newVaultText;
       // No per-keystroke logs; flush logs happen in flushOutgoingUpdates.
     } catch (e) {
-      this.logError("onVaultFileModified failed", { path, error: e });
+      this.logError("onVaultFileChanged failed", { path, error: e });
     }
   }
 
@@ -615,11 +628,10 @@ export class YjsEvoluHistoryEngine {
             this.destroyDoc(path);
             this.pendingVaultSeed.delete(path);
             this.tombstoneSnapshot(path);
-            const f = this.vault.getAbstractFileByPath(path);
-            if (f) {
+            if (await this.vault.fileExists(path)) {
               this.pendingRemoteDeletes.add(path);
               try {
-                await this.vault.trash(f, true);
+                await this.vault.deleteFile(path);
               } finally {
                 this.pendingRemoteDeletes.delete(path);
               }
@@ -796,11 +808,7 @@ export class YjsEvoluHistoryEngine {
 
     const snapshotBase64 = await this.loadLocalSnapshot(path);
 
-    let lastVaultText = "";
-    const f = this.vault.getAbstractFileByPath(path);
-    if (f instanceof TFile) {
-      lastVaultText = await this.vault.read(f);
-    }
+    const lastVaultText = (await this.vault.readText(path)) ?? "";
 
     // Apply snapshot BEFORE registering the update listener so the restored
     // state is not re-broadcast to other devices (they already have it).
@@ -916,23 +924,21 @@ export class YjsEvoluHistoryEngine {
         return;
       }
 
-      let f = this.vault.getAbstractFileByPath(path);
-      this.logInfo("writeYjsToVault: vault lookup", { path, fileFound: f instanceof TFile });
+      const fileFound = await this.vault.fileExists(path);
+      this.logInfo("writeYjsToVault: vault lookup", { path, fileFound });
 
-      if (!(f instanceof TFile)) {
+      if (!fileFound) {
         // Create parent folder(s) if the path contains a directory component
         // that doesn't exist on this device yet.
         const slashIdx = path.lastIndexOf("/");
         if (slashIdx > 0) {
           const folderPath = path.substring(0, slashIdx);
-          if (!this.vault.getAbstractFileByPath(folderPath)) {
-            this.logInfo("writeYjsToVault: creating folder", { folderPath });
-            await this.vault.createFolder(folderPath);
-          }
+          this.logInfo("writeYjsToVault: ensuring folder", { folderPath });
+          await this.vault.ensureFolder(folderPath);
         }
 
         this.logInfo("writeYjsToVault: creating file", { path, chars: newText.length });
-        await this.vault.create(path, newText);
+        await this.vault.writeText(path, newText);
         st.lastVaultText = newText;
         this.logInfo("writeYjsToVault: file created", { path });
         return;
@@ -940,7 +946,7 @@ export class YjsEvoluHistoryEngine {
 
       this.logInfo("writeYjsToVault: modifying file", { path, chars: newText.length });
       st.ignoreNextVaultModify = true;
-      await this.vault.modify(f, newText);
+      await this.vault.writeText(path, newText);
       st.lastVaultText = newText;
     } catch (e) {
       this.logError("writeYjsToVault failed", { path, error: e });
@@ -981,27 +987,19 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
-  private isTextFile(file: TFile): boolean {
-    return file.extension === "md" || file.extension === "txt";
-  }
-
-  private isTextPath(path: string): boolean {
-    return path.endsWith(".md") || path.endsWith(".txt");
-  }
-
   // ---------- delete / rename handlers ----------
 
   /**
-   * Called when the vault fires a `"delete"` event for a text file.
+   * Called when the vault fires a `"delete"` event for a tracked file.
    *
    * Destroys the in-memory Yjs doc, tombstones the snapshot so the path is
    * treated as fresh if re-created, and emits a `fileUpdate { type: "delete" }`
    * row so other devices trash the file.
    */
-  async onVaultFileDeleted(file: TFile) {
-    if (!this.isTextFile(file)) return;
-    const path = file.path;
+  async onVaultFileDeleted(path: string) {
+    if (!isTrackedVaultPath(path, this.localSyncConfig)) return;
     if (this.pendingRemoteDeletes.has(path)) return; // remote-initiated trash — suppress echo
+    if (!this.localSyncConfig.syncDeletes) return;
     try {
       this.destroyDoc(path);
       this.pendingVaultSeed.delete(path);
@@ -1024,15 +1022,20 @@ export class YjsEvoluHistoryEngine {
   }
 
   /**
-   * Called when the vault fires a `"rename"` event for a text file.
+   * Called when the vault fires a `"rename"` event for a tracked file.
    *
    * Propagated as a delete of the old path + a full-state retransmit of the
    * new path.  The in-memory doc state is re-keyed to the new path so edits
    * made immediately after the rename are diff'd against the correct baseline.
    */
-  async onVaultFileRenamed(file: TFile, oldPath: string) {
-    const newPath = file.path;
-    if (!this.isTextPath(oldPath) && !this.isTextPath(newPath)) return;
+  async onVaultFileRenamed(oldPath: string, newPath: string) {
+    if (
+      !isTrackedVaultPath(oldPath, this.localSyncConfig) &&
+      !isTrackedVaultPath(newPath, this.localSyncConfig)
+    ) {
+      return;
+    }
+    if (!this.localSyncConfig.syncDeletes) return;
     try {
       // Re-key in-memory state to the new path.
       const st = this.states.get(oldPath);
@@ -1081,6 +1084,8 @@ export class YjsEvoluHistoryEngine {
    * Called concurrently from `start()` alongside `scanVaultForUnsyncedFiles`.
    */
   private async auditSnapshotsForOfflineDeletes() {
+    if (!this.localSyncConfig.syncDeletes) return;
+
     try {
       const q = this.evolu.createQuery((db) =>
         db
@@ -1092,7 +1097,9 @@ export class YjsEvoluHistoryEngine {
       if (rows.length === 0) return;
 
       const vaultPaths = new Set(
-        this.vault.getFiles().filter((f) => this.isTextFile(f)).map((f) => f.path),
+        (await this.vault.listFiles())
+          .filter((f) => isTrackedVaultFile(f, this.localSyncConfig))
+          .map((f) => f.path),
       );
 
       let audited = 0;
