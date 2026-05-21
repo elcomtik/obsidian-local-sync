@@ -33,9 +33,6 @@ stages:
   - publish
   - release
 
-variables:
-  DAEMON_IMAGE: ${CI_REGISTRY_IMAGE}/daemon
-
 # ─── Build ───────────────────────────────────────────────────────────────────
 
 build:
@@ -59,20 +56,7 @@ build:
 # ─── Daemon Image ────────────────────────────────────────────────────────────
 
 docker-build:
-  variables:
-    BUILDER_CACHE_IMAGE: ${DAEMON_IMAGE}:builder-cache
-    FINAL_CACHE_IMAGE: ${DAEMON_IMAGE}:final-cache
-    COMMIT_IMAGE: ${DAEMON_IMAGE}/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}
-
-docker-push-latest:
-  variables:
-    COMMIT_IMAGE: ${DAEMON_IMAGE}/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}
-    LATEST_IMAGE: ${DAEMON_IMAGE}/${CI_COMMIT_REF_SLUG}:latest
-
-docker-push-release:
-  variables:
-    COMMIT_IMAGE: ${DAEMON_IMAGE}/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}
-    RELEASE_IMAGE: ${DAEMON_IMAGE}:${CI_COMMIT_REF_NAME}
+  stage: build
 
 # ─── Publish to Package Registry (tags only) ─────────────────────────────────
 
@@ -119,7 +103,7 @@ release:
 
       Use the daemon image:
 
-      `$CI_REGISTRY_IMAGE/daemon:$CI_COMMIT_TAG`
+      `$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG`
     assets:
       links:
         - name: "obsidian-local-sync-$CI_COMMIT_TAG.zip"
