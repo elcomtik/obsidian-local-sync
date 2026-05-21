@@ -7,9 +7,9 @@
 # │   build  — compile TypeScript → dist/ and dist-daemon/                  │
 # ├──────────────────────────────────────────────────────────────────────────┤
 # │ Tag push  (git tag v0.0.8 && git push origin v0.0.8)                    │
-# │   build → daemon-image → publish → release                               │
+# │   build → docker-build → docker-push-release → publish → release         │
 # │                                                                          │
-# │   daemon-image  Builds and pushes the daemon container image.           │
+# │   docker-build  Builds and pushes the daemon container image.           │
 # │   publish       Uploads the plugin ZIP to the GitLab Generic Package    │
 # │                 Registry (permanent, versioned).                        │
 # │                                                                          │
@@ -20,19 +20,27 @@
 # No credentials or env vars need to be configured manually — GitLab injects
 # CI_JOB_TOKEN, CI_API_V4_URL, CI_PROJECT_ID, and CI_COMMIT_TAG automatically.
 
+include:
+  - { project: elcomtik/ci-templates, file: docker/build-2stage.yml, ref: v0.4.3 }
+  - { project: elcomtik/ci-templates, file: docker/publish.yml, ref: v0.4.3 }
+
 default:
   image: node:22-alpine
 
 stages:
   - build
-  - image
+  - push
   - publish
   - release
+
+variables:
+  DAEMON_IMAGE: ${CI_REGISTRY_IMAGE}/daemon
 
 # ─── Build ───────────────────────────────────────────────────────────────────
 
 build:
   stage: build
+  image: node:22-alpine
   script:
     - npm ci
     - npm run build:plugin
@@ -50,35 +58,27 @@ build:
 
 # ─── Daemon Image ────────────────────────────────────────────────────────────
 
-daemon-image:
-  stage: image
-  image: docker:27
-  services:
-    - docker:27-dind
-  rules:
-    - if: $CI_COMMIT_TAG =~ /^v/
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+docker-build:
   variables:
-    DOCKER_TLS_CERTDIR: "/certs"
-  script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-    - docker build -t "$CI_REGISTRY_IMAGE/daemon:$CI_COMMIT_SHORT_SHA" .
-    - docker push "$CI_REGISTRY_IMAGE/daemon:$CI_COMMIT_SHORT_SHA"
-    - |
-      if [ -n "$CI_COMMIT_TAG" ]; then
-        docker tag "$CI_REGISTRY_IMAGE/daemon:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE/daemon:$CI_COMMIT_TAG"
-        docker push "$CI_REGISTRY_IMAGE/daemon:$CI_COMMIT_TAG"
-      fi
-    - |
-      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
-        docker tag "$CI_REGISTRY_IMAGE/daemon:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE/daemon:main"
-        docker push "$CI_REGISTRY_IMAGE/daemon:main"
-      fi
+    BUILDER_CACHE_IMAGE: ${DAEMON_IMAGE}:builder-cache
+    FINAL_CACHE_IMAGE: ${DAEMON_IMAGE}:final-cache
+    COMMIT_IMAGE: ${DAEMON_IMAGE}/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}
+
+docker-push-latest:
+  variables:
+    COMMIT_IMAGE: ${DAEMON_IMAGE}/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}
+    LATEST_IMAGE: ${DAEMON_IMAGE}/${CI_COMMIT_REF_SLUG}:latest
+
+docker-push-release:
+  variables:
+    COMMIT_IMAGE: ${DAEMON_IMAGE}/${CI_COMMIT_REF_SLUG}:${CI_COMMIT_SHA}
+    RELEASE_IMAGE: ${DAEMON_IMAGE}:${CI_COMMIT_REF_NAME}
 
 # ─── Publish to Package Registry (tags only) ─────────────────────────────────
 
 publish:
   stage: publish
+  image: node:22-alpine
   needs: [build]   # download build artifacts; don't wait for unrelated jobs
   rules:
     - if: $CI_COMMIT_TAG =~ /^v/
@@ -98,7 +98,7 @@ release:
   stage: release
   needs:
     - publish
-    - daemon-image
+    - docker-push-release
   rules:
     - if: $CI_COMMIT_TAG =~ /^v/
   image: registry.gitlab.com/gitlab-org/release-cli:latest
@@ -119,7 +119,7 @@ release:
 
       Use the daemon image:
 
-      `"$CI_REGISTRY_IMAGE/daemon:$CI_COMMIT_TAG"`
+      `$CI_REGISTRY_IMAGE/daemon:$CI_COMMIT_TAG`
     assets:
       links:
         - name: "obsidian-local-sync-$CI_COMMIT_TAG.zip"
