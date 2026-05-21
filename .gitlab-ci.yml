@@ -24,9 +24,6 @@ include:
   - { project: elcomtik/ci-templates, file: docker/build-2stage.yml, ref: v0.4.3 }
   - { project: elcomtik/ci-templates, file: docker/publish.yml, ref: v0.4.3 }
 
-default:
-  image: node:22-alpine
-
 stages:
   - build
   - push
