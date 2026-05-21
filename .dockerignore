@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-daemon/
+.git/
+.gitlab-ci.yml
+.obsidian/
+.env
+.env.local
+npm-debug.log
+*.tsbuildinfo
