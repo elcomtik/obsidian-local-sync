@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import chokidar from "chokidar";
 import { Mnemonic } from "@evolu/common";
@@ -22,6 +23,9 @@ const dbPath = path.resolve(
   process.env.LOCALSYNC_DB_PATH ??
     path.join(vaultRoot, ".obsidian/plugins/obsidian-local-sync/obsidian-local-sync.db"),
 );
+const ownerMarkerPath = path.resolve(
+  process.env.LOCALSYNC_OWNER_MARKER_PATH ?? `${dbPath}.owner.sha256`,
+);
 const relayUrl = process.env.EVOLU_RELAY_URL ?? "wss://free.evoluhq.com";
 const appName = process.env.LOCALSYNC_APP_NAME ?? "obsidian-local-sync";
 const deviceId = process.env.DEVICE_ID ?? `k8s-${vaultName}`;
@@ -38,7 +42,6 @@ const localSyncConfig: LocalSyncConfig = {
 };
 const usePolling = readBoolean("LOCALSYNC_USE_POLLING", false);
 const pollIntervalMs = readPositiveInt("LOCALSYNC_POLL_INTERVAL_MS", 1000);
-const ownerReadTimeoutMs = readPositiveInt("LOCALSYNC_OWNER_READ_TIMEOUT_MS", 30_000);
 
 const io: PlatformIO = {
   async readFile() {
@@ -59,15 +62,15 @@ let { evolu, closeDb } = createEvoluClient(appName, relayUrl, io);
 
 const mnemonic = process.env.LOCALSYNC_MNEMONIC?.trim();
 if (mnemonic) {
-  const currentMnemonic = (await withTimeout(
-    evolu.appOwner,
-    "Timed out waiting for Evolu app owner",
-    ownerReadTimeoutMs,
-  ))?.mnemonic;
-  if (currentMnemonic !== mnemonic) {
+  const mnemonicHash = hashMnemonic(mnemonic);
+  const currentMarker = await readOptionalText(ownerMarkerPath);
+  const dbExists = await fileExists(dbPath);
+  if (currentMarker !== mnemonicHash || !dbExists) {
     console.log("[obsidian-local-sync] INFO: Restoring daemon owner from LOCALSYNC_MNEMONIC");
     await evolu.restoreAppOwner(Mnemonic.orThrow(mnemonic), { reload: false });
     await closeDb();
+    await fs.mkdir(path.dirname(ownerMarkerPath), { recursive: true });
+    await fs.writeFile(ownerMarkerPath, mnemonicHash, "utf8");
     ({ evolu, closeDb } = createEvoluClient(appName, relayUrl, io, { forceNew: true }));
   }
 } else {
@@ -199,16 +202,29 @@ function readLogLevel(value: string): LogLevel {
   throw new Error("LOCALSYNC_LOG_LEVEL must be one of: off, error, warn, info");
 }
 
-function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs: number): Promise<T> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
-  });
-  return Promise.race([promise, timeoutPromise]).finally(() => {
-    if (timeout) clearTimeout(timeout);
-  });
-}
-
 function isMissingFile(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+async function readOptionalText(filePath: string): Promise<string | null> {
+  try {
+    return (await fs.readFile(filePath, "utf8")).trim();
+  } catch (error) {
+    if (isMissingFile(error)) return null;
+    throw error;
+  }
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    const fileStat = await fs.stat(filePath);
+    return fileStat.isFile();
+  } catch (error) {
+    if (isMissingFile(error)) return false;
+    throw error;
+  }
+}
+
+function hashMnemonic(mnemonic: string): string {
+  return createHash("sha256").update(mnemonic).digest("hex");
 }

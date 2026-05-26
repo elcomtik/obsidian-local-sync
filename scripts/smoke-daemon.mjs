@@ -30,7 +30,6 @@ const child = spawn(process.execPath, [daemonPath], {
     DEVICE_ID: "smoke-daemon",
     LOCALSYNC_LOG_LEVEL: "info",
     LOCALSYNC_MNEMONIC: mnemonic,
-    LOCALSYNC_OWNER_READ_TIMEOUT_MS: "10000",
     LOCALSYNC_HISTORY_POLL_MS: "250",
     LOCALSYNC_OUTGOING_BATCH_MS: "100",
     LOCALSYNC_USE_POLLING: "true",
