@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createRandomBytes } from "@evolu/common";
+import { createOwnerSecret, ownerSecretToMnemonic } from "@evolu/common/local-first";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const daemonPath = path.join(repoRoot, "dist-daemon", "main.js");
@@ -14,6 +16,7 @@ const dbPath = path.join(
   "obsidian-local-sync",
   "obsidian-local-sync.db",
 );
+const mnemonic = ownerSecretToMnemonic(createOwnerSecret({ randomBytes: createRandomBytes() }));
 
 await mkdir(vaultRoot, { recursive: true });
 
@@ -26,6 +29,8 @@ const child = spawn(process.execPath, [daemonPath], {
     LOCALSYNC_DB_PATH: dbPath,
     DEVICE_ID: "smoke-daemon",
     LOCALSYNC_LOG_LEVEL: "info",
+    LOCALSYNC_MNEMONIC: mnemonic,
+    LOCALSYNC_OWNER_READ_TIMEOUT_MS: "10000",
     LOCALSYNC_HISTORY_POLL_MS: "250",
     LOCALSYNC_OUTGOING_BATCH_MS: "100",
     LOCALSYNC_USE_POLLING: "true",
@@ -48,6 +53,7 @@ child.stderr.on("data", (chunk) => {
 
 try {
   await waitForOutput("Watcher ready", 10_000);
+  await sleep(500);
 
   await mkdir(path.join(vaultRoot, ".obsidian"), { recursive: true });
   await writeFile(path.join(vaultRoot, ".obsidian", "workspace.md"), "ignored\n", "utf8");

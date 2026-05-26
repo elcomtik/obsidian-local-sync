@@ -38,6 +38,7 @@ const localSyncConfig: LocalSyncConfig = {
 };
 const usePolling = readBoolean("LOCALSYNC_USE_POLLING", false);
 const pollIntervalMs = readPositiveInt("LOCALSYNC_POLL_INTERVAL_MS", 1000);
+const ownerReadTimeoutMs = readPositiveInt("LOCALSYNC_OWNER_READ_TIMEOUT_MS", 30_000);
 
 const io: PlatformIO = {
   async readFile() {
@@ -58,7 +59,11 @@ let { evolu, closeDb } = createEvoluClient(appName, relayUrl, io);
 
 const mnemonic = process.env.LOCALSYNC_MNEMONIC?.trim();
 if (mnemonic) {
-  const currentMnemonic = (await evolu.appOwner)?.mnemonic;
+  const currentMnemonic = (await withTimeout(
+    evolu.appOwner,
+    "Timed out waiting for Evolu app owner",
+    ownerReadTimeoutMs,
+  ))?.mnemonic;
   if (currentMnemonic !== mnemonic) {
     console.log("[obsidian-local-sync] INFO: Restoring daemon owner from LOCALSYNC_MNEMONIC");
     await evolu.restoreAppOwner(Mnemonic.orThrow(mnemonic), { reload: false });
@@ -192,6 +197,16 @@ function readLogLevel(value: string): LogLevel {
     return value;
   }
   throw new Error("LOCALSYNC_LOG_LEVEL must be one of: off, error, warn, info");
+}
+
+function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
 }
 
 function isMissingFile(error: unknown): boolean {
