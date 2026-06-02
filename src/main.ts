@@ -23,6 +23,7 @@ import {
   DEFAULT_LOCAL_SYNC_CONFIG,
   type LocalSyncConfig,
 } from "../src-core/pathPolicy";
+import { formatLogLine } from "../src-core/logFormat";
 import { ObsidianVaultAdapter } from "./obsidianVaultAdapter";
 
 /**
@@ -107,15 +108,15 @@ function normalizeRules(values: string[]): string[] {
 }
 
 function logInfo(message: string, data?: unknown) {
-  console.log("[obsidian-local-sync]", new Date().toISOString(), "INFO:", message, data ?? "");
+  console.log(formatLogLine("INFO", message, data));
 }
 
 function logWarn(message: string, data?: unknown) {
-  console.warn("[obsidian-local-sync]", new Date().toISOString(), "WARN:", message, data ?? "");
+  console.warn(formatLogLine("WARN", message, data));
 }
 
 function logError(message: string, data?: unknown) {
-  console.error("[obsidian-local-sync]", new Date().toISOString(), "ERROR:", message, data ?? "");
+  console.error(formatLogLine("ERROR", message, data));
 }
 
 export default class ObsidianLocalSyncPlugin extends Plugin {

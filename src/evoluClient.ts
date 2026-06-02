@@ -13,6 +13,7 @@ import type { CreateSqliteDriver, Evolu, EvoluDeps, Mnemonic } from "@evolu/comm
 import type { Database } from "../src-core/schema";
 import { createPersistentSqlJsDriver, type PlatformIO } from "./sqliteDriver";
 import { Schema } from "../src-core/schema";
+import { formatLogLine } from "../src-core/logFormat";
 
 /**
  * Custom console passed to Evolu deps.
@@ -32,7 +33,7 @@ const evoluConsole = {
   ...createConsole(),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   error: (...args: any[]) => {
-    console.warn("[evolu]", ...args);
+    console.warn(formatLogLine("WARN", "Evolu error", args));
   },
 };
 

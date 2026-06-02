@@ -1,5 +1,6 @@
 import initSqlJs from "sql.js/dist/sql-asm.js";
 import type { CreateSqliteDriver } from "@evolu/common";
+import { formatLogLine } from "../src-core/logFormat";
 
 let sqlPromise: ReturnType<typeof initSqlJs> | null = null;
 
@@ -63,7 +64,7 @@ export function createPersistentSqlJsDriver(io: PlatformIO): CreateSqliteDriver 
       if (isDisposed || isFlushed) return;
       const data = db.export();
       io.writeFile(data).catch((e) => {
-        console.error("[obsidian-local-sync] ERROR: Failed to save database", e);
+        console.error(formatLogLine("ERROR", "Failed to save database", e));
       });
     }
 
@@ -97,7 +98,7 @@ export function createPersistentSqlJsDriver(io: PlatformIO): CreateSqliteDriver 
       try {
         await io.writeFile(data);
       } catch (e) {
-        console.error("[obsidian-local-sync] ERROR: Failed to save database", e);
+        console.error(formatLogLine("ERROR", "Failed to save database", e));
       }
     }
 
@@ -147,7 +148,7 @@ export function createPersistentSqlJsDriver(io: PlatformIO): CreateSqliteDriver 
           // Export before closing DB, then write asynchronously.
           const data = db.export();
           io.writeFile(data).catch((e) => {
-            console.error("[obsidian-local-sync] ERROR: Failed to save database", e);
+            console.error(formatLogLine("ERROR", "Failed to save database", e));
           });
         }
         db.close();

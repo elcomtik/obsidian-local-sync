@@ -10,6 +10,7 @@ import {
   isTrackedVaultFile,
   isTrackedVaultPath,
 } from "./pathPolicy";
+import { formatLogLine } from "./logFormat";
 import type { VaultAdapter, VaultFile } from "./vaultAdapter";
 
 /**
@@ -234,17 +235,17 @@ export class YjsEvoluHistoryEngine {
 
   private logInfo(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.info) return;
-    console.log("[obsidian-local-sync]", new Date().toISOString(), "INFO:", message, data ?? "");
+    console.log(formatLogLine("INFO", message, data));
   }
 
   private logWarn(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.warn) return;
-    console.warn("[obsidian-local-sync]", new Date().toISOString(), "WARN:", message, data ?? "");
+    console.warn(formatLogLine("WARN", message, data));
   }
 
   private logError(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.error) return;
-    console.error("[obsidian-local-sync]", new Date().toISOString(), "ERROR:", message, data ?? "");
+    console.error(formatLogLine("ERROR", message, data));
   }
 
   // ---------- lifecycle ----------

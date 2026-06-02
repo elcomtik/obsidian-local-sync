@@ -13,6 +13,7 @@ import {
   isTrackedVaultPath,
   type LocalSyncConfig,
 } from "../src-core/pathPolicy";
+import { formatLogLine } from "../src-core/logFormat";
 import { createEvoluClient } from "../src/evoluClient";
 import type { PlatformIO } from "../src/sqliteDriver";
 import { NodeFsVaultAdapter } from "./nodeFsVaultAdapter";
@@ -229,17 +230,17 @@ function readLogLevel(value: string): LogLevel {
 
 function logInfo(message: string, data?: unknown) {
   if (logLevelRank[logLevel] < logLevelRank.info) return;
-  console.log("[obsidian-local-sync]", new Date().toISOString(), "INFO:", message, data ?? "");
+  console.log(formatLogLine("INFO", message, data));
 }
 
 function logWarn(message: string, data?: unknown) {
   if (logLevelRank[logLevel] < logLevelRank.warn) return;
-  console.warn("[obsidian-local-sync]", new Date().toISOString(), "WARN:", message, data ?? "");
+  console.warn(formatLogLine("WARN", message, data));
 }
 
 function logError(message: string, data?: unknown) {
   if (logLevelRank[logLevel] < logLevelRank.error) return;
-  console.error("[obsidian-local-sync]", new Date().toISOString(), "ERROR:", message, data ?? "");
+  console.error(formatLogLine("ERROR", message, data));
 }
 
 function isMissingFile(error: unknown): boolean {
