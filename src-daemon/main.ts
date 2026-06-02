@@ -9,6 +9,7 @@ import {
 } from "../src-core/engine";
 import {
   DEFAULT_LOCAL_SYNC_CONFIG,
+  getExtension,
   isTrackedVaultPath,
   type LocalSyncConfig,
 } from "../src-core/pathPolicy";
@@ -26,6 +27,12 @@ const relayUrl = process.env.EVOLU_RELAY_URL ?? "wss://free.evoluhq.com";
 const appName = process.env.LOCALSYNC_APP_NAME ?? "obsidian-local-sync";
 const deviceId = process.env.DEVICE_ID ?? `k8s-${vaultName}`;
 const logLevel = readLogLevel(process.env.LOCALSYNC_LOG_LEVEL ?? "info");
+const logLevelRank: Record<LogLevel, number> = {
+  off: 0,
+  error: 1,
+  warn: 2,
+  info: 3,
+};
 const engineConfig: EngineConfig = {
   historyPollMs: readPositiveInt("LOCALSYNC_HISTORY_POLL_MS", 1000),
   historyBatchSize: readPositiveInt("LOCALSYNC_HISTORY_BATCH_SIZE", 500),
@@ -34,7 +41,10 @@ const engineConfig: EngineConfig = {
 };
 const localSyncConfig: LocalSyncConfig = {
   ...DEFAULT_LOCAL_SYNC_CONFIG,
+  includeExtensions: readList("LOCALSYNC_INCLUDE_EXTENSIONS", DEFAULT_LOCAL_SYNC_CONFIG.includeExtensions),
+  excludeGlobs: readRules("LOCALSYNC_EXCLUDE_GLOBS", DEFAULT_LOCAL_SYNC_CONFIG.excludeGlobs),
   startupScan: readBoolean("LOCALSYNC_STARTUP_SCAN", true),
+  syncDeletes: readBoolean("LOCALSYNC_SYNC_DELETES", true),
 };
 const usePolling = readBoolean("LOCALSYNC_USE_POLLING", false);
 const pollIntervalMs = readPositiveInt("LOCALSYNC_POLL_INTERVAL_MS", 1000);
@@ -61,26 +71,26 @@ if (mnemonic) {
   const dbExists = await fileExists(dbPath);
   const currentOwner = dbExists
     ? await withTimeout(evolu.appOwner, ownerReadTimeoutMs).catch((error) => {
-        console.warn("[obsidian-local-sync] WARN: Failed to read daemon owner from DB", error);
+        logWarn("Failed to read daemon owner from DB", error);
         return null;
       })
     : null;
   if (currentOwner?.mnemonic !== mnemonic) {
-    console.log("[obsidian-local-sync] INFO: Restoring daemon owner from LOCALSYNC_MNEMONIC");
+    logInfo("Restoring daemon owner from LOCALSYNC_MNEMONIC");
     await evolu.restoreAppOwner(Mnemonic.orThrow(mnemonic), { reload: false });
     await closeDb();
     ({ evolu, closeDb } = createEvoluClient(appName, relayUrl, io, { forceNew: true }));
   }
 } else {
-  console.warn(
-    "[obsidian-local-sync] WARN: LOCALSYNC_MNEMONIC is not set; using the existing local DB owner or creating a new isolated owner if the DB is empty.",
+  logWarn(
+    "LOCALSYNC_MNEMONIC is not set; using the existing local DB owner or creating a new isolated owner if the DB is empty.",
   );
 }
 
 evolu.subscribeError(() => {
   const error = evolu.getError();
   if (error) {
-    console.error("[obsidian-local-sync] ERROR: Evolu error:", error);
+    logError("Evolu error", error);
   }
 });
 
@@ -114,13 +124,13 @@ watcher
   .on("change", (absolutePath) => void onChanged(absolutePath))
   .on("unlink", (absolutePath) => void onDeleted(absolutePath))
   .on("ready", () => {
-    console.log("[obsidian-local-sync] INFO: Watcher ready");
+    logInfo("Watcher ready");
   })
   .on("error", (error) => {
-    console.error("[obsidian-local-sync] ERROR: Watcher failed", error);
+    logError("Watcher failed", error);
   });
 
-console.log("[obsidian-local-sync] INFO: Daemon started", {
+logInfo("Daemon started", {
   vaultName,
   vaultRoot,
   dbPath,
@@ -135,23 +145,23 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 async function onChanged(absolutePath: string) {
   const vaultPath = safeToVaultPath(vault, absolutePath);
   if (vaultPath === null) return;
-  console.log("[obsidian-local-sync] INFO: Vault file changed", { path: vaultPath });
+  logInfo("Vault file changed", { path: vaultPath });
   await engine.onVaultFileChanged(vaultPath);
 }
 
 async function onDeleted(absolutePath: string) {
   const vaultPath = safeToVaultPath(vault, absolutePath);
   if (vaultPath === null) return;
-  console.log("[obsidian-local-sync] INFO: Vault file deleted", { path: vaultPath });
+  logInfo("Vault file deleted", { path: vaultPath });
   await engine.onVaultFileDeleted(vaultPath);
 }
 
 async function shutdown(signal: string) {
-  console.log("[obsidian-local-sync] INFO: Daemon stopping", { signal });
+  logInfo("Daemon stopping", { signal });
   await watcher.close();
   await engine.stop();
   await closeDb();
-  console.log("[obsidian-local-sync] INFO: Daemon stopped");
+  logInfo("Daemon stopped");
   process.exit(0);
 }
 
@@ -166,7 +176,8 @@ function safeToVaultPath(vault: NodeFsVaultAdapter, absolutePath: string): strin
 function isIgnoredWatchPath(vault: NodeFsVaultAdapter, absolutePath: string): boolean {
   const vaultPath = safeToVaultPath(vault, absolutePath);
   if (vaultPath === null || vaultPath === "") return false;
-  return vaultPath.split("/").some((part) => part.startsWith("."));
+  if (getExtension(vaultPath) === undefined) return false;
+  return !isTrackedVaultPath(vaultPath, localSyncConfig);
 }
 
 function readRequiredEnv(name: string): string {
@@ -193,11 +204,42 @@ function readBoolean(name: string, fallback: boolean): boolean {
   return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
 }
 
+function readList(name: string, fallback: string[]): string[] {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const values = raw.split(/[,\s]+/).map((value) => value.trim().replace(/^\./, "").toLowerCase()).filter(Boolean);
+  if (values.length === 0) {
+    throw new Error(`${name} must contain at least one value`);
+  }
+  return Array.from(new Set(values));
+}
+
+function readRules(name: string, fallback: string[]): string[] {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  return raw.split(/[\n,]+/).map((value) => value.trim()).filter(Boolean);
+}
+
 function readLogLevel(value: string): LogLevel {
   if (value === "off" || value === "error" || value === "warn" || value === "info") {
     return value;
   }
   throw new Error("LOCALSYNC_LOG_LEVEL must be one of: off, error, warn, info");
+}
+
+function logInfo(message: string, data?: unknown) {
+  if (logLevelRank[logLevel] < logLevelRank.info) return;
+  console.log("[obsidian-local-sync]", new Date().toISOString(), "INFO:", message, data ?? "");
+}
+
+function logWarn(message: string, data?: unknown) {
+  if (logLevelRank[logLevel] < logLevelRank.warn) return;
+  console.warn("[obsidian-local-sync]", new Date().toISOString(), "WARN:", message, data ?? "");
+}
+
+function logError(message: string, data?: unknown) {
+  if (logLevelRank[logLevel] < logLevelRank.error) return;
+  console.error("[obsidian-local-sync]", new Date().toISOString(), "ERROR:", message, data ?? "");
 }
 
 function isMissingFile(error: unknown): boolean {

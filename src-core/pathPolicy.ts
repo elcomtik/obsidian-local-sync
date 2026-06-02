@@ -7,8 +7,13 @@ export type LocalSyncConfig = {
   syncDeletes: boolean;
 };
 
+export type TrackingDecision =
+  | { tracked: true }
+  | { tracked: false; reason: "extension"; extension: string }
+  | { tracked: false; reason: "excludeRule"; rule: string };
+
 export const DEFAULT_LOCAL_SYNC_CONFIG: LocalSyncConfig = {
-  includeExtensions: ["md", "txt"],
+  includeExtensions: ["md", "txt", "canvas"],
   excludeGlobs: [
     ".git/**",
     ".trash/**",
@@ -36,9 +41,24 @@ export function isTrackedVaultFile(
   file: Pick<VaultFile, "path" | "extension">,
   config: LocalSyncConfig = DEFAULT_LOCAL_SYNC_CONFIG,
 ): boolean {
+  return getTrackingDecision(file, config).tracked;
+}
+
+export function getTrackingDecision(
+  file: Pick<VaultFile, "path" | "extension">,
+  config: LocalSyncConfig = DEFAULT_LOCAL_SYNC_CONFIG,
+): TrackingDecision {
   const extension = (file.extension ?? getExtension(file.path) ?? "").toLowerCase();
-  if (!config.includeExtensions.includes(extension)) return false;
-  return !config.excludeGlobs.some((glob) => matchesGlob(file.path, glob));
+  if (!config.includeExtensions.includes(extension)) {
+    return { tracked: false, reason: "extension", extension };
+  }
+
+  const pathDecision = getPathRuleDecision(file.path, config.excludeGlobs);
+  if (!pathDecision.included) {
+    return { tracked: false, reason: "excludeRule", rule: pathDecision.rule };
+  }
+
+  return { tracked: true };
 }
 
 export function isTrackedVaultPath(
@@ -49,8 +69,15 @@ export function isTrackedVaultPath(
 }
 
 function matchesGlob(path: string, glob: string): boolean {
+  if (glob === "**" || glob === "*") return true;
+
   if (glob.endsWith("/**")) {
     return path === glob.slice(0, -3) || path.startsWith(glob.slice(0, -2));
+  }
+
+  if (glob.startsWith("**/")) {
+    const suffix = glob.slice(3);
+    return path === suffix || path.endsWith(`/${suffix}`);
   }
 
   if (glob.startsWith("*.")) {
@@ -68,3 +95,23 @@ function matchesGlob(path: string, glob: string): boolean {
   return path === glob;
 }
 
+function getPathRuleDecision(path: string, rules: string[]): { included: boolean; rule: string } {
+  let included = true;
+  let matchedRule = "";
+
+  for (const rawRule of rules) {
+    const rule = rawRule.trim();
+    if (!rule || rule.startsWith("#")) continue;
+
+    const negated = rule.startsWith("!");
+    const pattern = negated ? rule.slice(1).trim() : rule;
+    if (!pattern || pattern.startsWith("#")) continue;
+
+    if (matchesGlob(path, pattern)) {
+      included = negated;
+      matchedRule = rule;
+    }
+  }
+
+  return { included, rule: matchedRule };
+}

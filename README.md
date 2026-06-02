@@ -1,5 +1,5 @@
 
-# Obsidian LocalSync
+# LocalSync
 
 [![CI](https://github.com/elcomtik/obsidian-local-sync/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/elcomtik/obsidian-local-sync/actions/workflows/release.yml)
 
@@ -56,6 +56,9 @@ Copy the `dist/` folder to:
 ```
 
 Enable the plugin in Obsidian → Settings → Community Plugins.
+
+The Obsidian plugin keeps the stable plugin id `obsidian-local-sync`, but its
+display name is `LocalSync`.
 
 ---
 

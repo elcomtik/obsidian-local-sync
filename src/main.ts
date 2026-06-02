@@ -19,6 +19,10 @@ import {
   type EngineConfig,
   type LogLevel,
 } from "../src-core/engine";
+import {
+  DEFAULT_LOCAL_SYNC_CONFIG,
+  type LocalSyncConfig,
+} from "../src-core/pathPolicy";
 import { ObsidianVaultAdapter } from "./obsidianVaultAdapter";
 
 /**
@@ -45,6 +49,11 @@ type PluginSettings = {
   outgoingBatchMs: number;
   maxOpenDocs: number;
 
+  includeExtensions: string[];
+  excludeGlobs: string[];
+  startupScan: boolean;
+  syncDeletes: boolean;
+
   logLevel: LogLevel;
 };
 
@@ -58,6 +67,11 @@ const DEFAULT_SETTINGS: PluginSettings = {
   outgoingBatchMs: 500,
   maxOpenDocs: 50,
 
+  includeExtensions: DEFAULT_LOCAL_SYNC_CONFIG.includeExtensions,
+  excludeGlobs: DEFAULT_LOCAL_SYNC_CONFIG.excludeGlobs,
+  startupScan: DEFAULT_LOCAL_SYNC_CONFIG.startupScan,
+  syncDeletes: DEFAULT_LOCAL_SYNC_CONFIG.syncDeletes,
+
   logLevel: "info",
 };
 
@@ -68,6 +82,40 @@ function toEngineConfig(s: PluginSettings): EngineConfig {
     outgoingBatchMs: s.outgoingBatchMs,
     maxOpenDocs: s.maxOpenDocs,
   };
+}
+
+function toLocalSyncConfig(s: PluginSettings): LocalSyncConfig {
+  return {
+    includeExtensions: normalizeExtensions(s.includeExtensions),
+    excludeGlobs: normalizeRules(s.excludeGlobs),
+    startupScan: s.startupScan,
+    syncDeletes: s.syncDeletes,
+  };
+}
+
+function normalizeExtensions(values: string[]): string[] {
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = value.trim().replace(/^\./, "").toLowerCase();
+    if (normalized) seen.add(normalized);
+  }
+  return Array.from(seen);
+}
+
+function normalizeRules(values: string[]): string[] {
+  return values.map((value) => value.trim()).filter(Boolean);
+}
+
+function logInfo(message: string, data?: unknown) {
+  console.log("[obsidian-local-sync]", new Date().toISOString(), "INFO:", message, data ?? "");
+}
+
+function logWarn(message: string, data?: unknown) {
+  console.warn("[obsidian-local-sync]", new Date().toISOString(), "WARN:", message, data ?? "");
+}
+
+function logError(message: string, data?: unknown) {
+  console.error("[obsidian-local-sync]", new Date().toISOString(), "ERROR:", message, data ?? "");
 }
 
 export default class ObsidianLocalSyncPlugin extends Plugin {
@@ -118,7 +166,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       if (this._unloaded) return;
       this.startEngine().catch((e) => {
         if (!this._unloaded) {
-          console.error("[obsidian-local-sync] ERROR: Failed to start engine", e);
+          logError("Failed to start engine", e);
           new Notice("LocalSync: failed to start — check console for details");
         }
       });
@@ -171,7 +219,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     this.closeEvoluDb = closeDb;
 
     if (this.settings.logLevel !== "off") {
-      console.log("[obsidian-local-sync] INFO: Evolu client created", {
+      logInfo("Evolu client created", {
         appName: this.settings.appName,
         relayUrl: this.settings.relayUrl,
         deviceId: this.settings.deviceId,
@@ -183,7 +231,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // ----------------------------
     if (this.settings.logLevel !== "off") {
       const owner = await this.evolu.appOwner;
-      console.log("[obsidian-local-sync] INFO: Evolu owner loaded", {
+      logInfo("Evolu owner loaded", {
         hasMnemonic: !!owner?.mnemonic,
       });
     }
@@ -194,7 +242,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     this.evolu.subscribeError(() => {
       const error = this.evolu.getError();
       if (error) {
-        console.error("[obsidian-local-sync] ERROR: Evolu error:", error);
+        logError("Evolu error", error);
       }
     });
 
@@ -206,6 +254,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       evolu: this.evolu,
       deviceId: this.settings.deviceId,
       config: toEngineConfig(this.settings),
+      localSyncConfig: toLocalSyncConfig(this.settings),
       logLevel: this.settings.logLevel,
     });
 
@@ -288,6 +337,8 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   async loadSettings() {
     const saved = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+    this.settings.includeExtensions = normalizeExtensions(this.settings.includeExtensions);
+    this.settings.excludeGlobs = normalizeRules(this.settings.excludeGlobs);
     // Persist the generated deviceId on first install so it survives restarts.
     if (!saved?.deviceId) {
       await this.saveSettings();
@@ -301,6 +352,13 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   async applyEngineConfigFromSettings() {
     await this.saveSettings();
     await this.engine.updateConfig(toEngineConfig(this.settings));
+  }
+
+  async applyLocalSyncConfigFromSettings() {
+    this.settings.includeExtensions = normalizeExtensions(this.settings.includeExtensions);
+    this.settings.excludeGlobs = normalizeRules(this.settings.excludeGlobs);
+    await this.saveSettings();
+    this.engine.updateLocalSyncConfig(toLocalSyncConfig(this.settings));
   }
 
   /**
@@ -352,6 +410,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       evolu: this.evolu,
       deviceId: this.settings.deviceId,
       config: toEngineConfig(this.settings),
+      localSyncConfig: toLocalSyncConfig(this.settings),
       logLevel: this.settings.logLevel,
     });
     await this.engine.start();
@@ -370,7 +429,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Obsidian LocalSync" });
+    containerEl.createEl("h2", { text: "LocalSync" });
 
     // ----------------------------
     // Logging
@@ -416,6 +475,63 @@ class LocalSyncSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    containerEl.createEl("h3", { text: "Path Policy" });
+
+    new Setting(containerEl)
+      .setName("Include extensions")
+      .setDesc("Comma or whitespace separated extensions without dots.")
+      .addText((text) => {
+        text
+          .setPlaceholder("md, txt")
+          .setValue(this.plugin.settings.includeExtensions.join(", "))
+          .onChange(async (value) => {
+            const extensions = value.split(/[,\s]+/).filter(Boolean);
+            if (extensions.length === 0) {
+              new Notice("At least one extension is required");
+              return;
+            }
+            this.plugin.settings.includeExtensions = extensions;
+            await this.plugin.applyLocalSyncConfigFromSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Exclude rules")
+      .setDesc("One rule per line. Later rules win; prefix with ! to re-include.")
+      .addTextArea((ta) => {
+        ta.inputEl.rows = 8;
+        ta.setPlaceholder(".git/**\n.obsidian/**\n!.obsidian/app.json");
+        ta.setValue(this.plugin.settings.excludeGlobs.join("\n"));
+        ta.onChange(async (value) => {
+          this.plugin.settings.excludeGlobs = value.split(/\r?\n/);
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Startup scan")
+      .setDesc("Scan tracked vault files when LocalSync starts.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.startupScan);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.startupScan = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+          new Notice(`Startup scan ${value ? "enabled" : "disabled"}`);
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Sync deletes")
+      .setDesc("Propagate local deletes and startup offline-delete audit rows.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncDeletes);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncDeletes = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+          new Notice(`Delete sync ${value ? "enabled" : "disabled"}`);
+        });
+      });
 
     // ----------------------------
     // Performance
@@ -588,7 +704,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
               const parsed = Mnemonic.orThrow(restoreValue);
               await this.plugin.evolu.restoreAppOwner(parsed, { reload: false });
               this.plugin.mnemonicCache = parsed;
-              console.log("[obsidian-local-sync] INFO: Evolu owner restored");
+              logInfo("Evolu owner restored");
               await this.plugin.restartEngine();
               new Notice("Owner restored — engine restarted.");
               this.display();
@@ -600,7 +716,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
             // First click — start mandatory 5s wait
             const hasFiles = this.plugin.app.vault
               .getFiles()
-              .some((f) => f.extension === "md" || f.extension === "txt");
+              .some((f) => this.plugin.settings.includeExtensions.includes(f.extension));
 
             restorePending = true;
             restoreReady = false;
@@ -661,7 +777,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
               const newMnemonic = generateMnemonic();
               await this.plugin.evolu.restoreAppOwner(newMnemonic, { reload: false });
               this.plugin.mnemonicCache = newMnemonic;
-              console.warn("[obsidian-local-sync] WARN: Evolu owner reset");
+              logWarn("Evolu owner reset");
               await this.plugin.restartEngine();
               new Notice("Owner reset — engine restarted.");
               this.display();

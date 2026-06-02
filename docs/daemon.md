@@ -33,13 +33,55 @@ deployment that must join an existing sync owner.
 | `DEVICE_ID` | `k8s-${VAULT_NAME}` | Stable daemon device id used in outgoing update ids. |
 | `EVOLU_RELAY_URL` | `wss://free.evoluhq.com` | Evolu relay WebSocket URL. |
 | `LOCALSYNC_LOG_LEVEL` | `info` | `off`, `error`, `warn`, or `info`. |
+| `LOCALSYNC_INCLUDE_EXTENSIONS` | `md,txt,canvas` | Comma or whitespace separated tracked extensions, without dots. |
+| `LOCALSYNC_EXCLUDE_GLOBS` | built-in defaults | Comma or newline separated path rules. Later rules win; prefix a rule with `!` to re-include like gitignore. |
 | `LOCALSYNC_HISTORY_POLL_MS` | `1000` | Remote history poll interval. |
 | `LOCALSYNC_HISTORY_BATCH_SIZE` | `500` | Remote history rows consumed per poll. |
 | `LOCALSYNC_OUTGOING_BATCH_MS` | `500` | Local Yjs update flush debounce. |
 | `LOCALSYNC_MAX_OPEN_DOCS` | `50` | Maximum open Yjs documents. |
 | `LOCALSYNC_STARTUP_SCAN` | `true` | Scan vault on startup. |
+| `LOCALSYNC_SYNC_DELETES` | `true` | Propagate local deletes and run startup offline-delete audit. |
 | `LOCALSYNC_USE_POLLING` | `false` | Force chokidar polling. Useful on some network/PVC mounts. |
 | `LOCALSYNC_POLL_INTERVAL_MS` | `1000` | Chokidar polling interval when polling is enabled. |
+
+## Path Policy
+
+LocalSync first filters by `LOCALSYNC_INCLUDE_EXTENSIONS`, then applies
+`LOCALSYNC_EXCLUDE_GLOBS` in order. The last matching rule wins. Rules starting
+with `!` re-include paths that were excluded by an earlier rule.
+
+Default tracked extensions:
+
+```text
+md
+txt
+canvas
+```
+
+Default exclude rules:
+
+```text
+.git/**
+.trash/**
+.obsidian/workspace*.json
+.obsidian/cache/**
+.obsidian/plugins/obsidian-local-sync/*.db
+.obsidian/plugins/obsidian-local-sync/*.db-shm
+.obsidian/plugins/obsidian-local-sync/*.db-wal
+.DS_Store
+*.tmp
+*.swp
+```
+
+Example:
+
+```bash
+LOCALSYNC_INCLUDE_EXTENSIONS=md,txt,canvas
+LOCALSYNC_EXCLUDE_GLOBS='.obsidian/**
+!.obsidian/app.json
+!.obsidian/appearance.json
+.git/**'
+```
 
 ## Local Run
 
@@ -73,5 +115,5 @@ process down cleanly.
 
 ## Scope
 
-The daemon currently tracks `.md` and `.txt` files, using the same path policy
-as the plugin. One daemon process is intended to manage one vault.
+The daemon uses the same path policy model as the plugin. One daemon process is
+intended to manage one vault.

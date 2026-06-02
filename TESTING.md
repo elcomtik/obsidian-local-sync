@@ -15,7 +15,7 @@ npm run build
 cp -r dist/ <vault>/.obsidian/plugins/obsidian-local-sync/
 ```
 
-**Reload plugin** (without restarting Obsidian): Settings → Community plugins → disable then re-enable *Obsidian LocalSync*.
+**Reload plugin** (without restarting Obsidian): Settings → Community plugins → disable then re-enable *LocalSync*.
 
 **Two-device setup**: two separate Obsidian vaults (can be two Obsidian windows on the same machine pointing to different vault folders, or two physical machines).
 
@@ -143,7 +143,7 @@ cp -r dist/ <vault>/.obsidian/plugins/obsidian-local-sync/
 
 **Steps (Restore with non-empty vault):**
 1. Device A: vault has at least one `.md` file, plugin enabled.
-2. Open Settings → Obsidian LocalSync → Restore mnemonic → paste any mnemonic.
+2. Open Settings → LocalSync → Restore mnemonic → paste any mnemonic.
 3. Click **Restore** once.
 4. Immediately click **Restore** again (within 5 s).
 5. Wait until button changes to `"Confirm restore?"` (after 5 s), then click.

@@ -6,10 +6,11 @@ import type { Database } from "./schema";
 import type { LocalSyncConfig } from "./pathPolicy";
 import {
   DEFAULT_LOCAL_SYNC_CONFIG,
+  getTrackingDecision,
   isTrackedVaultFile,
   isTrackedVaultPath,
 } from "./pathPolicy";
-import type { VaultAdapter } from "./vaultAdapter";
+import type { VaultAdapter, VaultFile } from "./vaultAdapter";
 
 /**
  * Logging levels (simple).
@@ -233,17 +234,17 @@ export class YjsEvoluHistoryEngine {
 
   private logInfo(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.info) return;
-    console.log("[obsidian-local-sync] INFO:", message, data ?? "");
+    console.log("[obsidian-local-sync]", new Date().toISOString(), "INFO:", message, data ?? "");
   }
 
   private logWarn(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.warn) return;
-    console.warn("[obsidian-local-sync] WARN:", message, data ?? "");
+    console.warn("[obsidian-local-sync]", new Date().toISOString(), "WARN:", message, data ?? "");
   }
 
   private logError(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.error) return;
-    console.error("[obsidian-local-sync] ERROR:", message, data ?? "");
+    console.error("[obsidian-local-sync]", new Date().toISOString(), "ERROR:", message, data ?? "");
   }
 
   // ---------- lifecycle ----------
@@ -285,11 +286,43 @@ export class YjsEvoluHistoryEngine {
    */
   private async scanVaultForUnsyncedFiles() {
     try {
-      const files = (await this.vault.listFiles()).filter((f) =>
-        isTrackedVaultFile(f, this.localSyncConfig),
-      );
-      this.logInfo("Startup scan: begin", { total: files.length });
-      let retransmitted = 0;
+      const allFiles = await this.vault.listFiles();
+      const files: VaultFile[] = [];
+      const skippedByExtension = new Map<string, number>();
+      const skippedByRule = new Map<string, number>();
+
+      for (const file of allFiles) {
+        const decision = getTrackingDecision(file, this.localSyncConfig);
+        if (decision.tracked) {
+          files.push(file);
+          continue;
+        }
+
+        if (decision.reason === "extension") {
+          const key = decision.extension || "(none)";
+          skippedByExtension.set(key, (skippedByExtension.get(key) ?? 0) + 1);
+          this.logInfo("Startup scan: skipped file", {
+            path: file.path,
+            reason: decision.reason,
+            extension: key,
+          });
+        } else {
+          skippedByRule.set(decision.rule, (skippedByRule.get(decision.rule) ?? 0) + 1);
+          this.logInfo("Startup scan: skipped file", {
+            path: file.path,
+            reason: decision.reason,
+            rule: decision.rule,
+          });
+        }
+      }
+
+      this.logInfo("Startup scan: begin", {
+        adapterFiles: allFiles.length,
+        trackedFiles: files.length,
+        skippedByExtension: Object.fromEntries(skippedByExtension),
+        skippedByRule: Object.fromEntries(skippedByRule),
+      });
+      let loaded = 0;
       let deferred = 0;
 
       for (const file of files) {
@@ -299,11 +332,16 @@ export class YjsEvoluHistoryEngine {
         if (result === "deferred") {
           deferred++;
         } else if (result === "loaded") {
-          retransmitted++;
+          loaded++;
         }
       }
 
-      this.logInfo("Startup scan: done", { loaded: retransmitted, deferred, total: files.length });
+      this.logInfo("Startup scan: done", {
+        loaded,
+        deferred,
+        trackedFiles: files.length,
+        adapterFiles: allFiles.length,
+      });
       this.scanComplete = true;
     } catch (e) {
       this.logError("scanVaultForUnsyncedFiles failed", e);
@@ -354,6 +392,8 @@ export class YjsEvoluHistoryEngine {
       if (!this.states.has(path)) {
         this.logInfo("Startup scan: seeding new file", { path });
         await this.getOrLoadFileState(path); // seedFromVault: true (default)
+      } else {
+        this.logInfo("Startup scan: deferred file already opened, skipping seed", { path });
       }
       this.pendingVaultSeed.delete(path);
     }
@@ -448,6 +488,12 @@ export class YjsEvoluHistoryEngine {
   setLogLevel(level: LogLevel) {
     this.logLevel = level;
     this.logInfo("Log level set", level);
+  }
+
+  /** Updates path policy used by scans, vault events, and remote write/delete handling. */
+  updateLocalSyncConfig(config: LocalSyncConfig) {
+    this.localSyncConfig = config;
+    this.logInfo("Local sync path policy updated", config);
   }
 
   /**
@@ -676,7 +722,9 @@ export class YjsEvoluHistoryEngine {
           }
 
           touchedPaths.add(path);
-          this.pendingVaultSeed.delete(path);
+          if (this.pendingVaultSeed.delete(path)) {
+            this.logInfo("Startup scan: remote history covered deferred file", { path });
+          }
         }
 
         // Save one snapshot per touched file rather than one per update row.
