@@ -33,6 +33,7 @@ const logLevelRank: Record<LogLevel, number> = {
   error: 1,
   warn: 2,
   info: 3,
+  debug: 4,
 };
 const engineConfig: EngineConfig = {
   historyPollMs: readPositiveInt("LOCALSYNC_HISTORY_POLL_MS", 1000),
@@ -222,10 +223,10 @@ function readRules(name: string, fallback: string[]): string[] {
 }
 
 function readLogLevel(value: string): LogLevel {
-  if (value === "off" || value === "error" || value === "warn" || value === "info") {
+  if (value === "off" || value === "error" || value === "warn" || value === "info" || value === "debug") {
     return value;
   }
-  throw new Error("LOCALSYNC_LOG_LEVEL must be one of: off, error, warn, info");
+  throw new Error("LOCALSYNC_LOG_LEVEL must be one of: off, error, warn, info, debug");
 }
 
 function logInfo(message: string, data?: unknown) {

@@ -19,14 +19,16 @@ import type { VaultAdapter, VaultFile } from "./vaultAdapter";
  * - error: only errors
  * - warn: warnings + errors
  * - info: normal operational logs + warnings + errors
+ * - debug: verbose per-file/cache internals
  */
-export type LogLevel = "off" | "error" | "warn" | "info";
+export type LogLevel = "off" | "error" | "warn" | "info" | "debug";
 
 const levelRank: Record<LogLevel, number> = {
   off: 0,
   error: 1,
   warn: 2,
   info: 3,
+  debug: 4,
 };
 
 /**
@@ -236,6 +238,11 @@ export class YjsEvoluHistoryEngine {
   private logInfo(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.info) return;
     console.log(formatLogLine("INFO", message, data));
+  }
+
+  private logDebug(message: string, data?: unknown) {
+    if (levelRank[this.logLevel] < levelRank.debug) return;
+    console.log(formatLogLine("DEBUG", message, data));
   }
 
   private logWarn(message: string, data?: unknown) {
@@ -768,7 +775,7 @@ export class YjsEvoluHistoryEngine {
 
       await this.closeDoc(oldestPath);
       this.states.delete(oldestPath);
-      this.logInfo("LRU evicted doc", { path: oldestPath, openDocs: this.states.size });
+      this.logDebug("LRU evicted doc", { path: oldestPath, openDocs: this.states.size });
     }
   }
 

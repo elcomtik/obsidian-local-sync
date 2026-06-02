@@ -1,4 +1,4 @@
-export type LogSeverity = "INFO" | "WARN" | "ERROR";
+export type LogSeverity = "INFO" | "WARN" | "ERROR" | "DEBUG";
 
 export function formatLogLine(severity: LogSeverity, message: string, data?: unknown): string {
   const base = `[obsidian-local-sync] ${new Date().toISOString()} ${severity}: ${message}`;

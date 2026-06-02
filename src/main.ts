@@ -443,6 +443,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
         dd.addOption("error", "Error");
         dd.addOption("warn", "Warn");
         dd.addOption("info", "Info");
+        dd.addOption("debug", "Debug");
 
         dd.setValue(this.plugin.settings.logLevel);
 

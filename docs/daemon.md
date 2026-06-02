@@ -32,7 +32,7 @@ deployment that must join an existing sync owner.
 | `LOCALSYNC_APP_NAME` | `obsidian-local-sync` | Evolu app name. |
 | `DEVICE_ID` | `k8s-${VAULT_NAME}` | Stable daemon device id used in outgoing update ids. |
 | `EVOLU_RELAY_URL` | `wss://free.evoluhq.com` | Evolu relay WebSocket URL. |
-| `LOCALSYNC_LOG_LEVEL` | `info` | `off`, `error`, `warn`, or `info`. |
+| `LOCALSYNC_LOG_LEVEL` | `info` | `off`, `error`, `warn`, `info`, or `debug`. |
 | `LOCALSYNC_INCLUDE_EXTENSIONS` | `md,txt,canvas` | Comma or whitespace separated tracked extensions, without dots. |
 | `LOCALSYNC_EXCLUDE_GLOBS` | built-in defaults | Comma or newline separated path rules. Later rules win; prefix a rule with `!` to re-include like gitignore. |
 | `LOCALSYNC_HISTORY_POLL_MS` | `1000` | Remote history poll interval. |
