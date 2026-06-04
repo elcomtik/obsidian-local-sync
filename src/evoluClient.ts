@@ -13,7 +13,7 @@ import type { CreateSqliteDriver, Evolu, EvoluDeps, Mnemonic } from "@evolu/comm
 import type { Database } from "../src-core/schema";
 import { createPersistentSqlJsDriver, type PlatformIO } from "./sqliteDriver";
 import { Schema } from "../src-core/schema";
-import { formatLogLine } from "../src-core/logFormat";
+import { formatLogLine, type LogFormatter } from "../src-core/logFormat";
 
 /**
  * Custom console passed to Evolu deps.
@@ -29,13 +29,15 @@ import { formatLogLine } from "../src-core/logFormat";
  * those are a platform concern.  But Evolu's own error-level relay/storage
  * messages *can* be demoted to warn so they do not flood the error stream.
  */
-const evoluConsole = {
-  ...createConsole(),
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  error: (...args: any[]) => {
-    console.warn(formatLogLine("WARN", "Evolu error", args));
-  },
-};
+function createEvoluConsole(logFormatter: LogFormatter) {
+  return {
+    ...createConsole(),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    error: (...args: any[]) => {
+      console.warn(logFormatter("WARN", "Evolu error", args));
+    },
+  };
+}
 
 /**
  * Module-level Evolu client singleton.
@@ -73,7 +75,10 @@ export function createEvoluClient(
   appName: string,
   relayUrl: string,
   io: PlatformIO,
-  { forceNew = false }: { forceNew?: boolean } = {},
+  {
+    forceNew = false,
+    logFormatter = formatLogLine,
+  }: { forceNew?: boolean; logFormatter?: LogFormatter } = {},
 ) {
   if (_cached && !forceNew) {
     return { evolu: _cached.evolu, closeDb: _cached.flush };
@@ -81,7 +86,8 @@ export function createEvoluClient(
 
   let flush: () => Promise<void> = async () => {};
 
-  const innerFactory = createPersistentSqlJsDriver(io);
+  const evoluConsole = createEvoluConsole(logFormatter);
+  const innerFactory = createPersistentSqlJsDriver(io, logFormatter);
   const wrappedFactory: CreateSqliteDriver = async (_name, options) => {
     const driver = await innerFactory(_name, options);
     flush = async () => { await (driver as any).flush?.(); };

@@ -13,7 +13,7 @@ import {
   isTrackedVaultPath,
   type LocalSyncConfig,
 } from "../src-core/pathPolicy";
-import { formatLogLine } from "../src-core/logFormat";
+import { createDaemonLogFormatter } from "../src-core/logFormat";
 import { createEvoluClient } from "../src/evoluClient";
 import type { PlatformIO } from "../src/sqliteDriver";
 import { NodeFsVaultAdapter } from "./nodeFsVaultAdapter";
@@ -51,6 +51,7 @@ const localSyncConfig: LocalSyncConfig = {
 const usePolling = readBoolean("LOCALSYNC_USE_POLLING", false);
 const pollIntervalMs = readPositiveInt("LOCALSYNC_POLL_INTERVAL_MS", 1000);
 const ownerReadTimeoutMs = readPositiveInt("LOCALSYNC_OWNER_READ_TIMEOUT_MS", 30_000);
+const logFormatter = createDaemonLogFormatter("obsidian-local-sync", {});
 
 const io: PlatformIO = {
   async readFile() {
@@ -66,7 +67,7 @@ const io: PlatformIO = {
   },
 };
 
-let { evolu, closeDb } = createEvoluClient(appName, relayUrl, io);
+let { evolu, closeDb } = createEvoluClient(appName, relayUrl, io, { logFormatter });
 
 const mnemonic = process.env.LOCALSYNC_MNEMONIC?.trim();
 if (mnemonic) {
@@ -81,7 +82,10 @@ if (mnemonic) {
     logInfo("Restoring daemon owner from LOCALSYNC_MNEMONIC");
     await evolu.restoreAppOwner(Mnemonic.orThrow(mnemonic), { reload: false });
     await closeDb();
-    ({ evolu, closeDb } = createEvoluClient(appName, relayUrl, io, { forceNew: true }));
+    ({ evolu, closeDb } = createEvoluClient(appName, relayUrl, io, {
+      forceNew: true,
+      logFormatter,
+    }));
   }
 } else {
   logWarn(
@@ -104,6 +108,7 @@ const engine = new YjsEvoluHistoryEngine({
   config: engineConfig,
   localSyncConfig,
   logLevel,
+  logFormatter,
 });
 
 await engine.start();
@@ -231,17 +236,17 @@ function readLogLevel(value: string): LogLevel {
 
 function logInfo(message: string, data?: unknown) {
   if (logLevelRank[logLevel] < logLevelRank.info) return;
-  console.log(formatLogLine("INFO", message, data));
+  console.log(logFormatter("INFO", message, data));
 }
 
 function logWarn(message: string, data?: unknown) {
   if (logLevelRank[logLevel] < logLevelRank.warn) return;
-  console.warn(formatLogLine("WARN", message, data));
+  console.warn(logFormatter("WARN", message, data));
 }
 
 function logError(message: string, data?: unknown) {
   if (logLevelRank[logLevel] < logLevelRank.error) return;
-  console.error(formatLogLine("ERROR", message, data));
+  console.error(logFormatter("ERROR", message, data));
 }
 
 function isMissingFile(error: unknown): boolean {

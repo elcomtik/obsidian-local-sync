@@ -1,9 +1,24 @@
 export type LogSeverity = "INFO" | "WARN" | "ERROR" | "DEBUG";
+export type LogFormatter = (severity: LogSeverity, message: string, data?: unknown) => string;
 
 export function formatLogLine(severity: LogSeverity, message: string, data?: unknown): string {
   const base = `[obsidian-local-sync] ${new Date().toISOString()} ${severity}: ${message}`;
   if (data === undefined || data === "") return base;
   return `${base} ${formatLogData(data)}`;
+}
+
+export function createDaemonLogFormatter(component: string, context: Record<string, string>): LogFormatter {
+  return (severity, message, data) => {
+    const contextText = Object.entries(context)
+      .filter(([, value]) => value.length > 0)
+      .map(([key, value]) => `${key}=${value}`)
+      .join(" ");
+    const prefix = contextText
+      ? `${new Date().toISOString()} [${component}] ${contextText} ${severity}: ${message}`
+      : `${new Date().toISOString()} [${component}] ${severity}: ${message}`;
+    if (data === undefined || data === "") return prefix;
+    return `${prefix} ${formatLogData(data)}`;
+  };
 }
 
 function formatLogData(data: unknown): string {

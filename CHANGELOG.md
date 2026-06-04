@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.8 — 2026-06-04
+
+### Changed
+
+- **Daemon log format for Kubernetes**:
+  standalone daemon logs now use timestamp-first formatting with the
+  `obsidian-local-sync` component name and severity near the front:
+  `2026-06-04T15:01:37.421Z [obsidian-local-sync] INFO: ...`.
+  Plugin/browser logs keep the existing component-first format for Obsidian
+  developer console readability.
+
 ## 0.2.7 — 2026-06-04
 
 ### Fixed

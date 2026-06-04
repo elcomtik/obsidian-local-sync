@@ -1,6 +1,6 @@
 import initSqlJs from "sql.js/dist/sql-asm.js";
 import type { CreateSqliteDriver } from "@evolu/common";
-import { formatLogLine } from "../src-core/logFormat";
+import { formatLogLine, type LogFormatter } from "../src-core/logFormat";
 
 let sqlPromise: ReturnType<typeof initSqlJs> | null = null;
 
@@ -38,7 +38,10 @@ export type PlatformIO = {
  * This replaces `@evolu/web`, which is incompatible with Obsidian's CJS plugin
  * context (`import.meta.url` unavailable, no SharedWebWorker, no OPFS).
  */
-export function createPersistentSqlJsDriver(io: PlatformIO): CreateSqliteDriver {
+export function createPersistentSqlJsDriver(
+  io: PlatformIO,
+  logFormatter: LogFormatter = formatLogLine,
+): CreateSqliteDriver {
   return async (_name, options) => {
     const SQL = await getSql();
 
@@ -64,7 +67,7 @@ export function createPersistentSqlJsDriver(io: PlatformIO): CreateSqliteDriver 
       if (isDisposed || isFlushed) return;
       const data = db.export();
       io.writeFile(data).catch((e) => {
-        console.error(formatLogLine("ERROR", "Failed to save database", e));
+        console.error(logFormatter("ERROR", "Failed to save database", e));
       });
     }
 
@@ -98,7 +101,7 @@ export function createPersistentSqlJsDriver(io: PlatformIO): CreateSqliteDriver 
       try {
         await io.writeFile(data);
       } catch (e) {
-        console.error(formatLogLine("ERROR", "Failed to save database", e));
+        console.error(logFormatter("ERROR", "Failed to save database", e));
       }
     }
 
@@ -148,7 +151,7 @@ export function createPersistentSqlJsDriver(io: PlatformIO): CreateSqliteDriver 
           // Export before closing DB, then write asynchronously.
           const data = db.export();
           io.writeFile(data).catch((e) => {
-            console.error(formatLogLine("ERROR", "Failed to save database", e));
+            console.error(logFormatter("ERROR", "Failed to save database", e));
           });
         }
         db.close();

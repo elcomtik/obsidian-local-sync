@@ -10,7 +10,7 @@ import {
   isTrackedVaultFile,
   isTrackedVaultPath,
 } from "./pathPolicy";
-import { formatLogLine } from "./logFormat";
+import { formatLogLine, type LogFormatter } from "./logFormat";
 import type { VaultAdapter, VaultFile } from "./vaultAdapter";
 
 /**
@@ -147,6 +147,7 @@ export class YjsEvoluHistoryEngine {
   private config: EngineConfig;
   private localSyncConfig: LocalSyncConfig;
   private logLevel: LogLevel;
+  private formatLogLine: LogFormatter = formatLogLine;
 
   private states = new Map<string, FileState>();
 
@@ -230,6 +231,7 @@ export class YjsEvoluHistoryEngine {
     config: EngineConfig;
     localSyncConfig?: LocalSyncConfig;
     logLevel: LogLevel;
+    logFormatter?: LogFormatter;
   }) {
     this.vault = args.vault;
     this.evolu = args.evolu;
@@ -237,28 +239,29 @@ export class YjsEvoluHistoryEngine {
     this.config = args.config;
     this.localSyncConfig = args.localSyncConfig ?? DEFAULT_LOCAL_SYNC_CONFIG;
     this.logLevel = args.logLevel;
+    this.formatLogLine = args.logFormatter ?? formatLogLine;
   }
 
   // ---------- logging helpers ----------
 
   private logInfo(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.info) return;
-    console.log(formatLogLine("INFO", message, data));
+    console.log(this.formatLogLine("INFO", message, data));
   }
 
   private logDebug(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.debug) return;
-    console.log(formatLogLine("DEBUG", message, data));
+    console.log(this.formatLogLine("DEBUG", message, data));
   }
 
   private logWarn(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.warn) return;
-    console.warn(formatLogLine("WARN", message, data));
+    console.warn(this.formatLogLine("WARN", message, data));
   }
 
   private logError(message: string, data?: unknown) {
     if (levelRank[this.logLevel] < levelRank.error) return;
-    console.error(formatLogLine("ERROR", message, data));
+    console.error(this.formatLogLine("ERROR", message, data));
   }
 
   // ---------- lifecycle ----------
