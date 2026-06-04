@@ -1,5 +1,134 @@
 # Changelog
 
+## 0.2.7 — 2026-06-04
+
+### Fixed
+
+- **Repair files with local snapshots but missing sync history**:
+  startup now compares tracked vault paths and local `_fileSnapshot` rows against
+  visible `fileUpdate` history.  If a vault file exists locally but has no
+  present `fileUpdate`, LocalSync retransmits a deterministic full-state update
+  so fresh peers can restore it.  This repairs older states where an interrupted
+  run left files snapshotted locally but never advertised through Evolu history.
+
+- **Prevent snapshots after failed outgoing flushes**:
+  `flushOutgoingUpdates` now reports success/failure and keeps pending updates
+  until the `fileUpdate` upsert succeeds.  LRU eviction and shutdown skip saving
+  a fresh `_fileSnapshot` when outgoing sync failed, preventing local-only
+  snapshots from masking unsent file updates.
+
+- **Sync empty files correctly**:
+  empty newly-created files now advertise a full empty state, and remote empty
+  file updates create the missing vault file instead of being skipped as
+  "unchanged".  This prevents empty-file updates from later being mistaken for
+  offline deletes on the receiving peer.
+
+### Added
+
+- **Sync inventory diagnostics**:
+  startup logs compare vault-tracked files, local snapshots, tombstones, and
+  `fileUpdate` history counts at `startup-scan-done` and `history-quiet`.
+  Samples of missing paths are included to make future sync-state investigations
+  observable from exported Obsidian logs.
+
+## 0.2.6 — 2026-06-02
+
+### Changed
+
+- **Quieter runtime logs**:
+  added the `debug` log level and moved high-volume LRU cache messages out of
+  normal `info` logs.  This keeps startup and sync diagnostics readable while
+  still allowing detailed cache tracing when needed.
+
+## 0.2.5 — 2026-06-02
+
+### Changed
+
+- **Structured log messages render inline**:
+  log payloads are now formatted into the message text as JSON across the
+  plugin, daemon, Evolu client, and SQLite driver.  Exported browser logs now
+  preserve the important context instead of showing only a generic message with
+  a detached object.
+
+## 0.2.4 — 2026-06-02
+
+### Added
+
+- **Configurable path policy**:
+  include extensions and exclude patterns are configurable for both the Obsidian
+  plugin and standalone daemon.  Excludes support gitignore-style negation so a
+  broad ignore such as `.obsidian/**` can keep selected files or folders.
+
+- **Canvas sync by default**:
+  `.canvas` files are included in the default sync policy alongside Markdown and
+  text files.
+
+- **Plugin settings for sync policy**:
+  the Obsidian settings tab now exposes include extensions, exclude patterns,
+  startup scan, and offline delete behavior.
+
+### Changed
+
+- **Plugin display name**:
+  renamed the visible Obsidian plugin name to `LocalSync`.
+
+- **More observable startup filtering**:
+  startup scan logging now reports policy decisions so skipped files are easier
+  to diagnose.
+
+## 0.2.3 — 2026-05-26
+
+### Fixed
+
+- **Daemon owner restore reads the DB first**:
+  daemon startup now prefers the owner already stored in the SQLite DB and only
+  restores `LOCALSYNC_MNEMONIC` when the DB owner is missing, unreadable, or
+  different.  Owner reads are bounded by `LOCALSYNC_OWNER_READ_TIMEOUT_MS`.
+
+- **Atomic daemon DB writes**:
+  DB export writes now go through a temporary file and rename, reducing the
+  chance of a malformed SQLite image after interruption.
+
+## 0.2.2 — 2026-05-26
+
+### Fixed
+
+- **Avoid unbounded app owner waits during daemon mnemonic startup**:
+  daemon startup stopped relying on an unresolved `evolu.appOwner` promise for
+  every mnemonic check.  A local owner marker was introduced so the daemon could
+  restore only when needed instead of hanging before startup.
+
+## 0.2.1 — 2026-05-26
+
+### Fixed
+
+- **Bound daemon owner lookup while restoring mnemonic**:
+  `LOCALSYNC_MNEMONIC` startup gained a timeout around owner lookup so unresolved
+  Evolu owner reads did not leave top-level await unsettled and terminate the
+  daemon with exit code 13.
+
+- **Daemon smoke coverage for mnemonic restore**:
+  the daemon smoke test now starts with a generated mnemonic and verifies the
+  restore path.
+
+## 0.2.0 — 2026-05-25
+
+### Added
+
+- **Standalone daemon**:
+  added a Node.js daemon build that can sync a vault directory outside Obsidian,
+  using the shared sync core and filesystem-backed vault adapter.
+
+- **Daemon container release pipeline**:
+  added Dockerfile, GitLab CI image publishing, and a daemon runtime smoke test
+  so Kubernetes sidecars can be built and verified from the same project.
+
+### Changed
+
+- **Shared sync core**:
+  refactored the Obsidian plugin internals around an explicit vault adapter
+  boundary so the plugin and daemon use the same reconciliation engine.
+
 ## 0.1.4 — 2026-02-25
 
 ### Changed

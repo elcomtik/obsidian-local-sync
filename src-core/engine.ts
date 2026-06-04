@@ -112,6 +112,11 @@ type FileState = {
 
 };
 
+type SyncInventory = {
+  vaultPathsMissingFileUpdate: string[];
+  snapshotPathsMissingFileUpdate: string[];
+};
+
 /**
  * Core sync engine for obsidian-local-sync.
  *
@@ -202,6 +207,7 @@ export class YjsEvoluHistoryEngine {
    * relay sync before we decide a file has no remote history.
    */
   private pendingVaultSeedReady = false;
+  private hasLoggedQuietSyncInventory = false;
 
   /**
    * A minimal empty Yjs update (full state of a new empty Y.Doc), base64-encoded.
@@ -350,6 +356,7 @@ export class YjsEvoluHistoryEngine {
         trackedFiles: files.length,
         adapterFiles: allFiles.length,
       });
+      await this.logSyncInventory("startup-scan-done", files);
       this.scanComplete = true;
     } catch (e) {
       this.logError("scanVaultForUnsyncedFiles failed", e);
@@ -415,7 +422,7 @@ export class YjsEvoluHistoryEngine {
    * Using a fixed ID means repeated calls update the same Evolu row rather than
    * creating unbounded new rows.
    */
-  private async retransmitCurrentState(path: string) {
+  private async retransmitCurrentState(path: string): Promise<boolean> {
     try {
       const st = await this.getOrLoadFileState(path);
       const updateBytes = Y.encodeStateAsUpdate(st.doc);
@@ -426,9 +433,12 @@ export class YjsEvoluHistoryEngine {
       );
       this.evolu.upsert("fileUpdate", { id, path, updateBase64 });
       this.outgoingIds.add(id);
+      await this.saveLocalSnapshot(path, st);
       this.logInfo("Startup scan: retransmitted", { path, bytes: updateBytes.length });
+      return true;
     } catch (e) {
       this.logError("retransmitCurrentState failed", { path, error: e });
+      return false;
     }
   }
 
@@ -553,6 +563,7 @@ export class YjsEvoluHistoryEngine {
     try {
       const newVaultText = await this.vault.readText(path);
       if (newVaultText === null) return;
+      const hadSnapshot = (await this.loadLocalSnapshot(path)) !== null;
       const st = await this.getOrLoadFileState(path);
       this.touch(path, st);
 
@@ -567,6 +578,10 @@ export class YjsEvoluHistoryEngine {
       });
 
       st.lastVaultText = newVaultText;
+      if (!hadSnapshot && newVaultText.length === 0 && st.pendingUpdates.length === 0) {
+        this.logInfo("Vault file changed: advertising empty new file", { path });
+        await this.retransmitCurrentState(path);
+      }
       // No per-keystroke logs; flush logs happen in flushOutgoingUpdates.
     } catch (e) {
       this.logError("onVaultFileChanged failed", { path, error: e });
@@ -619,6 +634,11 @@ export class YjsEvoluHistoryEngine {
               this.pendingVaultSeedReady = true;
             } else {
               await this.drainPendingVaultSeed();
+            }
+            if (!this.hasLoggedQuietSyncInventory) {
+              this.hasLoggedQuietSyncInventory = true;
+              const inventory = await this.logSyncInventory("history-quiet");
+              await this.repairMissingFileUpdates(inventory.vaultPathsMissingFileUpdate);
             }
           }
           return;
@@ -773,15 +793,16 @@ export class YjsEvoluHistoryEngine {
       const oldestPath = this.states.keys().next().value as string | undefined;
       if (!oldestPath) return;
 
-      await this.closeDoc(oldestPath);
+      const closed = await this.closeDoc(oldestPath);
+      if (!closed) return;
       this.states.delete(oldestPath);
       this.logDebug("LRU evicted doc", { path: oldestPath, openDocs: this.states.size });
     }
   }
 
-  private async closeDoc(path: string) {
+  private async closeDoc(path: string): Promise<boolean> {
     const st = this.states.get(path);
-    if (!st) return;
+    if (!st) return true;
 
     try {
       if (st.flushTimer != null) {
@@ -789,12 +810,19 @@ export class YjsEvoluHistoryEngine {
         st.flushTimer = null;
       }
 
-      await this.flushOutgoingUpdates(path, st);
+      const flushed = await this.flushOutgoingUpdates(path, st);
+      if (!flushed) {
+        this.logWarn("closeDoc: skipping snapshot after failed outgoing flush", { path });
+        return false;
+      }
+
       await this.saveLocalSnapshot(path, st);
 
       st.doc.destroy();
+      return true;
     } catch (e) {
       this.logError("closeDoc failed", { path, error: e });
+      return false;
     }
   }
 
@@ -842,6 +870,166 @@ export class YjsEvoluHistoryEngine {
     const rows = await this.evolu.loadQuery(q);
     if (rows.length === 0) return null;
     return rows[0].lastTimestamp ?? null;
+  }
+
+  private async logSyncInventory(
+    stage: string,
+    trackedFiles?: VaultFile[],
+  ): Promise<SyncInventory> {
+    try {
+      const files =
+        trackedFiles ??
+        (await this.vault.listFiles()).filter((file) =>
+          isTrackedVaultFile(file, this.localSyncConfig),
+        );
+      const vaultPaths = new Set(files.map((file) => file.path));
+
+      const snapshotQ = this.evolu.createQuery((db) =>
+        db
+          .selectFrom("_fileSnapshot")
+          .select(["path", "snapshotBase64"])
+          .where("isDeleted", "is", null),
+      );
+      const snapshotRows = await this.evolu.loadQuery(snapshotQ);
+      const snapshotPaths = new Set<string>();
+      const tombstonePaths = new Set<string>();
+      for (const row of snapshotRows) {
+        if (!row.path) continue;
+        if (row.snapshotBase64 === "DELETED") {
+          tombstonePaths.add(row.path);
+        } else {
+          snapshotPaths.add(row.path);
+        }
+      }
+
+      // fileUpdate rows are the sync-history representation that other peers
+      // can learn from once Evolu has replicated them. _fileSnapshot rows are
+      // local-only cache and must be counted separately.
+      const historyQ = this.evolu.createQuery((db) =>
+        db
+          .selectFrom("evolu_history")
+          .select(["id", "timestamp"])
+          .where("table", "==", "fileUpdate")
+          .where("column", "==", "updateBase64")
+          .orderBy("timestamp", "asc")
+          .limit(100000),
+      );
+      const historyRows = await this.evolu.loadQuery(historyQ);
+      const ids = historyRows.map((row) => idBytesToId(row.id as unknown as IdBytes));
+      const fileUpdateRows = await this.loadFileUpdateRows(ids);
+      const rowsById = new Map(
+        fileUpdateRows
+          .filter((row) => row.id && row.path)
+          .map((row) => [
+            row.id,
+            { path: row.path, type: row.type ?? null },
+          ]),
+      );
+
+      const latestTypeByPath = new Map<string, string | null>();
+      let visibleHistoryRows = 0;
+      for (const row of historyRows) {
+        const id = idBytesToId(row.id as unknown as IdBytes);
+        const fileUpdate = rowsById.get(id);
+        if (!fileUpdate) continue;
+        visibleHistoryRows++;
+        latestTypeByPath.set(fileUpdate.path, fileUpdate.type);
+      }
+
+      const fileUpdatePaths = new Set(latestTypeByPath.keys());
+      const fileUpdatePresentPaths = new Set(
+        Array.from(latestTypeByPath.entries())
+          .filter(([, type]) => type !== "delete")
+          .map(([path]) => path),
+      );
+      const fileUpdateDeletedPaths = new Set(
+        Array.from(latestTypeByPath.entries())
+          .filter(([, type]) => type === "delete")
+          .map(([path]) => path),
+      );
+
+      const missingFileUpdatePaths = Array.from(vaultPaths)
+        .filter((path) => !fileUpdatePresentPaths.has(path))
+        .sort();
+      const snapshotOnlyPaths = Array.from(snapshotPaths)
+        .filter((path) => !fileUpdatePresentPaths.has(path))
+        .sort();
+
+      this.logInfo("Sync inventory", {
+        stage,
+        vaultTrackedFiles: vaultPaths.size,
+        localSnapshotPaths: snapshotPaths.size,
+        localSnapshotTombstones: tombstonePaths.size,
+        fileUpdateHistoryRows: historyRows.length,
+        visibleFileUpdateRows: visibleHistoryRows,
+        fileUpdatePaths: fileUpdatePaths.size,
+        fileUpdatePresentPaths: fileUpdatePresentPaths.size,
+        fileUpdateDeletedPaths: fileUpdateDeletedPaths.size,
+        vaultPathsMissingFileUpdate: missingFileUpdatePaths.length,
+        snapshotPathsMissingFileUpdate: snapshotOnlyPaths.length,
+        sampleVaultPathsMissingFileUpdate: missingFileUpdatePaths.slice(0, 20),
+        sampleSnapshotPathsMissingFileUpdate: snapshotOnlyPaths.slice(0, 20),
+      });
+      return {
+        vaultPathsMissingFileUpdate: missingFileUpdatePaths,
+        snapshotPathsMissingFileUpdate: snapshotOnlyPaths,
+      };
+    } catch (e) {
+      this.logError("logSyncInventory failed", { stage, error: e });
+      return { vaultPathsMissingFileUpdate: [], snapshotPathsMissingFileUpdate: [] };
+    }
+  }
+
+  private async repairMissingFileUpdates(paths: string[]) {
+    if (paths.length === 0) return;
+
+    this.logInfo("Sync inventory repair: retransmitting missing fileUpdate paths", {
+      count: paths.length,
+      sample: paths.slice(0, 20),
+    });
+
+    let repaired = 0;
+    for (const path of paths) {
+      if (!this.isActive) break;
+      if (!(await this.vault.fileExists(path))) continue;
+      if (!isTrackedVaultPath(path, this.localSyncConfig)) continue;
+
+      const ok = await this.retransmitCurrentState(path);
+      if (ok) repaired++;
+    }
+
+    this.logInfo("Sync inventory repair: done", {
+      requested: paths.length,
+      repaired,
+    });
+  }
+
+  private async loadFileUpdateRows(ids: string[]) {
+    const rows: Array<{ id: string; path: string; type: string | null }> = [];
+    const batchSize = 500;
+    for (let i = 0; i < ids.length; i += batchSize) {
+      const batch = ids.slice(i, i + batchSize);
+      if (batch.length === 0) continue;
+      const fileUpdateQ = this.evolu.createQuery((db) =>
+        (db as any)
+          .selectFrom("fileUpdate")
+          .select(["id", "path", "type"])
+          .where("id", "in", batch as any)
+          .where("isDeleted", "is", null),
+      );
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const batchRows = (await this.evolu.loadQuery(fileUpdateQ)) as ReadonlyArray<any>;
+      rows.push(
+        ...batchRows
+          .filter((row) => row.id && row.path)
+          .map((row) => ({
+            id: row.id as string,
+            path: row.path as string,
+            type: (row.type as string | null) ?? null,
+          })),
+      );
+    }
+    return rows;
   }
 
   private async saveHistoryCursor(ts: TimestampBytes) {
@@ -976,10 +1164,6 @@ export class YjsEvoluHistoryEngine {
         lastVaultTextLen: st.lastVaultText.length,
         unchanged: newText === st.lastVaultText,
       });
-      if (newText === st.lastVaultText) {
-        this.logInfo("writeYjsToVault: no change, skipping", { path });
-        return;
-      }
 
       const fileFound = await this.vault.fileExists(path);
       this.logInfo("writeYjsToVault: vault lookup", { path, fileFound });
@@ -998,6 +1182,11 @@ export class YjsEvoluHistoryEngine {
         await this.vault.writeText(path, newText);
         st.lastVaultText = newText;
         this.logInfo("writeYjsToVault: file created", { path });
+        return;
+      }
+
+      if (newText === st.lastVaultText) {
+        this.logInfo("writeYjsToVault: no change, skipping", { path });
         return;
       }
 
@@ -1021,12 +1210,11 @@ export class YjsEvoluHistoryEngine {
     }, this.config.outgoingBatchMs);
   }
 
-  private async flushOutgoingUpdates(path: string, st: FileState) {
+  private async flushOutgoingUpdates(path: string, st: FileState): Promise<boolean> {
     try {
-      if (st.pendingUpdates.length === 0) return;
+      if (st.pendingUpdates.length === 0) return true;
 
       const merged = Y.mergeUpdates(st.pendingUpdates);
-      st.pendingUpdates = [];
 
       const updateBase64 = toBase64(merged);
       const id = createIdFromString<"FileUpdate">(
@@ -1035,12 +1223,15 @@ export class YjsEvoluHistoryEngine {
 
       this.evolu.upsert("fileUpdate", { id, path, updateBase64 });
       this.outgoingIds.add(id);
+      st.pendingUpdates = [];
 
       this.logInfo("Sent outgoing update", { path, bytes: merged.length });
 
       await this.saveLocalSnapshot(path, st);
+      return true;
     } catch (e) {
       this.logError("flushOutgoingUpdates failed", { path, error: e });
+      return false;
     }
   }
 
