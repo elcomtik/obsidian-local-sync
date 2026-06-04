@@ -10,8 +10,8 @@
 # │ Tag push  (git tag v0.0.9 && git push origin v0.0.9)                    │
 # │   build → release                                                        │
 # │                                                                          │
-# │   release  Zips main.js + main.js.map + manifest.json and attaches it  │
-# │            directly to a GitHub Release (no separate registry needed).  │
+# │   release  Zips plugin and daemon bundles and attaches both directly    │
+# │            to a GitHub Release (no separate registry needed).           │
 # └──────────────────────────────────────────────────────────────────────────┘
 #
 # No credentials or secrets need to be configured manually — GITHUB_TOKEN is
@@ -118,19 +118,30 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: plugin-dist
-          # no path → files land at workspace root (main.js, main.js.map, manifest.json)
+          path: plugin-dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: daemon-dist
+          path: daemon-dist
 
       - name: Create ZIP
         run: |
           zip -j "obsidian-local-sync-${{ github.ref_name }}.zip" \
-            main.js \
-            main.js.map \
-            manifest.json
+            plugin-dist/main.js \
+            plugin-dist/main.js.map \
+            plugin-dist/manifest.json
+
+          zip -j "obsidian-local-sync-daemon-${{ github.ref_name }}.zip" \
+            daemon-dist/main.js \
+            daemon-dist/main.js.map
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: "obsidian-local-sync-${{ github.ref_name }}.zip"
+          files: |
+            obsidian-local-sync-${{ github.ref_name }}.zip
+            obsidian-local-sync-daemon-${{ github.ref_name }}.zip
           body: |
             ## Installation
 
@@ -138,3 +149,8 @@ jobs:
             2. Unzip — you get `main.js`, `main.js.map`, and `manifest.json`.
             3. Copy all three files to `<vault>/.obsidian/plugins/obsidian-local-sync/`.
             4. Reload Obsidian → enable the plugin.
+
+            ## Daemon
+
+            Download `obsidian-local-sync-daemon-${{ github.ref_name }}.zip` if you
+            want to run the bundled Node.js daemon without Docker.
