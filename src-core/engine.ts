@@ -152,7 +152,9 @@ export class YjsEvoluHistoryEngine {
   private states = new Map<string, FileState>();
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private rescanTimer: ReturnType<typeof setInterval> | null = null;
   private isPolling = false;
+  private isScanningVault = false;
   /** Resolves when the current poll cycle completes. Awaited by stop(). */
   private ongoingPoll: Promise<void> = Promise.resolve();
 
@@ -277,14 +279,15 @@ export class YjsEvoluHistoryEngine {
     try {
       await this.ensureHistoryCursorRow();
       this.startPollingTimer();
+      this.startRescanTimer();
       this.logInfo("Engine started", this.config);
       // Kick off the audit, scan, and initial poll concurrently.
       // - auditSnapshotsForOfflineDeletes: detects files deleted/renamed while plugin was off.
       // - scanVaultForUnsyncedFiles: populates pendingVaultSeed (no Yjs mutations).
       // - poll: relay delivery; deferred seeding runs after relay is quiet.
       if (this.localSyncConfig.startupScan) {
-        void this.auditSnapshotsForOfflineDeletes();
-        void this.scanVaultForUnsyncedFiles();
+        void this.auditSnapshotsForOfflineDeletes("Startup scan");
+        void this.scanVaultForUnsyncedFiles("Startup scan");
       } else {
         this.scanComplete = true;
       }
@@ -295,13 +298,19 @@ export class YjsEvoluHistoryEngine {
   }
 
   /**
-   * Background scan run once at startup.
+   * Background scan run at startup and, when configured, periodically.
    *
    * Uses {@link reconcileVaultFile} rather than pretending every vault file was
    * modified. Files with snapshots are loaded to detect offline drift; files
    * without snapshots are deferred until after the relay has gone quiet.
    */
-  private async scanVaultForUnsyncedFiles() {
+  private async scanVaultForUnsyncedFiles(label: string) {
+    if (this.isScanningVault) {
+      this.logInfo(`${label}: already running, skipping`);
+      return;
+    }
+
+    this.isScanningVault = true;
     try {
       const allFiles = await this.vault.listFiles();
       const files: VaultFile[] = [];
@@ -318,14 +327,14 @@ export class YjsEvoluHistoryEngine {
         if (decision.reason === "extension") {
           const key = decision.extension || "(none)";
           skippedByExtension.set(key, (skippedByExtension.get(key) ?? 0) + 1);
-          this.logInfo("Startup scan: skipped file", {
+          if (label === "Startup scan") this.logInfo(`${label}: skipped file`, {
             path: file.path,
             reason: decision.reason,
             extension: key,
           });
         } else {
           skippedByRule.set(decision.rule, (skippedByRule.get(decision.rule) ?? 0) + 1);
-          this.logInfo("Startup scan: skipped file", {
+          if (label === "Startup scan") this.logInfo(`${label}: skipped file`, {
             path: file.path,
             reason: decision.reason,
             rule: decision.rule,
@@ -333,7 +342,7 @@ export class YjsEvoluHistoryEngine {
         }
       }
 
-      this.logInfo("Startup scan: begin", {
+      this.logInfo(`${label}: begin`, {
         adapterFiles: allFiles.length,
         trackedFiles: files.length,
         skippedByExtension: Object.fromEntries(skippedByExtension),
@@ -344,7 +353,7 @@ export class YjsEvoluHistoryEngine {
 
       for (const file of files) {
         if (!this.isActive) break;
-        const result = await this.reconcileVaultFile(file.path);
+        const result = await this.reconcileVaultFile(file.path, label);
 
         if (result === "deferred") {
           deferred++;
@@ -353,17 +362,19 @@ export class YjsEvoluHistoryEngine {
         }
       }
 
-      this.logInfo("Startup scan: done", {
+      this.logInfo(`${label}: done`, {
         loaded,
         deferred,
         trackedFiles: files.length,
         adapterFiles: allFiles.length,
       });
-      await this.logSyncInventory("startup-scan-done", files);
+      await this.logSyncInventory(label === "Startup scan" ? "startup-scan-done" : "periodic-rescan-done", files);
       this.scanComplete = true;
     } catch (e) {
-      this.logError("scanVaultForUnsyncedFiles failed", e);
+      this.logError(`${label}: scanVaultForUnsyncedFiles failed`, e);
       this.scanComplete = true; // allow drain even if scan errored
+    } finally {
+      this.isScanningVault = false;
     }
   }
 
@@ -378,12 +389,12 @@ export class YjsEvoluHistoryEngine {
    * **No snapshot:** defer seeding until after a quiet relay poll so existing
    * remote history has a chance to arrive first.
    */
-  async reconcileVaultFile(path: string): Promise<ReconcileResult> {
+  async reconcileVaultFile(path: string, label = "Startup scan"): Promise<ReconcileResult> {
     if (!isTrackedVaultPath(path, this.localSyncConfig)) return "skipped";
 
     const snapshot = await this.loadLocalSnapshot(path);
     if (snapshot === null) {
-      this.logInfo("Startup scan: deferring new file seed", { path });
+      this.logInfo(`${label}: deferring new file seed`, { path });
       this.pendingVaultSeed.add(path);
       return "deferred";
     }
@@ -400,18 +411,18 @@ export class YjsEvoluHistoryEngine {
    * true.  Files already removed from `pendingVaultSeed` by
    * {@link pollHistoryOnce} (history arrived → no seeding needed) are
    * skipped automatically by the set iteration.
-   */
+  */
   private async drainPendingVaultSeed() {
     if (this.pendingVaultSeed.size === 0) return;
-    this.logInfo("Startup scan: seeding deferred files", { count: this.pendingVaultSeed.size });
+    this.logInfo("Deferred seed: seeding files", { count: this.pendingVaultSeed.size });
     for (const path of this.pendingVaultSeed) {
       if (!this.isActive) break;
       // Only seed if not already opened by poll (early-return in getOrLoadFileState)
       if (!this.states.has(path)) {
-        this.logInfo("Startup scan: seeding new file", { path });
+        this.logInfo("Deferred seed: seeding new file", { path });
         await this.getOrLoadFileState(path); // seedFromVault: true (default)
       } else {
-        this.logInfo("Startup scan: deferred file already opened, skipping seed", { path });
+        this.logInfo("Deferred seed: file already opened, skipping seed", { path });
       }
       this.pendingVaultSeed.delete(path);
     }
@@ -459,6 +470,7 @@ export class YjsEvoluHistoryEngine {
   async stop(flush = true) {
     try {
       this.stopPollingTimer();
+      this.stopRescanTimer();
       // Wait for any in-progress poll to finish so its cursor write is included
       // in the final DB flush.  Without this, the cursor update from the last
       // poll can arrive after closeEvoluDb() has already flushed, and the cursor
@@ -514,6 +526,8 @@ export class YjsEvoluHistoryEngine {
   /** Updates path policy used by scans, vault events, and remote write/delete handling. */
   updateLocalSyncConfig(config: LocalSyncConfig) {
     this.localSyncConfig = config;
+    this.stopRescanTimer();
+    this.startRescanTimer();
     this.logInfo("Local sync path policy updated", config);
   }
 
@@ -602,6 +616,31 @@ export class YjsEvoluHistoryEngine {
   private stopPollingTimer() {
     if (this.pollTimer != null) clearInterval(this.pollTimer);
     this.pollTimer = null;
+  }
+
+  private startRescanTimer() {
+    this.stopRescanTimer();
+    const intervalSeconds = this.localSyncConfig.periodicRescanSeconds;
+    if (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0) return;
+
+    this.rescanTimer = setInterval(() => {
+      if (this.isActive) void this.runPeriodicLocalRescan();
+    }, intervalSeconds * 1000);
+    this.logInfo("Periodic rescan enabled", { intervalSeconds });
+  }
+
+  private stopRescanTimer() {
+    if (this.rescanTimer != null) clearInterval(this.rescanTimer);
+    this.rescanTimer = null;
+  }
+
+  private async runPeriodicLocalRescan() {
+    if (!this.isActive) return;
+    this.logInfo("Periodic rescan: tick");
+    if (this.localSyncConfig.syncDeletes) {
+      await this.auditSnapshotsForOfflineDeletes("Periodic rescan");
+    }
+    await this.scanVaultForUnsyncedFiles("Periodic rescan");
   }
 
   private pollHistoryOnce() {
@@ -754,7 +793,7 @@ export class YjsEvoluHistoryEngine {
 
           touchedPaths.add(path);
           if (this.pendingVaultSeed.delete(path)) {
-            this.logInfo("Startup scan: remote history covered deferred file", { path });
+            this.logInfo("Deferred seed: remote history covered file", { path });
           }
         }
 
@@ -1334,7 +1373,7 @@ export class YjsEvoluHistoryEngine {
    *
    * Called concurrently from `start()` alongside `scanVaultForUnsyncedFiles`.
    */
-  private async auditSnapshotsForOfflineDeletes() {
+  private async auditSnapshotsForOfflineDeletes(label = "Startup scan") {
     if (!this.localSyncConfig.syncDeletes) return;
 
     try {
@@ -1362,7 +1401,7 @@ export class YjsEvoluHistoryEngine {
         // If the file still exists in the vault, nothing to do.
         if (vaultPaths.has(path)) continue;
 
-        this.logInfo("Startup audit: offline delete detected", { path });
+        this.logInfo(`${label}: offline delete detected`, { path });
         this.destroyDoc(path);
         this.pendingVaultSeed.delete(path);
         this.tombstoneSnapshot(path);
@@ -1381,10 +1420,10 @@ export class YjsEvoluHistoryEngine {
       }
 
       if (audited > 0) {
-        this.logInfo("Startup audit: done", { offlineDeletes: audited });
+        this.logInfo(`${label}: offline delete audit done`, { offlineDeletes: audited });
       }
     } catch (e) {
-      this.logError("auditSnapshotsForOfflineDeletes failed", e);
+      this.logError(`${label}: auditSnapshotsForOfflineDeletes failed`, e);
     }
   }
 }

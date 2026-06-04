@@ -54,6 +54,7 @@ type PluginSettings = {
   excludeGlobs: string[];
   startupScan: boolean;
   syncDeletes: boolean;
+  periodicRescanSeconds: number;
 
   logLevel: LogLevel;
 };
@@ -72,6 +73,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
   excludeGlobs: DEFAULT_LOCAL_SYNC_CONFIG.excludeGlobs,
   startupScan: DEFAULT_LOCAL_SYNC_CONFIG.startupScan,
   syncDeletes: DEFAULT_LOCAL_SYNC_CONFIG.syncDeletes,
+  periodicRescanSeconds: DEFAULT_LOCAL_SYNC_CONFIG.periodicRescanSeconds,
 
   logLevel: "info",
 };
@@ -91,6 +93,7 @@ function toLocalSyncConfig(s: PluginSettings): LocalSyncConfig {
     excludeGlobs: normalizeRules(s.excludeGlobs),
     startupScan: s.startupScan,
     syncDeletes: s.syncDeletes,
+    periodicRescanSeconds: s.periodicRescanSeconds,
   };
 }
 
@@ -532,6 +535,24 @@ class LocalSyncSettingTab extends PluginSettingTab {
           this.plugin.settings.syncDeletes = value;
           await this.plugin.applyLocalSyncConfigFromSettings();
           new Notice(`Delete sync ${value ? "enabled" : "disabled"}`);
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Periodic rescan (seconds)")
+      .setDesc("Scan tracked vault files periodically. Set to 0 to disable.")
+      .addText((text) => {
+        text.setValue(String(this.plugin.settings.periodicRescanSeconds));
+        text.inputEl.addEventListener("change", async () => {
+          const n = Number(text.inputEl.value);
+          if (!Number.isInteger(n) || n < 0) {
+            text.setValue(String(this.plugin.settings.periodicRescanSeconds));
+            new Notice("Periodic rescan must be 0 or a positive whole number of seconds");
+            return;
+          }
+          this.plugin.settings.periodicRescanSeconds = n;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+          new Notice(n > 0 ? `Periodic rescan every ${n} seconds` : "Periodic rescan disabled");
         });
       });
 

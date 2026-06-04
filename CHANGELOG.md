@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.9 — 2026-06-04
+
+### Added
+
+- **Configurable periodic local rescan**:
+  LocalSync can now periodically repeat startup-style vault reconciliation to
+  detect tracked files changed outside the watcher path. It is disabled by
+  default and configurable in plugin settings or with
+  `LOCALSYNC_PERIODIC_RESCAN_SECONDS` for the standalone daemon.
+
 ## 0.2.8 — 2026-06-04
 
 ### Changed

@@ -5,6 +5,7 @@ export type LocalSyncConfig = {
   excludeGlobs: string[];
   startupScan: boolean;
   syncDeletes: boolean;
+  periodicRescanSeconds: number;
 };
 
 export type TrackingDecision =
@@ -28,6 +29,7 @@ export const DEFAULT_LOCAL_SYNC_CONFIG: LocalSyncConfig = {
   ],
   startupScan: true,
   syncDeletes: true,
+  periodicRescanSeconds: 0,
 };
 
 export function getExtension(path: string): string | undefined {

@@ -41,8 +41,16 @@ deployment that must join an existing sync owner.
 | `LOCALSYNC_MAX_OPEN_DOCS` | `50` | Maximum open Yjs documents. |
 | `LOCALSYNC_STARTUP_SCAN` | `true` | Scan vault on startup. |
 | `LOCALSYNC_SYNC_DELETES` | `true` | Propagate local deletes and run startup offline-delete audit. |
+| `LOCALSYNC_PERIODIC_RESCAN_SECONDS` | `0` | Periodically rescan tracked vault files. Set to `0` to disable. |
 | `LOCALSYNC_USE_POLLING` | `false` | Force chokidar polling. Useful on some network/PVC mounts. |
 | `LOCALSYNC_POLL_INTERVAL_MS` | `1000` | Chokidar polling interval when polling is enabled. |
+
+`LOCALSYNC_PERIODIC_RESCAN_SECONDS` is disabled by default. When enabled, the
+daemon repeats the same tracked-file reconciliation used at startup: existing
+snapshots are checked for offline drift, files with no local snapshot are
+deferred until relay history is quiet, and offline-delete auditing runs when
+`LOCALSYNC_SYNC_DELETES=true`. This is useful for vaults that may be changed by
+tools outside the file watcher.
 
 ## Path Policy
 

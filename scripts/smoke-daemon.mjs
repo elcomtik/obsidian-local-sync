@@ -56,11 +56,11 @@ try {
   await sleep(500);
 
   await mkdir(path.join(vaultRoot, ".obsidian"), { recursive: true });
-  await writeFile(path.join(vaultRoot, ".obsidian", "workspace.md"), "ignored\n", "utf8");
+  await writeFile(path.join(vaultRoot, ".obsidian", "workspace.json"), "ignored\n", "utf8");
   await mkdir(path.join(vaultRoot, ".git"), { recursive: true });
   await writeFile(path.join(vaultRoot, ".git", "ignored.md"), "ignored\n", "utf8");
   await sleep(500);
-  assertNoOutput(".obsidian/workspace.md");
+  assertNoOutput(".obsidian/workspace.json");
   assertNoOutput(".git/ignored.md");
 
   const notePath = path.join(vaultRoot, "note.md");

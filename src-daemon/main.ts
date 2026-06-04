@@ -47,6 +47,10 @@ const localSyncConfig: LocalSyncConfig = {
   excludeGlobs: readRules("LOCALSYNC_EXCLUDE_GLOBS", DEFAULT_LOCAL_SYNC_CONFIG.excludeGlobs),
   startupScan: readBoolean("LOCALSYNC_STARTUP_SCAN", true),
   syncDeletes: readBoolean("LOCALSYNC_SYNC_DELETES", true),
+  periodicRescanSeconds: readNonNegativeInt(
+    "LOCALSYNC_PERIODIC_RESCAN_SECONDS",
+    DEFAULT_LOCAL_SYNC_CONFIG.periodicRescanSeconds,
+  ),
 };
 const usePolling = readBoolean("LOCALSYNC_USE_POLLING", false);
 const pollIntervalMs = readPositiveInt("LOCALSYNC_POLL_INTERVAL_MS", 1000);
@@ -201,6 +205,16 @@ function readPositiveInt(name: string, fallback: number): number {
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
     throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function readNonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be 0 or a positive integer`);
   }
   return value;
 }
