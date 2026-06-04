@@ -63,12 +63,17 @@ try {
   assertNoOutput(".obsidian/workspace.json");
   assertNoOutput(".git/ignored.md");
 
+  const emptyNotePath = path.join(vaultRoot, "empty.md");
+  await writeFile(emptyNotePath, "", "utf8");
+  await waitForOutput("Vault file changed", 10_000);
+  await waitForOutput("Vault file changed: advertising empty new file", 10_000);
+
   const notePath = path.join(vaultRoot, "note.md");
   await writeFile(notePath, "# Smoke\n\nInitial text\n", "utf8");
-  await waitForOutput("Vault file changed", 10_000);
+  await waitForOutputCount("Vault file changed", 2, 10_000);
 
   await writeFile(notePath, "# Smoke\n\nUpdated text\n", "utf8");
-  await waitForOutputCount("Vault file changed", 2, 10_000);
+  await waitForOutputCount("Vault file changed", 3, 10_000);
 
   await rm(notePath);
   await waitForOutput("Vault file deleted", 10_000);

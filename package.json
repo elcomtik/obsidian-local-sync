@@ -9,6 +9,7 @@
     "build:daemon": "node esbuild.daemon.config.mjs",
     "dev": "node esbuild.plugin.config.mjs --watch",
     "dev:daemon": "node esbuild.daemon.config.mjs --watch",
+    "test": "node scripts/run-tests.mjs",
     "smoke:daemon": "npm run build:daemon && node scripts/smoke-daemon.mjs"
   },
   "dependencies": {

@@ -111,6 +111,15 @@ docker run --rm \
   registry.example/obsidian-local-sync:latest
 ```
 
+## Tests
+
+```bash
+npm test
+```
+
+The unit test suite currently covers the shared path policy, including default
+tracked extensions, default excludes, and gitignore-style negation behavior.
+
 ## Smoke Test
 
 ```bash
@@ -118,8 +127,8 @@ npm run smoke:daemon
 ```
 
 The smoke test creates a temporary vault, starts the daemon, writes and deletes
-a tracked Markdown file, confirms the local database is persisted, and shuts the
-process down cleanly.
+a tracked Markdown file, verifies empty-file advertisement, confirms the local
+database is persisted, and shuts the process down cleanly.
 
 ## Scope
 
