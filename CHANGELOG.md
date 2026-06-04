@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.10 — 2026-06-04
+
+### Added
+
+- **LocalSync test coverage**:
+  added `npm test` with TypeScript unit tests for the shared path policy,
+  including default tracking, default excludes, extension precedence, and
+  gitignore-style negation behavior.
+
+- **CI verification jobs**:
+  GitLab and GitHub CI now run unit tests, typecheck, and daemon smoke
+  verification before build/release jobs.
+
+### Changed
+
+- **Daemon smoke coverage**:
+  smoke tests now verify empty-file advertisement in addition to normal file
+  write/delete behavior.
+
 ## 0.2.9 — 2026-06-04
 
 ### Added
