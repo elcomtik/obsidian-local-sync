@@ -4,8 +4,8 @@
 #
 # ┌──────────────────────────────────────────────────────────────────────────┐
 # │ Every push                                                               │
-# │   quality-gate — typecheck, plugin build, daemon smoke test             │
-# │   build        — compile TypeScript → dist/ and dist-daemon/            │
+# │   test/typecheck/smoke-daemon — verification jobs in the test stage     │
+# │   build                    — compile TypeScript → dist/ and dist-daemon/ │
 # ├──────────────────────────────────────────────────────────────────────────┤
 # │ Tag push  (git tag v0.0.8 && git push origin v0.0.8)                    │
 # │   build → docker-build → docker-push-release → publish → release         │
@@ -32,15 +32,27 @@ stages:
   - publish
   - release
 
-# ─── Quality Gate ────────────────────────────────────────────────────────────
+# ─── Test ────────────────────────────────────────────────────────────────────
 
-quality-gate:
+unit-test:
+  stage: test
+  image: node:22-alpine
+  script:
+    - npm ci
+    - npm test
+
+typecheck:
   stage: test
   image: node:22-alpine
   script:
     - npm ci
     - npx tsc --noEmit
-    - npm run build:plugin
+
+smoke-daemon:
+  stage: test
+  image: node:22-alpine
+  script:
+    - npm ci
     - npm run smoke:daemon
 
 # ─── Build ───────────────────────────────────────────────────────────────────
@@ -49,7 +61,9 @@ build:
   stage: build
   image: node:22-alpine
   needs:
-    - quality-gate
+    - unit-test
+    - typecheck
+    - smoke-daemon
   script:
     - npm ci
     - npm run build:plugin
@@ -70,7 +84,9 @@ build:
 docker-build:
   stage: build
   needs:
-    - quality-gate
+    - unit-test
+    - typecheck
+    - smoke-daemon
 
 # ─── Publish to Package Registry (tags only) ─────────────────────────────────
 

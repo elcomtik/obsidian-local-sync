@@ -4,7 +4,8 @@
 #
 # ┌──────────────────────────────────────────────────────────────────────────┐
 # │ Every push (any branch or tag)                                           │
-# │   build  — compile TypeScript → dist/ (smoke-test the build)            │
+# │   unit-test/typecheck/smoke-daemon — verify the code                    │
+# │   build  — compile plugin and daemon artifacts                          │
 # ├──────────────────────────────────────────────────────────────────────────┤
 # │ Tag push  (git tag v0.0.9 && git push origin v0.0.9)                    │
 # │   build → release                                                        │
@@ -24,9 +25,54 @@ on:
     tags: ['v*']
 
 jobs:
+  # ─── Test ──────────────────────────────────────────────────────────────────
+
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npx tsc --noEmit
+
+  smoke-daemon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run smoke:daemon
+
   # ─── Build ─────────────────────────────────────────────────────────────────
 
   build:
+    needs:
+      - unit-test
+      - typecheck
+      - smoke-daemon
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +83,8 @@ jobs:
           cache: npm   # speeds up subsequent runs by restoring node_modules cache
 
       - run: npm ci
-      - run: npm run build
+      - run: npm run build:plugin
+      - run: npm run build:daemon
 
       - uses: actions/upload-artifact@v4
         with:
@@ -48,6 +95,14 @@ jobs:
             dist/main.js
             dist/main.js.map
             dist/manifest.json
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon-dist
+          path: |
+            dist-daemon/main.js
+            dist-daemon/main.js.map
           retention-days: 7
 
   # ─── Release (tags only) ───────────────────────────────────────────────────
