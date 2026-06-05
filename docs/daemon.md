@@ -96,6 +96,17 @@ installed community plugin files should also sync. LocalSync's own plugin
 directory is excluded by default so device-local settings such as `deviceId` are
 not copied between peers.
 
+> [!WARNING]
+> Never remove the exclusion for `.obsidian/plugins/obsidian-local-sync/**`.
+>
+> That directory contains LocalSync's own runtime state: the Evolu/sql.js
+> database, device-specific settings, and the running plugin files. Syncing it
+> can replace the plugin while it is operating, copy one peer's device identity
+> into another peer, corrupt local sync state, or create feedback loops where
+> LocalSync tries to distribute its own implementation/state. Even when syncing
+> installed community plugin files, keep LocalSync's own plugin directory
+> excluded.
+
 Settings payloads are stored as base64 text in `settingUpdate`. LocalSync uses
 raw UTF-8 base64 for small or incompressible settings and gzip-compressed base64
 when compression reduces the stored payload size. Missing/null `encoding` means

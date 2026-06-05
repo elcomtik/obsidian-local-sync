@@ -149,8 +149,18 @@ Obsidian JSON settings, themes, snippets, and community plugin JSON settings
 unless excluded by settings exclude rules. Installed community plugin files
 (`main.js`, `styles.css`, and `manifest.json`) can be enabled on demand with
 the Installed community plugin files setting.
-LocalSync's own plugin directory is excluded so device-local sync settings such
-as `deviceId` are not copied between peers.
+
+> [!WARNING]
+> Never sync LocalSync's own plugin directory:
+> `.obsidian/plugins/obsidian-local-sync/**`.
+>
+> LocalSync stores its own database, device identity, settings, and runtime
+> plugin files there. Replicating that directory can overwrite the running
+> plugin, copy device-local identity/settings between peers, corrupt or replace
+> the local Evolu database, and create self-update loops that break sync across
+> the vault. LocalSync excludes this directory by default; keep that exclusion
+> in any custom settings policy.
+
 Startup and rescan repair settings from existing `settingUpdate` history before
 seeding local files, so a new peer should adopt already-synced settings instead
 of publishing its local defaults over them. For an initialized peer, repair
