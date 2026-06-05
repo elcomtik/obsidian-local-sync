@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { VaultAdapter, VaultFile } from "../src-core/vaultAdapter";
+import type { VaultAdapter, VaultFile, VaultFolderListing } from "../src-core/vaultAdapter";
 import { getExtension } from "../src-core/pathPolicy";
 
 export class NodeFsVaultAdapter implements VaultAdapter {
@@ -30,6 +30,23 @@ export class NodeFsVaultAdapter implements VaultAdapter {
 
     await walk(this.root);
     return files;
+  }
+
+  async listFolder(vaultPath: string): Promise<VaultFolderListing | null> {
+    try {
+      const entries = await fs.readdir(this.resolveVaultPath(vaultPath), { withFileTypes: true });
+      return {
+        files: entries
+          .filter((entry) => entry.isFile())
+          .map((entry) => `${vaultPath.replace(/\/$/, "")}/${entry.name}`),
+        folders: entries
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => `${vaultPath.replace(/\/$/, "")}/${entry.name}`),
+      };
+    } catch (error) {
+      if (isMissingFile(error)) return null;
+      throw error;
+    }
   }
 
   async readText(vaultPath: string): Promise<string | null> {

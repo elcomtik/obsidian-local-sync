@@ -33,6 +33,15 @@ const child = spawn(process.execPath, [daemonPath], {
     LOCALSYNC_OWNER_READ_TIMEOUT_MS: "10000",
     LOCALSYNC_HISTORY_POLL_MS: "250",
     LOCALSYNC_OUTGOING_BATCH_MS: "100",
+    LOCALSYNC_SYNC_OBSIDIAN_SETTINGS: "true",
+    LOCALSYNC_SETTINGS_INCLUDE_GLOBS: [
+      ".obsidian/**/*.json",
+      ".obsidian/themes/**",
+      ".obsidian/snippets/**",
+      ".obsidian/plugins/*/*.js",
+    ].join(","),
+    LOCALSYNC_PERIODIC_RESCAN_SECONDS: "1",
+    LOCALSYNC_SETTINGS_RESCAN_SECONDS: "1",
     LOCALSYNC_USE_POLLING: "true",
     LOCALSYNC_POLL_INTERVAL_MS: "100",
   },
@@ -52,15 +61,23 @@ child.stderr.on("data", (chunk) => {
 });
 
 try {
-  await waitForOutput("Watcher ready", 10_000);
+  await waitForOutput("Vault watcher ready", 10_000);
+  await waitForOutput("Settings watcher ready", 10_000);
   await sleep(500);
 
   await mkdir(path.join(vaultRoot, ".obsidian"), { recursive: true });
-  await writeFile(path.join(vaultRoot, ".obsidian", "workspace.json"), "ignored\n", "utf8");
+  await writeFile(path.join(vaultRoot, ".obsidian", "app.json"), "{}\n", "utf8");
+  await waitForOutput("Deferred settings seed: seeding new setting", 10_000);
+  await mkdir(path.join(vaultRoot, ".obsidian", "plugins", "example"), { recursive: true });
+  await writeFile(
+    path.join(vaultRoot, ".obsidian", "plugins", "example", "main.js"),
+    "function smoke() { return 'plugin'; }\n".repeat(20_000),
+    "utf8",
+  );
+  await waitForOutput('"encoding":"gzip"', 10_000);
   await mkdir(path.join(vaultRoot, ".git"), { recursive: true });
   await writeFile(path.join(vaultRoot, ".git", "ignored.md"), "ignored\n", "utf8");
   await sleep(500);
-  assertNoOutput(".obsidian/workspace.json");
   assertNoOutput(".git/ignored.md");
 
   const emptyNotePath = path.join(vaultRoot, "empty.md");

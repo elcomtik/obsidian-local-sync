@@ -1,14 +1,11 @@
 import { spawn } from "node:child_process";
 import { mkdir, readdir, rm } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { build } from "esbuild";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const testsRoot = path.join(repoRoot, "tests");
-const outRoot = await mkdir(path.join(os.tmpdir(), "obsidian-local-sync-tests-"), {
-  recursive: true,
-}).then(() => path.join(os.tmpdir(), `obsidian-local-sync-tests-${Date.now()}`));
+const outRoot = path.join(repoRoot, ".tmp", `tests-${Date.now()}`);
 
 try {
   await mkdir(outRoot, { recursive: true });

@@ -12,8 +12,12 @@ Single-user, multi-device file sync for Obsidian using:
 - **Configurable performance settings**
 - **Mnemonic-based device bootstrap**
 - **Console logging** (off / error / warn / info)
+- **Optional Obsidian settings sync** for allowlisted `.obsidian` JSON files
 
-This is an experimental local-first architecture for syncing Markdown files incrementally without retransmitting full file contents.
+This is an experimental local-first architecture for syncing note files
+incrementally without retransmitting full file contents. Optional Obsidian
+settings sync uses plain full-file updates instead of Yjs because settings JSON
+is configuration, not collaborative prose.
 
 ---
 
@@ -133,6 +137,39 @@ We store incremental updates:
 fileUpdate { id, path, updateBase64 }
 ```
 
+When Obsidian settings sync is enabled, settings are stored separately as
+plain last-writer-wins updates:
+
+```
+settingUpdate { id, path, contentBase64, contentHash, encoding }
+```
+
+Settings sync is disabled by default. When enabled, the default policy tracks
+Obsidian JSON settings, themes, snippets, and community plugin JSON settings
+unless excluded by settings exclude rules. Installed community plugin files
+(`main.js`, `styles.css`, and `manifest.json`) can be enabled on demand with
+the Installed community plugin files setting.
+LocalSync's own plugin directory is excluded so device-local sync settings such
+as `deviceId` are not copied between peers.
+Startup and rescan repair settings from existing `settingUpdate` history before
+seeding local files, so a new peer should adopt already-synced settings instead
+of publishing its local defaults over them. For an initialized peer, repair
+preserves local settings edits made after the last snapshotted remote state and
+lets the following settings scan advertise them.
+Settings payloads use raw UTF-8 base64 by default and may use gzip compression
+when that makes the stored payload smaller (`encoding = "gzip"`). Older raw
+settings rows remain readable because missing/null `encoding` means raw text.
+Because Obsidian does not reliably emit vault events for hidden `.obsidian`
+files, settings sync has its own rescan interval. Enabling settings sync from
+the plugin UI sets settings rescan to 30 seconds when it was disabled; vault
+content rescan remains separate.
+
+The Obsidian plugin has no vault-content exclude presets by default. Obsidian's
+adapter does not expose normal dotfile internals such as `.git`, and `.obsidian`
+settings are handled by the dedicated settings-sync policy. The standalone
+daemon keeps filesystem-oriented default excludes because it watches raw disk
+paths.
+
 #### Custom Platform Layer (replacing `@evolu/web`)
 
 The standard `@evolu/web` package is designed for browser environments and is
@@ -168,12 +205,15 @@ CRDT message level, independent of the platform layer.
 We poll `evolu_history` for:
 - table == "fileUpdate"
 - column == "updateBase64"
+- table == "settingUpdate"
+- column == "contentBase64"
 ordered by timestamp
 
 A local cursor (`_historyCursor`) prevents reprocessing.
 
 ### 4) Local-Only Tables
 - `_fileSnapshot`: one snapshot per file (replaced, not accumulated)
+- `_settingSnapshot`: one content hash per synced settings file plus tombstones
 - `_historyCursor`: last processed timestamp
 
 ### 5) LRU Memory Control

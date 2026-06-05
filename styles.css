@@ -1,0 +1,43 @@
+.localsync-settings .localsync-wide-input {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 20rem;
+}
+
+.localsync-settings .localsync-wide-setting .setting-item-control {
+  flex: 0 0 auto;
+  max-width: 20rem;
+  min-width: 0;
+  width: min(100%, 20rem);
+}
+
+.localsync-settings .localsync-wide-setting textarea.localsync-wide-input {
+  min-width: 100%;
+}
+
+.localsync-settings .localsync-wide-setting:has(textarea.localsync-wide-input) .setting-item-control {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.localsync-settings .localsync-wide-setting:has(textarea.localsync-wide-input) .setting-item-control button {
+  align-self: flex-end;
+}
+
+.localsync-settings .localsync-mnemonic-setting {
+  flex-wrap: wrap;
+}
+
+.localsync-settings .localsync-mnemonic-box {
+  flex: 1 0 100%;
+  margin-top: 0.5rem;
+  width: 100%;
+}
+
+.localsync-settings .localsync-mnemonic-input {
+  box-sizing: border-box;
+  font-family: var(--font-monospace);
+  font-size: 0.85em;
+  width: 100%;
+}

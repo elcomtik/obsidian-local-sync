@@ -8,6 +8,7 @@ import {
   DEFAULT_LOCAL_SYNC_CONFIG,
   getTrackingDecision,
   isTrackedVaultFile,
+  isTrackedSettingPath,
   isTrackedVaultPath,
 } from "./pathPolicy";
 import { formatLogLine, type LogFormatter } from "./logFormat";
@@ -71,6 +72,84 @@ function fromBase64(b64: string): Uint8Array {
   return out;
 }
 
+function base64ToText(b64: string): string {
+  return new TextDecoder().decode(fromBase64(b64));
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+
+function hashText(text: string): string {
+  // FNV-1a 64-bit. This is a change detector, not a security boundary.
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const bytes = new TextEncoder().encode(text);
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * prime);
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+async function encodeSettingContent(text: string): Promise<{
+  contentBase64: string;
+  encoding: string | null;
+  rawBytes: number;
+  storedBytes: number;
+}> {
+  const rawBytes = new TextEncoder().encode(text);
+  const gzipBytes = await gzipBytesIfAvailable(rawBytes);
+
+  if (gzipBytes && gzipBytes.length < rawBytes.length) {
+    return {
+      contentBase64: toBase64(gzipBytes),
+      encoding: "gzip",
+      rawBytes: rawBytes.length,
+      storedBytes: gzipBytes.length,
+    };
+  }
+
+  return {
+    contentBase64: toBase64(rawBytes),
+    encoding: null,
+    rawBytes: rawBytes.length,
+    storedBytes: rawBytes.length,
+  };
+}
+
+async function decodeSettingContent(row: SettingUpdateRow): Promise<string> {
+  if (row.encoding === "gzip") {
+    return new TextDecoder().decode(await gunzipBytes(fromBase64(row.contentBase64)));
+  }
+  return base64ToText(row.contentBase64);
+}
+
+async function gzipBytesIfAvailable(bytes: Uint8Array): Promise<Uint8Array | null> {
+  type CompressionStreamConstructor = new (format: "gzip") => TransformStream<Uint8Array, Uint8Array>;
+  const CompressionStreamCtor = (globalThis as { CompressionStream?: CompressionStreamConstructor }).CompressionStream;
+  if (!CompressionStreamCtor) return null;
+
+  try {
+    const stream = new Blob([toArrayBuffer(bytes)]).stream().pipeThrough(new CompressionStreamCtor("gzip"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+async function gunzipBytes(bytes: Uint8Array): Promise<Uint8Array> {
+  type DecompressionStreamConstructor = new (format: "gzip") => TransformStream<Uint8Array, Uint8Array>;
+  const DecompressionStreamCtor = (globalThis as { DecompressionStream?: DecompressionStreamConstructor }).DecompressionStream;
+  if (!DecompressionStreamCtor) {
+    throw new Error("Cannot decode gzip setting payload: DecompressionStream is not available");
+  }
+  const stream = new Blob([toArrayBuffer(bytes)]).stream().pipeThrough(new DecompressionStreamCtor("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
 /**
  * Better diff using diff-match-patch.
  * Converts oldText -> newText into inserts/deletes and applies to Yjs.
@@ -117,6 +196,21 @@ type SyncInventory = {
   snapshotPathsMissingFileUpdate: string[];
 };
 
+type SettingSnapshot = {
+  contentHash: string;
+  deleted: boolean;
+};
+
+type SettingUpdateRow = {
+  path: string;
+  contentBase64: string;
+  contentHash: string;
+  encoding: string | null;
+  type: string | null;
+};
+
+type SettingUpdateWithId = SettingUpdateRow & { id: string };
+
 /**
  * Core sync engine for obsidian-local-sync.
  *
@@ -152,7 +246,8 @@ export class YjsEvoluHistoryEngine {
   private states = new Map<string, FileState>();
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
-  private rescanTimer: ReturnType<typeof setInterval> | null = null;
+  private vaultRescanTimer: ReturnType<typeof setInterval> | null = null;
+  private settingsRescanTimer: ReturnType<typeof setInterval> | null = null;
   private isPolling = false;
   private isScanningVault = false;
   /** Resolves when the current poll cycle completes. Awaited by stop(). */
@@ -185,6 +280,7 @@ export class YjsEvoluHistoryEngine {
    * after one full quiet poll cycle (relay has quiesced for them).
    */
   private pendingVaultSeed = new Set<string>();
+  private pendingSettingSeed = new Set<string>();
 
   /**
    * Paths for which a remote delete is currently being applied (i.e. we are
@@ -194,6 +290,8 @@ export class YjsEvoluHistoryEngine {
    * Mirrors the `ignoreNextVaultModify` pattern used for content updates.
    */
   private pendingRemoteDeletes = new Set<string>();
+  private pendingRemoteSettingWrites = new Set<string>();
+  private pendingRemoteSettingDeletes = new Set<string>();
 
   /**
    * Set to `true` when {@link scanVaultForUnsyncedFiles} has finished
@@ -288,6 +386,8 @@ export class YjsEvoluHistoryEngine {
       if (this.localSyncConfig.startupScan) {
         void this.auditSnapshotsForOfflineDeletes("Startup scan");
         void this.scanVaultForUnsyncedFiles("Startup scan");
+        void this.auditSettingSnapshotsForOfflineDeletes("Startup settings scan");
+        void this.scanSettingsForUnsyncedFiles("Startup settings scan");
       } else {
         this.scanComplete = true;
       }
@@ -378,6 +478,78 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
+  private async scanSettingsForUnsyncedFiles(label: string) {
+    if (!this.localSyncConfig.syncObsidianSettings) return;
+
+    try {
+      await this.repairSettingsFromRemoteState(`${label}: remote settings repair`);
+
+      const paths = await this.listTrackedSettingPaths();
+      this.logInfo(`${label}: begin`, { trackedSettings: paths.length });
+
+      let advertised = 0;
+      let deferred = 0;
+      let unchanged = 0;
+
+      for (const path of paths) {
+        if (!this.isActive) break;
+        const result = await this.reconcileSettingFile(path, label);
+        if (result === "deferred") deferred++;
+        else if (result === "advertised") advertised++;
+        else if (result === "unchanged") unchanged++;
+      }
+
+      this.logInfo(`${label}: done`, {
+        trackedSettings: paths.length,
+        advertised,
+        deferred,
+        unchanged,
+      });
+    } catch (e) {
+      this.logError(`${label}: scanSettingsForUnsyncedFiles failed`, e);
+    }
+  }
+
+  private async listTrackedSettingPaths(): Promise<string[]> {
+    if (!this.localSyncConfig.syncObsidianSettings) return [];
+
+    const discovered = new Set<string>();
+    await this.collectSettingPaths(".obsidian", discovered);
+    return Array.from(discovered)
+      .filter((path) => isTrackedSettingPath(path, this.localSyncConfig))
+      .sort();
+  }
+
+  private async collectSettingPaths(folder: string, discovered: Set<string>): Promise<void> {
+    const listing = await this.vault.listFolder(folder);
+    if (!listing) return;
+
+    for (const filePath of listing.files) discovered.add(filePath);
+    for (const folderPath of listing.folders) {
+      await this.collectSettingPaths(folderPath, discovered);
+    }
+  }
+
+  private async reconcileSettingFile(path: string, label: string): Promise<"advertised" | "deferred" | "unchanged" | "skipped"> {
+    if (!isTrackedSettingPath(path, this.localSyncConfig)) return "skipped";
+
+    const content = await this.vault.readText(path);
+    if (content === null) return "skipped";
+
+    const snapshot = await this.loadSettingSnapshot(path);
+    if (snapshot === null || snapshot.deleted) {
+      this.pendingSettingSeed.add(path);
+      this.logInfo(`${label}: deferring new setting seed`, { path });
+      return "deferred";
+    }
+
+    const contentHash = hashText(content);
+    if (snapshot.contentHash === contentHash) return "unchanged";
+
+    await this.advertiseSettingContent(path, content, contentHash, `${label}: setting changed`);
+    return "advertised";
+  }
+
   /**
    * Reconciles one vault file during startup without treating it as a fresh
    * modify event.
@@ -428,6 +600,37 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
+  private async drainPendingSettingSeed() {
+    if (!this.localSyncConfig.syncObsidianSettings || this.pendingSettingSeed.size === 0) return;
+
+    const remoteSettings = await this.loadLatestSettingUpdatesFromHistory();
+    this.logInfo("Deferred settings seed: seeding files", { count: this.pendingSettingSeed.size });
+    for (const path of this.pendingSettingSeed) {
+      if (!this.isActive) break;
+      if (!isTrackedSettingPath(path, this.localSyncConfig)) {
+        this.pendingSettingSeed.delete(path);
+        continue;
+      }
+
+      const remote = remoteSettings.get(path);
+      if (remote) {
+        await this.applyRemoteSettingUpdate(remote);
+        this.pendingSettingSeed.delete(path);
+        this.logInfo("Deferred settings seed: remote state exists, skipped local seed", { path });
+        continue;
+      }
+
+      const content = await this.vault.readText(path);
+      if (content === null) {
+        this.pendingSettingSeed.delete(path);
+        continue;
+      }
+
+      await this.advertiseSettingContent(path, content, hashText(content), "Deferred settings seed: seeding new setting");
+      this.pendingSettingSeed.delete(path);
+    }
+  }
+
   /**
    * Encodes the current in-memory Yjs doc state as a full update and upserts a
    * `fileUpdate` row with a deterministic per-file-per-device ID.
@@ -454,6 +657,52 @@ export class YjsEvoluHistoryEngine {
       this.logError("retransmitCurrentState failed", { path, error: e });
       return false;
     }
+  }
+
+  private async advertiseSettingContent(
+    path: string,
+    content: string,
+    contentHash = hashText(content),
+    message = "Sent outgoing setting update",
+  ): Promise<void> {
+    const id = createIdFromString<"SettingUpdate">(
+      `setting:${path}:${this.deviceId}:${Date.now()}:${Math.random()}`,
+    );
+    const encoded = await encodeSettingContent(content);
+    this.evolu.upsert("settingUpdate", {
+      id,
+      path,
+      contentBase64: encoded.contentBase64,
+      contentHash,
+      encoding: encoded.encoding,
+    });
+    this.outgoingIds.add(id);
+    this.saveSettingSnapshot(path, contentHash);
+    this.logInfo(message, {
+      path,
+      chars: content.length,
+      contentHash,
+      encoding: encoded.encoding ?? "raw",
+      rawBytes: encoded.rawBytes,
+      storedBytes: encoded.storedBytes,
+    });
+  }
+
+  private async advertiseSettingDelete(path: string, message = "Setting deleted, propagating"): Promise<void> {
+    const id = createIdFromString<"SettingUpdate">(
+      `setting-del:${path}:${this.deviceId}:${Date.now()}:${Math.random()}`,
+    );
+    this.evolu.upsert("settingUpdate", {
+      id,
+      path,
+      contentBase64: "",
+      contentHash: "DELETED",
+      encoding: null,
+      type: "delete",
+    });
+    this.outgoingIds.add(id);
+    this.tombstoneSettingSnapshot(path);
+    this.logInfo(message, { path });
   }
 
   /**
@@ -575,6 +824,17 @@ export class YjsEvoluHistoryEngine {
    * @param path The modified vault file path.
    */
   async onVaultFileChanged(path: string) {
+    if (isTrackedSettingPath(path, this.localSyncConfig)) {
+      if (this.pendingRemoteSettingWrites.has(path)) {
+        this.pendingRemoteSettingWrites.delete(path);
+        return;
+      }
+      const content = await this.vault.readText(path);
+      if (content === null) return;
+      await this.advertiseSettingContent(path, content, hashText(content), "Setting file changed, propagating");
+      return;
+    }
+
     if (!isTrackedVaultPath(path, this.localSyncConfig)) return;
 
     try {
@@ -620,27 +880,51 @@ export class YjsEvoluHistoryEngine {
 
   private startRescanTimer() {
     this.stopRescanTimer();
-    const intervalSeconds = this.localSyncConfig.periodicRescanSeconds;
-    if (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0) return;
 
-    this.rescanTimer = setInterval(() => {
-      if (this.isActive) void this.runPeriodicLocalRescan();
-    }, intervalSeconds * 1000);
-    this.logInfo("Periodic rescan enabled", { intervalSeconds });
+    const vaultIntervalSeconds = this.localSyncConfig.periodicRescanSeconds;
+    if (Number.isFinite(vaultIntervalSeconds) && vaultIntervalSeconds > 0) {
+      this.vaultRescanTimer = setInterval(() => {
+        if (this.isActive) void this.runPeriodicVaultRescan();
+      }, vaultIntervalSeconds * 1000);
+      this.logInfo("Periodic vault rescan enabled", { intervalSeconds: vaultIntervalSeconds });
+    }
+
+    const settingsIntervalSeconds = this.localSyncConfig.settingsRescanSeconds;
+    if (
+      this.localSyncConfig.syncObsidianSettings &&
+      Number.isFinite(settingsIntervalSeconds) &&
+      settingsIntervalSeconds > 0
+    ) {
+      this.settingsRescanTimer = setInterval(() => {
+        if (this.isActive) void this.runPeriodicSettingsRescan();
+      }, settingsIntervalSeconds * 1000);
+      this.logInfo("Periodic settings rescan enabled", { intervalSeconds: settingsIntervalSeconds });
+    }
   }
 
   private stopRescanTimer() {
-    if (this.rescanTimer != null) clearInterval(this.rescanTimer);
-    this.rescanTimer = null;
+    if (this.vaultRescanTimer != null) clearInterval(this.vaultRescanTimer);
+    if (this.settingsRescanTimer != null) clearInterval(this.settingsRescanTimer);
+    this.vaultRescanTimer = null;
+    this.settingsRescanTimer = null;
   }
 
-  private async runPeriodicLocalRescan() {
+  private async runPeriodicVaultRescan() {
     if (!this.isActive) return;
-    this.logInfo("Periodic rescan: tick");
+    this.logInfo("Periodic vault rescan: tick");
     if (this.localSyncConfig.syncDeletes) {
-      await this.auditSnapshotsForOfflineDeletes("Periodic rescan");
+      await this.auditSnapshotsForOfflineDeletes("Periodic vault rescan");
     }
-    await this.scanVaultForUnsyncedFiles("Periodic rescan");
+    await this.scanVaultForUnsyncedFiles("Periodic vault rescan");
+  }
+
+  private async runPeriodicSettingsRescan() {
+    if (!this.isActive || !this.localSyncConfig.syncObsidianSettings) return;
+    this.logInfo("Periodic settings rescan: tick");
+    if (this.localSyncConfig.syncDeletes) {
+      await this.auditSettingSnapshotsForOfflineDeletes("Periodic settings rescan");
+    }
+    await this.scanSettingsForUnsyncedFiles("Periodic settings rescan");
   }
 
   private pollHistoryOnce() {
@@ -653,14 +937,14 @@ export class YjsEvoluHistoryEngine {
         // Step 1: Fetch history row IDs in timestamp order.
         // Must use the original "==" operator for evolu_history columns
         // (Evolu's internal convention) and keep the two-step id lookup:
-        // evolu_history.id is stored as BLOB, while fileUpdate.id is TEXT,
+        // evolu_history.id is stored as BLOB, while synced table IDs are TEXT,
         // so a direct JOIN would never match — we convert bytes→string first.
         const histQ = this.evolu.createQuery((db) => {
           let qb = db
             .selectFrom("evolu_history")
-            .select(["id", "timestamp"])
-            .where("table", "==", "fileUpdate")
-            .where("column", "==", "updateBase64");
+            .select(["id", "timestamp", "table"])
+            .where("table", "in", ["fileUpdate", "settingUpdate"] as any)
+            .where("column", "in", ["updateBase64", "contentBase64"] as any);
 
           if (cursor != null) qb = qb.where("timestamp", ">", cursor);
 
@@ -675,7 +959,11 @@ export class YjsEvoluHistoryEngine {
             if (!this.pendingVaultSeedReady) {
               this.pendingVaultSeedReady = true;
             } else {
+              if (this.pendingSettingSeed.size > 0) {
+                await this.repairSettingsFromRemoteState("History quiet settings repair");
+              }
               await this.drainPendingVaultSeed();
+              await this.drainPendingSettingSeed();
             }
             if (!this.hasLoggedQuietSyncInventory) {
               this.hasLoggedQuietSyncInventory = true;
@@ -688,25 +976,26 @@ export class YjsEvoluHistoryEngine {
 
         this.logInfo("History poll fetched rows", { count: histRows.length });
 
-        // Step 2: Convert blob IDs to string IDs and batch-fetch all fileUpdate
-        // rows in a single query (one round-trip instead of N).
+        // Step 2: Convert blob IDs to string IDs and batch-fetch synced rows.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const stringIds = histRows.map((h) => idBytesToId(h.id as unknown as IdBytes)) as any;
+        const fileUpdateIds = histRows
+          .filter((h) => h.table === "fileUpdate")
+          .map((h) => idBytesToId(h.id as unknown as IdBytes));
+        const settingUpdateIds = histRows
+          .filter((h) => h.table === "settingUpdate")
+          .map((h) => idBytesToId(h.id as unknown as IdBytes));
 
-        const fileUpdateQ = this.evolu.createQuery((db) =>
-          (db as any)
-            .selectFrom("fileUpdate")
-            .select(["id", "path", "updateBase64", "type"])
-            .where("id", "in", stringIds)
-            .where("isDeleted", "is", null),
-        );
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const fileUpdateRows = (await this.evolu.loadQuery(fileUpdateQ)) as ReadonlyArray<any>;
+        const fileUpdateRows = fileUpdateIds.length === 0
+          ? []
+          : await this.loadFileUpdateContentRows(fileUpdateIds);
         const rowMap = new Map<string, { path: string; updateBase64: string; type: string | null }>(
           fileUpdateRows
             .filter((r) => r.id && r.path && r.updateBase64)
             .map((r) => [r.id as string, { path: r.path as string, updateBase64: r.updateBase64 as string, type: (r.type as string | null) ?? null }]),
+        );
+        const settingRows = await this.loadSettingUpdateRows(settingUpdateIds);
+        const settingRowMap = new Map<string, SettingUpdateRow>(
+          settingRows.map((row) => [row.id, row]),
         );
 
         // Step 3: Look-ahead — for each path, record the index of its LAST
@@ -727,7 +1016,19 @@ export class YjsEvoluHistoryEngine {
 
           // Skip rows we produced ourselves in this session.
           if (this.outgoingIds.has(id)) {
-            this.logInfo("Skipped own fileUpdate row", { id });
+            this.logInfo("Skipped own history row", { id, table: h.table });
+            continue;
+          }
+
+          if (h.table === "settingUpdate") {
+            const setting = settingRowMap.get(id);
+            if (!setting) continue;
+
+            await this.applyRemoteSettingUpdate(setting);
+            touchedPaths.add(setting.path);
+            if (this.pendingSettingSeed.delete(setting.path)) {
+              this.logInfo("Deferred settings seed: remote history covered setting", { path: setting.path });
+            }
             continue;
           }
 
@@ -1046,6 +1347,204 @@ export class YjsEvoluHistoryEngine {
     });
   }
 
+  private async repairSettingsFromRemoteState(label: string) {
+    if (!this.localSyncConfig.syncObsidianSettings) return;
+
+    try {
+      const remoteSettings = await this.loadLatestSettingUpdatesFromHistory();
+      if (remoteSettings.size === 0) {
+        this.logInfo(label, { remoteSettings: 0, applied: 0, unchanged: 0, skipped: 0 });
+        return;
+      }
+
+      let applied = 0;
+      let unchanged = 0;
+      let skipped = 0;
+
+      for (const [path, remote] of remoteSettings) {
+        if (!isTrackedSettingPath(path, this.localSyncConfig)) {
+          skipped++;
+          continue;
+        }
+
+        const snapshot = await this.loadSettingSnapshot(path);
+        if (remote.type === "delete") {
+          const exists = await this.vault.fileExists(path);
+          if (snapshot?.deleted && !exists) {
+            this.pendingSettingSeed.delete(path);
+            unchanged++;
+            continue;
+          }
+
+          await this.applyRemoteSettingUpdate(remote);
+          applied++;
+          continue;
+        }
+
+        const current = await this.vault.readText(path);
+        const currentHash = current === null ? null : hashText(current);
+        const currentMatches = currentHash === remote.contentHash;
+        if (snapshot?.contentHash === remote.contentHash && currentHash !== null && currentHash !== remote.contentHash) {
+          // We have already seen this remote setting state, but the local file
+          // has changed since our last local snapshot. Do not repair it back to
+          // the old remote value; the following settings scan will advertise
+          // the local change instead.
+          this.logInfo(`${label}: keeping local setting change`, {
+            path,
+            snapshotHash: snapshot.contentHash,
+            remoteHash: remote.contentHash,
+            currentHash,
+          });
+          unchanged++;
+          continue;
+        }
+
+        if (snapshot?.contentHash === remote.contentHash && currentMatches) {
+          this.pendingSettingSeed.delete(path);
+          unchanged++;
+          continue;
+        }
+
+        await this.applyRemoteSettingUpdate(remote);
+        applied++;
+      }
+
+      this.logInfo(label, {
+        remoteSettings: remoteSettings.size,
+        applied,
+        unchanged,
+        skipped,
+      });
+    } catch (e) {
+      this.logError(`${label}: repairSettingsFromRemoteState failed`, e);
+    }
+  }
+
+  private async loadLatestSettingUpdatesFromHistory(): Promise<Map<string, SettingUpdateWithId>> {
+    const historyQ = this.evolu.createQuery((db) =>
+      db
+        .selectFrom("evolu_history")
+        .select(["id", "timestamp"])
+        .where("table", "==", "settingUpdate")
+        .where("column", "==", "contentBase64")
+        .orderBy("timestamp", "asc")
+        .limit(100000),
+    );
+    const historyRows = await this.evolu.loadQuery(historyQ);
+    if (historyRows.length === 0) return new Map();
+
+    const ids = historyRows.map((row) => idBytesToId(row.id as unknown as IdBytes));
+    const settingRows = await this.loadSettingUpdateRows(ids);
+    const rowsById = new Map(settingRows.map((row) => [row.id, row]));
+    const latestByPath = new Map<string, SettingUpdateWithId>();
+
+    for (const historyRow of historyRows) {
+      const id = idBytesToId(historyRow.id as unknown as IdBytes);
+      const setting = rowsById.get(id);
+      if (!setting) continue;
+      latestByPath.set(setting.path, setting);
+    }
+
+    return latestByPath;
+  }
+
+  private async loadFileUpdateContentRows(ids: string[]) {
+    if (ids.length === 0) return [];
+
+    const fileUpdateQ = this.evolu.createQuery((db) =>
+      (db as any)
+        .selectFrom("fileUpdate")
+        .select(["id", "path", "updateBase64", "type"])
+        .where("id", "in", ids as any)
+        .where("isDeleted", "is", null),
+    );
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (await this.evolu.loadQuery(fileUpdateQ)) as ReadonlyArray<any>;
+  }
+
+  private async loadSettingUpdateRows(ids: string[]): Promise<Array<SettingUpdateRow & { id: string }>> {
+    const rows: Array<SettingUpdateRow & { id: string }> = [];
+    const batchSize = 500;
+    for (let i = 0; i < ids.length; i += batchSize) {
+      const batch = ids.slice(i, i + batchSize);
+      if (batch.length === 0) continue;
+
+      const settingUpdateQ = this.evolu.createQuery((db) =>
+        (db as any)
+          .selectFrom("settingUpdate")
+          .select(["id", "path", "contentBase64", "contentHash", "encoding", "type"])
+          .where("id", "in", batch as any)
+          .where("isDeleted", "is", null),
+      );
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const batchRows = (await this.evolu.loadQuery(settingUpdateQ)) as ReadonlyArray<any>;
+      rows.push(
+        ...batchRows
+          .filter((row) => row.id && row.path && row.contentHash)
+          .map((row) => ({
+            id: row.id as string,
+            path: row.path as string,
+            contentBase64: (row.contentBase64 as string | null) ?? "",
+            contentHash: row.contentHash as string,
+            encoding: (row.encoding as string | null) ?? null,
+            type: (row.type as string | null) ?? null,
+          })),
+      );
+    }
+
+    return rows;
+  }
+
+  private async applyRemoteSettingUpdate(row: SettingUpdateRow) {
+    const path = row.path;
+    try {
+      if (!isTrackedSettingPath(path, this.localSyncConfig)) {
+        this.logInfo("Skipped remote setting update, path not tracked", { path });
+        return;
+      }
+
+      if (row.type === "delete") {
+        this.pendingSettingSeed.delete(path);
+        this.tombstoneSettingSnapshot(path);
+        if (await this.vault.fileExists(path)) {
+          this.pendingRemoteSettingDeletes.add(path);
+          try {
+            await this.vault.deleteFile(path);
+          } finally {
+            this.pendingRemoteSettingDeletes.delete(path);
+          }
+        }
+        this.logInfo("Applied remote setting delete", { path });
+        return;
+      }
+
+      const content = await decodeSettingContent(row);
+      const current = await this.vault.readText(path);
+      if (current !== content) {
+        this.pendingRemoteSettingWrites.add(path);
+        try {
+          await this.vault.writeText(path, content);
+        } finally {
+          this.pendingRemoteSettingWrites.delete(path);
+        }
+      }
+      this.saveSettingSnapshot(path, row.contentHash);
+      this.logInfo("Applied remote setting update", {
+        path,
+        chars: content.length,
+        contentHash: row.contentHash,
+        encoding: row.encoding ?? "raw",
+        changed: current !== content,
+      });
+    } catch (error) {
+      this.pendingRemoteSettingWrites.delete(path);
+      this.pendingRemoteSettingDeletes.delete(path);
+      this.logError("applyRemoteSettingUpdate failed", { path, type: row.type, error });
+    }
+  }
+
   private async loadFileUpdateRows(ids: string[]) {
     const rows: Array<{ id: string; path: string; type: string | null }> = [];
     const batchSize = 500;
@@ -1077,6 +1576,36 @@ export class YjsEvoluHistoryEngine {
   private async saveHistoryCursor(ts: TimestampBytes) {
     const cursorId = createIdFromString<"HistoryCursor">("history-cursor");
     this.evolu.upsert("_historyCursor", { id: cursorId, lastTimestamp: ts });
+  }
+
+  // ---------- setting snapshots ----------
+
+  private async loadSettingSnapshot(path: string): Promise<SettingSnapshot | null> {
+    const id = createIdFromString<"SettingSnapshot">(`setting-snapshot:${path}`);
+
+    const q = this.evolu.createQuery((db) =>
+      db
+        .selectFrom("_settingSnapshot")
+        .select(["contentHash"])
+        .where("id", "=", id)
+        .where("isDeleted", "is", null)
+        .limit(1),
+    );
+
+    const rows = await this.evolu.loadQuery(q);
+    if (rows.length === 0) return null;
+    const contentHash = rows[0].contentHash;
+    if (!contentHash) return null;
+    return { contentHash, deleted: contentHash === "DELETED" };
+  }
+
+  private saveSettingSnapshot(path: string, contentHash: string) {
+    const id = createIdFromString<"SettingSnapshot">(`setting-snapshot:${path}`);
+    this.evolu.upsert("_settingSnapshot", { id, path, contentHash });
+  }
+
+  private tombstoneSettingSnapshot(path: string) {
+    this.saveSettingSnapshot(path, "DELETED");
   }
 
   // ---------- snapshots ----------
@@ -1287,6 +1816,13 @@ export class YjsEvoluHistoryEngine {
    * row so other devices trash the file.
    */
   async onVaultFileDeleted(path: string) {
+    if (isTrackedSettingPath(path, this.localSyncConfig)) {
+      if (this.pendingRemoteSettingDeletes.has(path)) return;
+      if (!this.localSyncConfig.syncDeletes) return;
+      await this.advertiseSettingDelete(path);
+      return;
+    }
+
     if (!isTrackedVaultPath(path, this.localSyncConfig)) return;
     if (this.pendingRemoteDeletes.has(path)) return; // remote-initiated trash — suppress echo
     if (!this.localSyncConfig.syncDeletes) return;
@@ -1319,6 +1855,27 @@ export class YjsEvoluHistoryEngine {
    * made immediately after the rename are diff'd against the correct baseline.
    */
   async onVaultFileRenamed(oldPath: string, newPath: string) {
+    if (
+      isTrackedSettingPath(oldPath, this.localSyncConfig) ||
+      isTrackedSettingPath(newPath, this.localSyncConfig)
+    ) {
+      if (!this.localSyncConfig.syncDeletes) return;
+      try {
+        if (isTrackedSettingPath(oldPath, this.localSyncConfig)) {
+          await this.advertiseSettingDelete(oldPath, "Setting file renamed, deleting old path");
+        }
+        if (isTrackedSettingPath(newPath, this.localSyncConfig)) {
+          const content = await this.vault.readText(newPath);
+          if (content !== null) {
+            await this.advertiseSettingContent(newPath, content, hashText(content), "Setting file renamed, advertising new path");
+          }
+        }
+      } catch (e) {
+        this.logError("onVaultFileRenamed setting handling failed", { oldPath, newPath, error: e });
+      }
+      return;
+    }
+
     if (
       !isTrackedVaultPath(oldPath, this.localSyncConfig) &&
       !isTrackedVaultPath(newPath, this.localSyncConfig)
@@ -1424,6 +1981,41 @@ export class YjsEvoluHistoryEngine {
       }
     } catch (e) {
       this.logError(`${label}: auditSnapshotsForOfflineDeletes failed`, e);
+    }
+  }
+
+  private async auditSettingSnapshotsForOfflineDeletes(label = "Startup settings scan") {
+    if (!this.localSyncConfig.syncObsidianSettings || !this.localSyncConfig.syncDeletes) return;
+
+    try {
+      const q = this.evolu.createQuery((db) =>
+        db
+          .selectFrom("_settingSnapshot")
+          .select(["path", "contentHash"])
+          .where("isDeleted", "is", null),
+      );
+      const rows = await this.evolu.loadQuery(q);
+      if (rows.length === 0) return;
+
+      const settingPaths = new Set(await this.listTrackedSettingPaths());
+
+      let audited = 0;
+      for (const row of rows) {
+        const path = row.path;
+        if (!path || !isTrackedSettingPath(path, this.localSyncConfig)) continue;
+        if (row.contentHash === "DELETED") continue;
+        if (settingPaths.has(path)) continue;
+
+        this.pendingSettingSeed.delete(path);
+        await this.advertiseSettingDelete(path, `${label}: offline setting delete detected`);
+        audited++;
+      }
+
+      if (audited > 0) {
+        this.logInfo(`${label}: offline setting delete audit done`, { offlineDeletes: audited });
+      }
+    } catch (e) {
+      this.logError(`${label}: auditSettingSnapshotsForOfflineDeletes failed`, e);
     }
   }
 }

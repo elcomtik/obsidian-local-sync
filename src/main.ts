@@ -52,9 +52,21 @@ type PluginSettings = {
 
   includeExtensions: string[];
   excludeGlobs: string[];
+  syncObsidianSettings: boolean;
+  settingsIncludeGlobs: string[];
+  settingsExcludeGlobs: string[];
+  syncMainSettings: boolean;
+  syncAppearanceSettings: boolean;
+  syncHotkeys: boolean;
+  syncCorePluginList: boolean;
+  syncCorePluginSettings: boolean;
+  syncCommunityPluginList: boolean;
+  syncCommunityPluginSettings: boolean;
+  syncInstalledCommunityPluginFiles: boolean;
   startupScan: boolean;
   syncDeletes: boolean;
   periodicRescanSeconds: number;
+  settingsRescanSeconds: number;
 
   logLevel: LogLevel;
 };
@@ -71,12 +83,39 @@ const DEFAULT_SETTINGS: PluginSettings = {
 
   includeExtensions: DEFAULT_LOCAL_SYNC_CONFIG.includeExtensions,
   excludeGlobs: DEFAULT_LOCAL_SYNC_CONFIG.excludeGlobs,
+  syncObsidianSettings: DEFAULT_LOCAL_SYNC_CONFIG.syncObsidianSettings,
+  settingsIncludeGlobs: [],
+  settingsExcludeGlobs: [],
+  syncMainSettings: true,
+  syncAppearanceSettings: true,
+  syncHotkeys: true,
+  syncCorePluginList: true,
+  syncCorePluginSettings: true,
+  syncCommunityPluginList: true,
+  syncCommunityPluginSettings: true,
+  syncInstalledCommunityPluginFiles: false,
   startupScan: DEFAULT_LOCAL_SYNC_CONFIG.startupScan,
   syncDeletes: DEFAULT_LOCAL_SYNC_CONFIG.syncDeletes,
   periodicRescanSeconds: DEFAULT_LOCAL_SYNC_CONFIG.periodicRescanSeconds,
+  settingsRescanSeconds: DEFAULT_LOCAL_SYNC_CONFIG.settingsRescanSeconds,
 
   logLevel: "info",
 };
+
+const OBSOLETE_VAULT_EXCLUDE_GLOBS = new Set([
+  ".git/**",
+  ".trash/**",
+  ".obsidian/workspace*.json",
+  ".obsidian/cache/**",
+  ".obsidian/plugins/obsidian-local-sync/*.db",
+  ".obsidian/plugins/obsidian-local-sync/*.db-shm",
+  ".obsidian/plugins/obsidian-local-sync/*.db-wal",
+  ".DS_Store",
+  "*.tmp",
+  "*.swp",
+]);
+
+const SETTINGS_SYNC_RESCAN_SECONDS = 30;
 
 function toEngineConfig(s: PluginSettings): EngineConfig {
   return {
@@ -91,10 +130,101 @@ function toLocalSyncConfig(s: PluginSettings): LocalSyncConfig {
   return {
     includeExtensions: normalizeExtensions(s.includeExtensions),
     excludeGlobs: normalizeRules(s.excludeGlobs),
+    syncObsidianSettings: s.syncObsidianSettings,
+    settingsIncludeGlobs: normalizeRules([
+      ...getSettingsCategoryIncludeRules(s),
+      ...s.settingsIncludeGlobs,
+    ]),
+    settingsExcludeGlobs: normalizeRules([
+      ...getSettingsCategoryExcludeRules(s),
+      ...s.settingsExcludeGlobs,
+      ".obsidian/plugins/obsidian-local-sync/**",
+    ]),
     startupScan: s.startupScan,
     syncDeletes: s.syncDeletes,
     periodicRescanSeconds: s.periodicRescanSeconds,
+    settingsRescanSeconds: s.settingsRescanSeconds,
   };
+}
+
+function getSettingsCategoryIncludeRules(s: PluginSettings): string[] {
+  const rules: string[] = [];
+
+  if (s.syncMainSettings) {
+    rules.push(
+      ".obsidian/app.json",
+      ".obsidian/backlink.json",
+      ".obsidian/bookmarks.json",
+      ".obsidian/daily-notes.json",
+      ".obsidian/graph.json",
+      ".obsidian/types.json",
+    );
+  }
+  if (s.syncAppearanceSettings) {
+    rules.push(
+      ".obsidian/appearance.json",
+      ".obsidian/themes/**",
+      ".obsidian/snippets/**",
+    );
+  }
+  if (s.syncHotkeys) rules.push(".obsidian/hotkeys.json");
+  if (s.syncCorePluginList) rules.push(".obsidian/core-plugins.json");
+  if (s.syncCorePluginSettings) rules.push(".obsidian/*.json");
+  if (s.syncCommunityPluginList) rules.push(".obsidian/community-plugins.json");
+  if (s.syncCommunityPluginSettings) {
+    rules.push(".obsidian/plugins/*/*.json");
+  }
+  if (s.syncInstalledCommunityPluginFiles) {
+    rules.push(
+      ".obsidian/plugins/*/main.js",
+      ".obsidian/plugins/*/styles.css",
+      ".obsidian/plugins/*/manifest.json",
+    );
+  }
+
+  return rules;
+}
+
+function getSettingsCategoryExcludeRules(s: PluginSettings): string[] {
+  const rules: string[] = [
+    ".obsidian/workspace*.json",
+  ];
+
+  if (!s.syncMainSettings) {
+    rules.push(
+      ".obsidian/app.json",
+      ".obsidian/backlink.json",
+      ".obsidian/bookmarks.json",
+      ".obsidian/daily-notes.json",
+      ".obsidian/graph.json",
+      ".obsidian/types.json",
+    );
+  }
+  if (!s.syncAppearanceSettings) {
+    rules.push(
+      ".obsidian/appearance.json",
+      ".obsidian/themes/**",
+      ".obsidian/snippets/**",
+    );
+  }
+  if (!s.syncHotkeys) rules.push(".obsidian/hotkeys.json");
+  if (!s.syncCorePluginList) rules.push(".obsidian/core-plugins.json");
+  if (!s.syncCommunityPluginList) rules.push(".obsidian/community-plugins.json");
+  if (!s.syncCommunityPluginSettings) {
+    rules.push(".obsidian/plugins/*/*.json");
+    if (s.syncInstalledCommunityPluginFiles) {
+      rules.push("!.obsidian/plugins/*/manifest.json");
+    }
+  }
+  if (!s.syncInstalledCommunityPluginFiles) {
+    rules.push(
+      ".obsidian/plugins/*/main.js",
+      ".obsidian/plugins/*/styles.css",
+      ".obsidian/plugins/*/manifest.json",
+    );
+  }
+
+  return rules;
 }
 
 function normalizeExtensions(values: string[]): string[] {
@@ -108,6 +238,11 @@ function normalizeExtensions(values: string[]): string[] {
 
 function normalizeRules(values: string[]): string[] {
   return values.map((value) => value.trim()).filter(Boolean);
+}
+
+function normalizeNonNegativeInt(value: number): number {
+  if (!Number.isInteger(value) || value < 0) return 0;
+  return value;
 }
 
 function logInfo(message: string, data?: unknown) {
@@ -339,12 +474,46 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   }
 
   async loadSettings() {
-    const saved = await this.loadData();
+    const saved = (await this.loadData()) as Partial<PluginSettings> | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+    let migrated = false;
+
+    if (
+      saved &&
+      !("syncMainSettings" in saved) &&
+      JSON.stringify(normalizeRules(saved.settingsIncludeGlobs ?? [])) ===
+        JSON.stringify([".obsidian/**/*.json"])
+    ) {
+      this.settings.settingsIncludeGlobs = [];
+      migrated = true;
+    }
+    if (saved?.syncObsidianSettings && saved.settingsRescanSeconds === undefined) {
+      this.settings.settingsRescanSeconds = SETTINGS_SYNC_RESCAN_SECONDS;
+      migrated = true;
+    }
+    if (
+      saved &&
+      "syncInstalledCommunityPlugins" in saved &&
+      !("syncInstalledCommunityPluginFiles" in saved)
+    ) {
+      const oldValue = Boolean((saved as { syncInstalledCommunityPlugins?: boolean }).syncInstalledCommunityPlugins);
+      this.settings.syncInstalledCommunityPluginFiles = oldValue;
+      if (oldValue) this.settings.syncCommunityPluginSettings = true;
+      delete (this.settings as { syncInstalledCommunityPlugins?: boolean }).syncInstalledCommunityPlugins;
+      migrated = true;
+    }
     this.settings.includeExtensions = normalizeExtensions(this.settings.includeExtensions);
-    this.settings.excludeGlobs = normalizeRules(this.settings.excludeGlobs);
+    this.settings.excludeGlobs = normalizeRules(this.settings.excludeGlobs).filter((rule) => {
+      const keep = !OBSOLETE_VAULT_EXCLUDE_GLOBS.has(rule);
+      if (!keep) migrated = true;
+      return keep;
+    });
+    this.settings.settingsIncludeGlobs = normalizeRules(this.settings.settingsIncludeGlobs);
+    this.settings.settingsExcludeGlobs = normalizeRules(this.settings.settingsExcludeGlobs);
+    this.settings.periodicRescanSeconds = normalizeNonNegativeInt(this.settings.periodicRescanSeconds);
+    this.settings.settingsRescanSeconds = normalizeNonNegativeInt(this.settings.settingsRescanSeconds);
     // Persist the generated deviceId on first install so it survives restarts.
-    if (!saved?.deviceId) {
+    if (!saved?.deviceId || migrated) {
       await this.saveSettings();
     }
   }
@@ -361,6 +530,10 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   async applyLocalSyncConfigFromSettings() {
     this.settings.includeExtensions = normalizeExtensions(this.settings.includeExtensions);
     this.settings.excludeGlobs = normalizeRules(this.settings.excludeGlobs);
+    this.settings.settingsIncludeGlobs = normalizeRules(this.settings.settingsIncludeGlobs);
+    this.settings.settingsExcludeGlobs = normalizeRules(this.settings.settingsExcludeGlobs);
+    this.settings.periodicRescanSeconds = normalizeNonNegativeInt(this.settings.periodicRescanSeconds);
+    this.settings.settingsRescanSeconds = normalizeNonNegativeInt(this.settings.settingsRescanSeconds);
     await this.saveSettings();
     this.engine.updateLocalSyncConfig(toLocalSyncConfig(this.settings));
   }
@@ -432,6 +605,12 @@ class LocalSyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.addClass("localsync-settings");
+
+    const markWide = (setting: Setting) => {
+      setting.settingEl.addClass("localsync-wide-setting");
+      return setting;
+    };
 
     containerEl.createEl("h2", { text: "LocalSync" });
 
@@ -463,10 +642,11 @@ class LocalSyncSettingTab extends PluginSettingTab {
     // ----------------------------
     containerEl.createEl("h3", { text: "Sync" });
 
-    new Setting(containerEl)
+    markWide(new Setting(containerEl))
       .setName("Relay URL")
       .setDesc("WebSocket relay endpoint. Changes take effect after reloading Obsidian.")
-      .addText((text) =>
+      .addText((text) => {
+        text.inputEl.addClass("localsync-wide-input");
         text
           .setPlaceholder("wss://free.evoluhq.com")
           .setValue(this.plugin.settings.relayUrl)
@@ -478,51 +658,54 @@ class LocalSyncSettingTab extends PluginSettingTab {
             }
             this.plugin.settings.relayUrl = trimmed;
             await this.plugin.saveSettings();
-          }),
-      );
-
-    containerEl.createEl("h3", { text: "Path Policy" });
-
-    new Setting(containerEl)
-      .setName("Include extensions")
-      .setDesc("Comma or whitespace separated extensions without dots.")
-      .addText((text) => {
-        text
-          .setPlaceholder("md, txt")
-          .setValue(this.plugin.settings.includeExtensions.join(", "))
-          .onChange(async (value) => {
-            const extensions = value.split(/[,\s]+/).filter(Boolean);
-            if (extensions.length === 0) {
-              new Notice("At least one extension is required");
-              return;
-            }
-            this.plugin.settings.includeExtensions = extensions;
-            await this.plugin.applyLocalSyncConfigFromSettings();
           });
       });
 
+    containerEl.createEl("h3", { text: "Vault sync" });
+
+    const setExtensionEnabled = async (extension: string, enabled: boolean) => {
+      const extensions = new Set(normalizeExtensions(this.plugin.settings.includeExtensions));
+      if (enabled) extensions.add(extension);
+      else extensions.delete(extension);
+      if (extensions.size === 0) {
+        new Notice("At least one vault file type must be enabled");
+        return false;
+      }
+      this.plugin.settings.includeExtensions = Array.from(extensions);
+      await this.plugin.applyLocalSyncConfigFromSettings();
+      return true;
+    };
+
     new Setting(containerEl)
-      .setName("Exclude rules")
-      .setDesc("One rule per line. Later rules win; prefix with ! to re-include.")
-      .addTextArea((ta) => {
-        ta.inputEl.rows = 8;
-        ta.setPlaceholder(".git/**\n.obsidian/**\n!.obsidian/app.json");
-        ta.setValue(this.plugin.settings.excludeGlobs.join("\n"));
-        ta.onChange(async (value) => {
-          this.plugin.settings.excludeGlobs = value.split(/\r?\n/);
-          await this.plugin.applyLocalSyncConfigFromSettings();
+      .setName("Notes")
+      .setDesc("Sync Markdown note files with the .md extension.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.includeExtensions.includes("md"));
+        toggle.onChange(async (value) => {
+          const changed = await setExtensionEnabled("md", value);
+          if (!changed) toggle.setValue(true);
         });
       });
 
     new Setting(containerEl)
-      .setName("Startup scan")
-      .setDesc("Scan tracked vault files when LocalSync starts.")
+      .setName("Text files")
+      .setDesc("Sync plain text files with the .txt extension.")
       .addToggle((toggle) => {
-        toggle.setValue(this.plugin.settings.startupScan);
+        toggle.setValue(this.plugin.settings.includeExtensions.includes("txt"));
         toggle.onChange(async (value) => {
-          this.plugin.settings.startupScan = value;
-          await this.plugin.applyLocalSyncConfigFromSettings();
-          new Notice(`Startup scan ${value ? "enabled" : "disabled"}`);
+          const changed = await setExtensionEnabled("txt", value);
+          if (!changed) toggle.setValue(true);
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Canvases")
+      .setDesc("Sync Obsidian canvas files with the .canvas extension.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.includeExtensions.includes("canvas"));
+        toggle.onChange(async (value) => {
+          const changed = await setExtensionEnabled("canvas", value);
+          if (!changed) toggle.setValue(true);
         });
       });
 
@@ -539,7 +722,19 @@ class LocalSyncSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Periodic rescan (seconds)")
+      .setName("Startup scan")
+      .setDesc("Scan tracked vault files when LocalSync starts.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.startupScan);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.startupScan = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+          new Notice(`Startup scan ${value ? "enabled" : "disabled"}`);
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Vault rescan interval (seconds)")
       .setDesc("Scan tracked vault files periodically. Set to 0 to disable.")
       .addText((text) => {
         text.setValue(String(this.plugin.settings.periodicRescanSeconds));
@@ -547,12 +742,181 @@ class LocalSyncSettingTab extends PluginSettingTab {
           const n = Number(text.inputEl.value);
           if (!Number.isInteger(n) || n < 0) {
             text.setValue(String(this.plugin.settings.periodicRescanSeconds));
-            new Notice("Periodic rescan must be 0 or a positive whole number of seconds");
+            new Notice("Vault rescan interval must be 0 or a positive whole number of seconds");
             return;
           }
           this.plugin.settings.periodicRescanSeconds = n;
           await this.plugin.applyLocalSyncConfigFromSettings();
-          new Notice(n > 0 ? `Periodic rescan every ${n} seconds` : "Periodic rescan disabled");
+          new Notice(n > 0 ? `Vault rescan every ${n} seconds` : "Vault rescan disabled");
+        });
+      });
+
+    markWide(new Setting(containerEl))
+      .setName("Excluded paths")
+      .setDesc("Optional Obsidian-visible vault paths. One rule per line. Later rules win; prefix with ! to re-include.")
+      .addTextArea((ta) => {
+        ta.inputEl.rows = 8;
+        ta.inputEl.addClass("localsync-wide-input");
+        ta.setPlaceholder("archive/**\n!archive/keep/**");
+        ta.setValue(this.plugin.settings.excludeGlobs.join("\n"));
+        ta.onChange(async (value) => {
+          this.plugin.settings.excludeGlobs = value.split(/\r?\n/);
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    containerEl.createEl("h3", { text: "Obsidian settings sync" });
+
+    new Setting(containerEl)
+      .setName("Sync Obsidian settings")
+      .setDesc("Sync allowlisted .obsidian settings files as plain last-writer-wins files.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncObsidianSettings);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncObsidianSettings = value;
+          if (value && this.plugin.settings.settingsRescanSeconds === 0) {
+            this.plugin.settings.settingsRescanSeconds = SETTINGS_SYNC_RESCAN_SECONDS;
+            new Notice(`Settings rescan enabled every ${SETTINGS_SYNC_RESCAN_SECONDS} seconds`);
+          }
+          await this.plugin.applyLocalSyncConfigFromSettings();
+          new Notice(`Obsidian settings sync ${value ? "enabled" : "disabled"}`);
+          this.display();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Settings rescan interval (seconds)")
+      .setDesc("Scan .obsidian settings periodically. Set to 0 to disable.")
+      .addText((text) => {
+        text.setValue(String(this.plugin.settings.settingsRescanSeconds));
+        text.inputEl.addEventListener("change", async () => {
+          const n = Number(text.inputEl.value);
+          if (!Number.isInteger(n) || n < 0) {
+            text.setValue(String(this.plugin.settings.settingsRescanSeconds));
+            new Notice("Settings rescan interval must be 0 or a positive whole number of seconds");
+            return;
+          }
+          this.plugin.settings.settingsRescanSeconds = n;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+          new Notice(n > 0 ? `Settings rescan every ${n} seconds` : "Settings rescan disabled");
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Main settings")
+      .setDesc("Sync editor settings, links, graph, bookmarks, daily notes, and file types.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncMainSettings);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncMainSettings = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Appearance settings")
+      .setDesc("Sync appearance settings, themes, and snippets.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncAppearanceSettings);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncAppearanceSettings = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Hotkeys")
+      .setDesc("Sync custom hotkeys.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncHotkeys);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncHotkeys = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Active core plugin list")
+      .setDesc("Sync which core plugins are enabled.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncCorePluginList);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncCorePluginList = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Core plugin settings")
+      .setDesc("Sync top-level Obsidian JSON settings, excluding workspace state.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncCorePluginSettings);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncCorePluginSettings = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Active community plugin list")
+      .setDesc("Sync which community plugins are enabled.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncCommunityPluginList);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncCommunityPluginList = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Community plugin settings")
+      .setDesc("Sync .obsidian/plugins/*/*.json settings, excluding plugin manifests unless installed plugin files are enabled.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncCommunityPluginSettings);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncCommunityPluginSettings = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Installed community plugin files")
+      .setDesc("Sync installed plugin main.js, styles.css, and manifest.json files. Disabled by default; enable only when plugin installations should follow this vault.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncInstalledCommunityPluginFiles);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncInstalledCommunityPluginFiles = value;
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    containerEl.createEl("h3", { text: "Advanced policy" });
+
+    markWide(new Setting(containerEl))
+      .setName("Settings include rules")
+      .setDesc("Optional extra .obsidian include rules. One rule per line.")
+      .addTextArea((ta) => {
+        ta.inputEl.rows = 4;
+        ta.inputEl.addClass("localsync-wide-input");
+        ta.setPlaceholder(".obsidian/plugins/my-plugin/**");
+        ta.setValue(this.plugin.settings.settingsIncludeGlobs.join("\n"));
+        ta.onChange(async (value) => {
+          this.plugin.settings.settingsIncludeGlobs = value.split(/\r?\n/);
+          await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    markWide(new Setting(containerEl))
+      .setName("Settings exclude rules")
+      .setDesc("Optional .obsidian exclude rules. One rule per line. Later rules win; prefix with ! to re-include.")
+      .addTextArea((ta) => {
+        ta.inputEl.rows = 4;
+        ta.inputEl.addClass("localsync-wide-input");
+        ta.setPlaceholder(".obsidian/plugins/some-plugin/**");
+        ta.setValue(this.plugin.settings.settingsExcludeGlobs.join("\n"));
+        ta.onChange(async (value) => {
+          this.plugin.settings.settingsExcludeGlobs = value.split(/\r?\n/);
+          await this.plugin.applyLocalSyncConfigFromSettings();
         });
       });
 
@@ -642,16 +1006,15 @@ class LocalSyncSettingTab extends PluginSettingTab {
     const revealSetting = new Setting(containerEl)
       .setName("Your mnemonic")
       .setDesc("24-word key — copy this to each device you want to sync.");
+    revealSetting.settingEl.addClass("localsync-mnemonic-setting");
 
-    const mnemonicBox = containerEl.createDiv();
+    const mnemonicBox = revealSetting.settingEl.createDiv({ cls: "localsync-mnemonic-box" });
     mnemonicBox.style.display = "none";
-    mnemonicBox.style.marginBottom = "1em";
 
     const mnemonicInput = mnemonicBox.createEl("input");
     mnemonicInput.type = "text";
     mnemonicInput.readOnly = true;
-    mnemonicInput.style.cssText =
-      "width:100%;font-family:var(--font-monospace);font-size:0.85em;box-sizing:border-box;";
+    mnemonicInput.addClass("localsync-mnemonic-input");
 
     revealSetting
       .addButton((btn) => {
@@ -698,12 +1061,13 @@ class LocalSyncSettingTab extends PluginSettingTab {
 
     let btn_restore: ButtonComponent;
 
-    new Setting(containerEl)
+    markWide(new Setting(containerEl))
       .setName("Restore mnemonic")
       .setDesc("Paste your 24-word key to restore an existing identity on this device.")
       .addTextArea((ta) => {
         ta.setPlaceholder("word1 word2 word3 …");
         ta.inputEl.rows = 2;
+        ta.inputEl.addClass("localsync-wide-input");
         ta.onChange((v) => {
           restoreValue = v.trim();
         });

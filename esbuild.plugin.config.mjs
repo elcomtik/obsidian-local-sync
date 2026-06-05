@@ -8,6 +8,9 @@ const outdir = "dist";
 
 fs.mkdirSync(outdir, { recursive: true });
 fs.copyFileSync("manifest.json", path.join(outdir, "manifest.json"));
+if (fs.existsSync("styles.css")) {
+  fs.copyFileSync("styles.css", path.join(outdir, "styles.css"));
+}
 
 const ctx = await esbuild.context({
   entryPoints: ["src/main.ts"],

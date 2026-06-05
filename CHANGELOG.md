@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.3.0 — 2026-06-05
+
+### Added
+
+- **Optional Obsidian settings sync**:
+  LocalSync can now sync selected `.obsidian` configuration files through a
+  separate `settingUpdate` table. Settings are full-file, last-writer-wins
+  payloads rather than Yjs documents, keeping note sync and configuration sync
+  separate.
+
+- **Remote-first settings bootstrap**:
+  startup and settings rescans repair local settings from already-replicated
+  `settingUpdate` history before seeding local settings. This lets a fresh peer
+  adopt existing synced settings instead of publishing local defaults over them.
+
+- **Settings rescan interval**:
+  settings sync has its own rescan interval, separate from vault file rescan.
+  Enabling settings sync in the plugin UI enables a 30 second settings rescan
+  when it was previously disabled. The daemon exposes the same control as
+  `LOCALSYNC_SETTINGS_RESCAN_SECONDS`.
+
+- **Split settings categories in the plugin UI**:
+  the settings tab now models Obsidian settings closer to Obsidian Sync:
+  main settings, appearance, hotkeys, core plugin list/settings, active
+  community plugin list, community plugin settings, and installed community
+  plugin files.
+
+- **Community plugin settings without plugin binaries**:
+  community plugin JSON settings can sync independently from installed plugin
+  files. `main.js`, `styles.css`, and `manifest.json` stay behind a separate
+  Installed community plugin files toggle, disabled by default.
+
+- **Compressed settings payloads**:
+  settings payloads may be gzip-compressed when compression reduces the stored
+  payload size. Rows carry an `encoding` field, and missing/null encoding
+  remains backward-compatible raw UTF-8 base64.
+
+- **Daemon settings watcher policy**:
+  the daemon now watches normal vault files and `.obsidian` settings separately
+  so hidden settings paths can be handled without mixing them into the Yjs vault
+  file pipeline.
+
+### Fixed
+
+- **Preserve local settings edits during repair**:
+  if a peer has already snapshotted a remote setting state and the local file
+  changed since then, settings repair no longer rewrites the local edit back to
+  the old remote value. The following settings scan advertises the local change
+  instead. This keeps periodic settings repair from reverting plugin updates.
+
+- **Avoid new-peer settings clobbering**:
+  fresh peers now defer local settings seeds and check remote settings state
+  before publishing, reducing the chance that local defaults wipe established
+  settings from another peer.
+
+### Changed
+
+- **Settings are explicitly outside Yjs**:
+  settings sync uses content hashes plus local `_settingSnapshot` rows rather
+  than Yjs documents. This keeps configuration files simple and makes large
+  plugin payload compression possible without affecting note CRDT behavior.
+
+- **Vault-content exclude defaults split by runtime**:
+  the Obsidian plugin no longer preloads `.git`, `.trash`, `.DS_Store`, `*.tmp`,
+  or `*.swp` as vault excludes because the Obsidian adapter does not expose
+  those paths in normal vault listings. Existing plugin settings migrate those
+  old presets out of the saved vault exclude list. The standalone daemon keeps
+  those filesystem-oriented defaults because it watches raw disk paths.
+
+- **Wider settings inputs**:
+  relay URL, mnemonic restore, and include/exclude rule fields are wider in the
+  Obsidian settings tab so long paths and environment-like values are easier to
+  edit.
+
+### Tests
+
+- Added path-policy tests for settings includes/excludes, negation, and the
+  split between community plugin JSON settings and installed plugin files.
+- Added a regression test proving settings repair preserves a local edit based
+  on an already-snapshotted remote setting and advertises that local edit.
+- Extended daemon smoke coverage to exercise settings sync, settings watcher
+  startup, and compressed plugin file payloads.
+
 ## 0.2.10 — 2026-06-04
 
 ### Added

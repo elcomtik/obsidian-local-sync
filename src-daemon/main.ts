@@ -10,6 +10,7 @@ import {
 import {
   DEFAULT_LOCAL_SYNC_CONFIG,
   getExtension,
+  isTrackedSettingPath,
   isTrackedVaultPath,
   type LocalSyncConfig,
 } from "../src-core/pathPolicy";
@@ -35,6 +36,13 @@ const logLevelRank: Record<LogLevel, number> = {
   info: 3,
   debug: 4,
 };
+const DAEMON_DEFAULT_EXCLUDE_GLOBS = [
+  ".git/**",
+  ".trash/**",
+  ".DS_Store",
+  "*.tmp",
+  "*.swp",
+];
 const engineConfig: EngineConfig = {
   historyPollMs: readPositiveInt("LOCALSYNC_HISTORY_POLL_MS", 1000),
   historyBatchSize: readPositiveInt("LOCALSYNC_HISTORY_BATCH_SIZE", 500),
@@ -44,12 +52,28 @@ const engineConfig: EngineConfig = {
 const localSyncConfig: LocalSyncConfig = {
   ...DEFAULT_LOCAL_SYNC_CONFIG,
   includeExtensions: readList("LOCALSYNC_INCLUDE_EXTENSIONS", DEFAULT_LOCAL_SYNC_CONFIG.includeExtensions),
-  excludeGlobs: readRules("LOCALSYNC_EXCLUDE_GLOBS", DEFAULT_LOCAL_SYNC_CONFIG.excludeGlobs),
+  excludeGlobs: readRules("LOCALSYNC_EXCLUDE_GLOBS", DAEMON_DEFAULT_EXCLUDE_GLOBS),
+  syncObsidianSettings: readBoolean(
+    "LOCALSYNC_SYNC_OBSIDIAN_SETTINGS",
+    DEFAULT_LOCAL_SYNC_CONFIG.syncObsidianSettings,
+  ),
+  settingsIncludeGlobs: readRules(
+    "LOCALSYNC_SETTINGS_INCLUDE_GLOBS",
+    DEFAULT_LOCAL_SYNC_CONFIG.settingsIncludeGlobs,
+  ),
+  settingsExcludeGlobs: readRules(
+    "LOCALSYNC_SETTINGS_EXCLUDE_GLOBS",
+    DEFAULT_LOCAL_SYNC_CONFIG.settingsExcludeGlobs,
+  ),
   startupScan: readBoolean("LOCALSYNC_STARTUP_SCAN", true),
   syncDeletes: readBoolean("LOCALSYNC_SYNC_DELETES", true),
   periodicRescanSeconds: readNonNegativeInt(
     "LOCALSYNC_PERIODIC_RESCAN_SECONDS",
     DEFAULT_LOCAL_SYNC_CONFIG.periodicRescanSeconds,
+  ),
+  settingsRescanSeconds: readNonNegativeInt(
+    "LOCALSYNC_SETTINGS_RESCAN_SECONDS",
+    DEFAULT_LOCAL_SYNC_CONFIG.settingsRescanSeconds,
   ),
 };
 const usePolling = readBoolean("LOCALSYNC_USE_POLLING", false);
@@ -117,7 +141,7 @@ const engine = new YjsEvoluHistoryEngine({
 
 await engine.start();
 
-const watcher = chokidar.watch(vaultRoot, {
+const vaultWatcher = chokidar.watch(vaultRoot, {
   persistent: true,
   ignoreInitial: true,
   awaitWriteFinish: {
@@ -127,19 +151,44 @@ const watcher = chokidar.watch(vaultRoot, {
   atomic: true,
   usePolling,
   interval: pollIntervalMs,
-  ignored: (absolutePath) => isIgnoredWatchPath(vault, absolutePath),
+  ignored: (absolutePath) => isIgnoredVaultWatchPath(vault, absolutePath),
 });
 
-watcher
-  .on("add", (absolutePath) => void onChanged(absolutePath))
-  .on("change", (absolutePath) => void onChanged(absolutePath))
-  .on("unlink", (absolutePath) => void onDeleted(absolutePath))
+vaultWatcher
+  .on("add", (absolutePath) => void onVaultChanged(absolutePath))
+  .on("change", (absolutePath) => void onVaultChanged(absolutePath))
+  .on("unlink", (absolutePath) => void onVaultDeleted(absolutePath))
   .on("ready", () => {
-    logInfo("Watcher ready");
+    logInfo("Vault watcher ready");
   })
   .on("error", (error) => {
-    logError("Watcher failed", error);
+    logError("Vault watcher failed", error);
   });
+
+const settingsRoot = path.join(vaultRoot, ".obsidian");
+const settingsWatcher = localSyncConfig.syncObsidianSettings
+  ? chokidar.watch(settingsRoot, {
+      persistent: true,
+      ignoreInitial: true,
+      awaitWriteFinish: {
+        stabilityThreshold: 1000,
+        pollInterval: 100,
+      },
+      atomic: true,
+      usePolling,
+      interval: pollIntervalMs,
+      ignored: (absolutePath) => isIgnoredSettingsWatchPath(vault, absolutePath),
+    })
+      .on("add", (absolutePath) => void onSettingsChanged(absolutePath))
+      .on("change", (absolutePath) => void onSettingsChanged(absolutePath))
+      .on("unlink", (absolutePath) => void onSettingsDeleted(absolutePath))
+      .on("ready", () => {
+        logInfo("Settings watcher ready");
+      })
+      .on("error", (error) => {
+        logError("Settings watcher failed", error);
+      })
+  : null;
 
 logInfo("Daemon started", {
   vaultName,
@@ -153,23 +202,38 @@ logInfo("Daemon started", {
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
-async function onChanged(absolutePath: string) {
+async function onVaultChanged(absolutePath: string) {
   const vaultPath = safeToVaultPath(vault, absolutePath);
   if (vaultPath === null) return;
   logInfo("Vault file changed", { path: vaultPath });
   await engine.onVaultFileChanged(vaultPath);
 }
 
-async function onDeleted(absolutePath: string) {
+async function onVaultDeleted(absolutePath: string) {
   const vaultPath = safeToVaultPath(vault, absolutePath);
   if (vaultPath === null) return;
   logInfo("Vault file deleted", { path: vaultPath });
   await engine.onVaultFileDeleted(vaultPath);
 }
 
+async function onSettingsChanged(absolutePath: string) {
+  const vaultPath = safeToVaultPath(vault, absolutePath);
+  if (vaultPath === null) return;
+  logInfo("Settings file changed", { path: vaultPath });
+  await engine.onVaultFileChanged(vaultPath);
+}
+
+async function onSettingsDeleted(absolutePath: string) {
+  const vaultPath = safeToVaultPath(vault, absolutePath);
+  if (vaultPath === null) return;
+  logInfo("Settings file deleted", { path: vaultPath });
+  await engine.onVaultFileDeleted(vaultPath);
+}
+
 async function shutdown(signal: string) {
   logInfo("Daemon stopping", { signal });
-  await watcher.close();
+  await vaultWatcher.close();
+  await settingsWatcher?.close();
   await engine.stop();
   await closeDb();
   logInfo("Daemon stopped");
@@ -184,11 +248,19 @@ function safeToVaultPath(vault: NodeFsVaultAdapter, absolutePath: string): strin
   }
 }
 
-function isIgnoredWatchPath(vault: NodeFsVaultAdapter, absolutePath: string): boolean {
+function isIgnoredVaultWatchPath(vault: NodeFsVaultAdapter, absolutePath: string): boolean {
+  const vaultPath = safeToVaultPath(vault, absolutePath);
+  if (vaultPath === null || vaultPath === "") return false;
+  if (vaultPath === ".obsidian" || vaultPath.startsWith(".obsidian/")) return true;
+  if (getExtension(vaultPath) === undefined) return false;
+  return !isTrackedVaultPath(vaultPath, localSyncConfig);
+}
+
+function isIgnoredSettingsWatchPath(vault: NodeFsVaultAdapter, absolutePath: string): boolean {
   const vaultPath = safeToVaultPath(vault, absolutePath);
   if (vaultPath === null || vaultPath === "") return false;
   if (getExtension(vaultPath) === undefined) return false;
-  return !isTrackedVaultPath(vaultPath, localSyncConfig);
+  return !isTrackedSettingPath(vaultPath, localSyncConfig);
 }
 
 function readRequiredEnv(name: string): string {

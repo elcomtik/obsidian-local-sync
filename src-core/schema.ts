@@ -4,6 +4,8 @@ import { TimestampBytes } from "@evolu/common/local-first";
 
 export const FileUpdateId = Evolu.id("FileUpdate");
 export const FileSnapshotId = Evolu.id("FileSnapshot");
+export const SettingUpdateId = Evolu.id("SettingUpdate");
+export const SettingSnapshotId = Evolu.id("SettingSnapshot");
 export const HistoryCursorId = Evolu.id("HistoryCursor");
 
 export const Schema = {
@@ -16,11 +18,28 @@ export const Schema = {
     type: Evolu.nullOr(Evolu.NonEmptyString1000)
   },
 
+  settingUpdate: {
+    id: SettingUpdateId,
+    path: Evolu.NonEmptyString1000,
+    contentBase64: Evolu.String,
+    contentHash: Evolu.NonEmptyString1000,
+    // null/raw = UTF-8 text base64; "gzip" = gzip-compressed UTF-8 text base64
+    encoding: Evolu.nullOr(Evolu.NonEmptyString1000),
+    // null = content update (default); "delete" = setting file was deleted
+    type: Evolu.nullOr(Evolu.NonEmptyString1000)
+  },
+
   // -------- local only --------
   _fileSnapshot: {
     id: FileSnapshotId,
     path: Evolu.NonEmptyString1000,
     snapshotBase64: Evolu.NonEmptyString
+  },
+
+  _settingSnapshot: {
+    id: SettingSnapshotId,
+    path: Evolu.NonEmptyString1000,
+    contentHash: Evolu.NonEmptyString1000
   },
 
   _historyCursor: {
