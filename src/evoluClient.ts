@@ -57,7 +57,9 @@ function createEvoluConsole(logFormatter: LogFormatter) {
  * authentication).  The SQLite driver's `flush()` is still called on every
  * unload to persist the history cursor.
  */
-let _cached: { evolu: Evolu<Database>; flush: () => Promise<void> } | null = null;
+export type CloseEvoluDb = (options?: { flush?: boolean }) => Promise<void>;
+
+let _cached: { evolu: Evolu<Database>; close: CloseEvoluDb } | null = null;
 
 /**
  * Returns the Evolu client for `appName` / `relayUrl`, creating it on the
@@ -81,16 +83,18 @@ export function createEvoluClient(
   }: { forceNew?: boolean; logFormatter?: LogFormatter } = {},
 ) {
   if (_cached && !forceNew) {
-    return { evolu: _cached.evolu, closeDb: _cached.flush };
+    return { evolu: _cached.evolu, closeDb: _cached.close };
   }
 
   let flush: () => Promise<void> = async () => {};
+  let discard: () => void = () => {};
 
   const evoluConsole = createEvoluConsole(logFormatter);
   const innerFactory = createPersistentSqlJsDriver(io, logFormatter);
   const wrappedFactory: CreateSqliteDriver = async (_name, options) => {
     const driver = await innerFactory(_name, options);
     flush = async () => { await (driver as any).flush?.(); };
+    discard = () => { (driver as any).discard?.(); };
     return driver;
   };
 
@@ -126,8 +130,14 @@ export function createEvoluClient(
     transports: [{ type: "WebSocket", url: relayUrl }],
   });
 
-  const closeDb = () => flush();
-  _cached = { evolu, flush: closeDb };
+  const closeDb: CloseEvoluDb = async (options = {}) => {
+    if (options.flush === false) {
+      discard();
+      return;
+    }
+    await flush();
+  };
+  _cached = { evolu, close: closeDb };
   return { evolu, closeDb };  // closeDb: () => Promise<void>
 }
 

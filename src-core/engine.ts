@@ -47,6 +47,24 @@ export type EngineConfig = {
   maxOpenDocs: number;
 };
 
+export type SyncProgress =
+  | {
+      status: "syncing";
+      message: string;
+      current?: number;
+      total?: number;
+    }
+  | {
+      status: "caught-up";
+      message: string;
+    }
+  | {
+      status: "blocked";
+      message: string;
+    };
+
+export type SyncProgressReporter = (progress: SyncProgress) => void;
+
 export type ReconcileResult = "loaded" | "deferred" | "skipped";
 
 const dmp = new DiffMatchPatch();
@@ -175,6 +193,45 @@ function applyBetterDiffToYText(ytext: Y.Text, oldText: string, newText: string)
   }
 }
 
+export type RebasedTextChange = {
+  text: string;
+  patchResults: boolean[];
+};
+
+/**
+ * Rebase a local text change onto the current Yjs text.
+ *
+ * `oldText -> newText` is the change observed in the vault file. `currentText`
+ * is the current replicated Yjs content, which may already include remote edits
+ * not present in `oldText`. Applying a positional diff from `oldText` directly
+ * to Yjs is only valid when `currentText === oldText`; otherwise indexes can
+ * point at the wrong content. Patches are fuzzier and can usually apply the
+ * local edit onto the current replicated text.
+ */
+export function rebaseTextChange(
+  oldText: string,
+  currentText: string,
+  newText: string,
+): RebasedTextChange {
+  if (oldText === newText) return { text: currentText, patchResults: [] };
+  if (oldText === currentText) return { text: newText, patchResults: [] };
+
+  const patches = dmp.patch_make(oldText, newText);
+  const [text, patchResults] = dmp.patch_apply(patches, currentText) as [string, boolean[]];
+  return { text, patchResults };
+}
+
+function applyRebasedTextChangeToYText(
+  ytext: Y.Text,
+  oldText: string,
+  newText: string,
+): RebasedTextChange {
+  const currentText = ytext.toString();
+  const result = rebaseTextChange(oldText, currentText, newText);
+  applyBetterDiffToYText(ytext, currentText, result.text);
+  return result;
+}
+
 type FileState = {
   doc: Y.Doc;
   text: Y.Text;
@@ -242,6 +299,7 @@ export class YjsEvoluHistoryEngine {
   private localSyncConfig: LocalSyncConfig;
   private logLevel: LogLevel;
   private formatLogLine: LogFormatter = formatLogLine;
+  private reportSyncProgress?: SyncProgressReporter;
 
   private states = new Map<string, FileState>();
 
@@ -250,6 +308,7 @@ export class YjsEvoluHistoryEngine {
   private settingsRescanTimer: ReturnType<typeof setInterval> | null = null;
   private isPolling = false;
   private isScanningVault = false;
+  private isStopped = false;
   /** Resolves when the current poll cycle completes. Awaited by stop(). */
   private ongoingPoll: Promise<void> = Promise.resolve();
 
@@ -332,6 +391,7 @@ export class YjsEvoluHistoryEngine {
     localSyncConfig?: LocalSyncConfig;
     logLevel: LogLevel;
     logFormatter?: LogFormatter;
+    reportSyncProgress?: SyncProgressReporter;
   }) {
     this.vault = args.vault;
     this.evolu = args.evolu;
@@ -340,6 +400,7 @@ export class YjsEvoluHistoryEngine {
     this.localSyncConfig = args.localSyncConfig ?? DEFAULT_LOCAL_SYNC_CONFIG;
     this.logLevel = args.logLevel;
     this.formatLogLine = args.logFormatter ?? formatLogLine;
+    this.reportSyncProgress = args.reportSyncProgress;
   }
 
   // ---------- logging helpers ----------
@@ -375,6 +436,7 @@ export class YjsEvoluHistoryEngine {
    */
   async start() {
     try {
+      this.isStopped = false;
       await this.ensureHistoryCursorRow();
       this.startPollingTimer();
       this.startRescanTimer();
@@ -405,6 +467,7 @@ export class YjsEvoluHistoryEngine {
    * without snapshots are deferred until after the relay has gone quiet.
    */
   private async scanVaultForUnsyncedFiles(label: string) {
+    if (this.isStopped) return;
     if (this.isScanningVault) {
       this.logInfo(`${label}: already running, skipping`);
       return;
@@ -452,7 +515,7 @@ export class YjsEvoluHistoryEngine {
       let deferred = 0;
 
       for (const file of files) {
-        if (!this.isActive) break;
+        if (!this.isActive || this.isStopped) break;
         const result = await this.reconcileVaultFile(file.path, label);
 
         if (result === "deferred") {
@@ -479,6 +542,7 @@ export class YjsEvoluHistoryEngine {
   }
 
   private async scanSettingsForUnsyncedFiles(label: string) {
+    if (this.isStopped) return;
     if (!this.localSyncConfig.syncObsidianSettings) return;
 
     try {
@@ -492,7 +556,7 @@ export class YjsEvoluHistoryEngine {
       let unchanged = 0;
 
       for (const path of paths) {
-        if (!this.isActive) break;
+        if (!this.isActive || this.isStopped) break;
         const result = await this.reconcileSettingFile(path, label);
         if (result === "deferred") deferred++;
         else if (result === "advertised") advertised++;
@@ -521,6 +585,7 @@ export class YjsEvoluHistoryEngine {
   }
 
   private async collectSettingPaths(folder: string, discovered: Set<string>): Promise<void> {
+    if (this.isStopped) return;
     const listing = await this.vault.listFolder(folder);
     if (!listing) return;
 
@@ -531,6 +596,7 @@ export class YjsEvoluHistoryEngine {
   }
 
   private async reconcileSettingFile(path: string, label: string): Promise<"advertised" | "deferred" | "unchanged" | "skipped"> {
+    if (this.isStopped) return "skipped";
     if (!isTrackedSettingPath(path, this.localSyncConfig)) return "skipped";
 
     const content = await this.vault.readText(path);
@@ -562,6 +628,7 @@ export class YjsEvoluHistoryEngine {
    * remote history has a chance to arrive first.
    */
   async reconcileVaultFile(path: string, label = "Startup scan"): Promise<ReconcileResult> {
+    if (this.isStopped) return "skipped";
     if (!isTrackedVaultPath(path, this.localSyncConfig)) return "skipped";
 
     const snapshot = await this.loadLocalSnapshot(path);
@@ -585,10 +652,11 @@ export class YjsEvoluHistoryEngine {
    * skipped automatically by the set iteration.
   */
   private async drainPendingVaultSeed() {
+    if (this.isStopped) return;
     if (this.pendingVaultSeed.size === 0) return;
     this.logInfo("Deferred seed: seeding files", { count: this.pendingVaultSeed.size });
     for (const path of this.pendingVaultSeed) {
-      if (!this.isActive) break;
+      if (!this.isActive || this.isStopped) break;
       // Only seed if not already opened by poll (early-return in getOrLoadFileState)
       if (!this.states.has(path)) {
         this.logInfo("Deferred seed: seeding new file", { path });
@@ -601,12 +669,13 @@ export class YjsEvoluHistoryEngine {
   }
 
   private async drainPendingSettingSeed() {
+    if (this.isStopped) return;
     if (!this.localSyncConfig.syncObsidianSettings || this.pendingSettingSeed.size === 0) return;
 
     const remoteSettings = await this.loadLatestSettingUpdatesFromHistory();
     this.logInfo("Deferred settings seed: seeding files", { count: this.pendingSettingSeed.size });
     for (const path of this.pendingSettingSeed) {
-      if (!this.isActive) break;
+      if (!this.isActive || this.isStopped) break;
       if (!isTrackedSettingPath(path, this.localSyncConfig)) {
         this.pendingSettingSeed.delete(path);
         continue;
@@ -718,6 +787,7 @@ export class YjsEvoluHistoryEngine {
    */
   async stop(flush = true) {
     try {
+      this.isStopped = true;
       this.stopPollingTimer();
       this.stopRescanTimer();
       // Wait for any in-progress poll to finish so its cursor write is included
@@ -788,6 +858,7 @@ export class YjsEvoluHistoryEngine {
    * changes received while the engine was inactive.
    */
   async setActive() {
+    if (this.isStopped) return;
     this.isActive = true;
     this.logInfo("App active");
     this.pollHistoryOnce();
@@ -824,6 +895,7 @@ export class YjsEvoluHistoryEngine {
    * @param path The modified vault file path.
    */
   async onVaultFileChanged(path: string) {
+    if (this.isStopped) return;
     if (isTrackedSettingPath(path, this.localSyncConfig)) {
       if (this.pendingRemoteSettingWrites.has(path)) {
         this.pendingRemoteSettingWrites.delete(path);
@@ -850,11 +922,29 @@ export class YjsEvoluHistoryEngine {
         return;
       }
 
+      let patchResults: boolean[] = [];
       st.doc.transact(() => {
-        applyBetterDiffToYText(st.text, st.lastVaultText, newVaultText);
+        patchResults = applyRebasedTextChangeToYText(st.text, st.lastVaultText, newVaultText).patchResults;
       });
 
-      st.lastVaultText = newVaultText;
+      if (patchResults.some((ok) => !ok)) {
+        this.logWarn("Vault file changed: local patch did not apply cleanly", {
+          path,
+          patchResults,
+        });
+      }
+
+      const mergedText = st.text.toString();
+      if (mergedText !== newVaultText) {
+        this.logInfo("Vault file changed: writing rebased content back to vault", {
+          path,
+          vaultLen: newVaultText.length,
+          mergedLen: mergedText.length,
+        });
+        st.ignoreNextVaultModify = true;
+        await this.vault.writeText(path, mergedText);
+      }
+      st.lastVaultText = mergedText;
       if (!hadSnapshot && newVaultText.length === 0 && st.pendingUpdates.length === 0) {
         this.logInfo("Vault file changed: advertising empty new file", { path });
         await this.retransmitCurrentState(path);
@@ -928,7 +1018,7 @@ export class YjsEvoluHistoryEngine {
   }
 
   private pollHistoryOnce() {
-    if (!this.isActive || this.isPolling) return;
+    if (this.isStopped || !this.isActive || this.isPolling) return;
     this.isPolling = true;
     this.ongoingPoll = (async () => {
       try {
@@ -954,6 +1044,10 @@ export class YjsEvoluHistoryEngine {
         const histRows = await this.evolu.loadQuery(histQ);
 
         if (histRows.length === 0) {
+          this.reportSyncProgress?.({
+            status: "caught-up",
+            message: "LocalSync is caught up.",
+          });
           // Deferred vault seeding (relay is quiet).
           if (this.scanComplete) {
             if (!this.pendingVaultSeedReady) {
@@ -975,6 +1069,12 @@ export class YjsEvoluHistoryEngine {
         }
 
         this.logInfo("History poll fetched rows", { count: histRows.length });
+        this.reportSyncProgress?.({
+          status: "syncing",
+          message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
+          current: 0,
+          total: histRows.length,
+        });
 
         // Step 2: Convert blob IDs to string IDs and batch-fetch synced rows.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1010,33 +1110,60 @@ export class YjsEvoluHistoryEngine {
 
         // Step 4: Process rows in timestamp order.
         const touchedPaths = new Set<string>();
+        let lastHandledTimestamp: TimestampBytes | null = null;
+        let stoppedAtMissingRow = false;
 
         for (const [rowIdx, h] of histRows.entries()) {
           const id = idBytesToId(h.id as unknown as IdBytes);
+          const timestamp = h.timestamp as unknown as TimestampBytes;
+          const current = rowIdx + 1;
 
           // Skip rows we produced ourselves in this session.
           if (this.outgoingIds.has(id)) {
             this.logInfo("Skipped own history row", { id, table: h.table });
+            lastHandledTimestamp = timestamp;
+            this.reportSyncProgress?.({
+              status: "syncing",
+              message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
+              current,
+              total: histRows.length,
+            });
             continue;
           }
 
           if (h.table === "settingUpdate") {
             const setting = settingRowMap.get(id);
-            if (!setting) continue;
+            if (!setting) {
+              this.logWarn("History referenced missing settingUpdate row; cursor not advanced past it", { id });
+              stoppedAtMissingRow = true;
+              break;
+            }
 
-            await this.applyRemoteSettingUpdate(setting);
+            const applied = await this.applyRemoteSettingUpdate(setting);
+            if (!applied) {
+              this.logWarn("Remote setting update failed; cursor not advanced past it", { id, path: setting.path });
+              stoppedAtMissingRow = true;
+              break;
+            }
             touchedPaths.add(setting.path);
             if (this.pendingSettingSeed.delete(setting.path)) {
               this.logInfo("Deferred settings seed: remote history covered setting", { path: setting.path });
             }
+            lastHandledTimestamp = timestamp;
+            this.reportSyncProgress?.({
+              status: "syncing",
+              message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
+              current,
+              total: histRows.length,
+            });
             continue;
           }
 
           const r = rowMap.get(id);
           if (!r) {
-            // Row missing from fileUpdate (different device's encrypted data, or
-            // soft-deleted).  Skip silently — not an error.
-            continue;
+            this.logWarn("History referenced missing fileUpdate row; cursor not advanced past it", { id });
+            stoppedAtMissingRow = true;
+            break;
           }
 
           const { path, updateBase64, type } = r;
@@ -1056,6 +1183,13 @@ export class YjsEvoluHistoryEngine {
             }
             this.logInfo("Applied remote delete", { path });
             touchedPaths.add(path);
+            lastHandledTimestamp = timestamp;
+            this.reportSyncProgress?.({
+              status: "syncing",
+              message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
+              current,
+              total: histRows.length,
+            });
             continue;
           }
 
@@ -1068,6 +1202,13 @@ export class YjsEvoluHistoryEngine {
           );
           if (id === myRetransmitId) {
             this.logInfo("Skipped own startup-retransmit row", { path });
+            lastHandledTimestamp = timestamp;
+            this.reportSyncProgress?.({
+              status: "syncing",
+              message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
+              current,
+              total: histRows.length,
+            });
             continue;
           }
 
@@ -1089,13 +1230,25 @@ export class YjsEvoluHistoryEngine {
             // skip the vault write to avoid the Obsidian metadata-race (ARCH-2).
             this.logInfo("Skipping vault write, delete follows in batch", { path });
           } else {
-            await this.writeYjsToVault(path, st);
+            const written = await this.writeYjsToVault(path, st);
+            if (!written) {
+              this.logWarn("Remote file update failed to write to vault; cursor not advanced past it", { id, path });
+              stoppedAtMissingRow = true;
+              break;
+            }
           }
 
           touchedPaths.add(path);
           if (this.pendingVaultSeed.delete(path)) {
             this.logInfo("Deferred seed: remote history covered file", { path });
           }
+          lastHandledTimestamp = timestamp;
+          this.reportSyncProgress?.({
+            status: "syncing",
+            message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
+            current,
+            total: histRows.length,
+          });
         }
 
         // Save one snapshot per touched file rather than one per update row.
@@ -1104,8 +1257,16 @@ export class YjsEvoluHistoryEngine {
           if (st) await this.saveLocalSnapshot(p, st);
         }
 
-        const lastTs = histRows[histRows.length - 1].timestamp as unknown as TimestampBytes;
-        await this.saveHistoryCursor(lastTs);
+        if (lastHandledTimestamp != null) {
+          await this.saveHistoryCursor(lastHandledTimestamp);
+        }
+        if (stoppedAtMissingRow) {
+          this.reportSyncProgress?.({
+            status: "blocked",
+            message: "LocalSync paused: a remote row could not be applied. Check console before editing.",
+          });
+          return;
+        }
 
         // Deferred vault seeding: drain only when the relay is quiet.
         if (this.scanComplete) {
@@ -1497,12 +1658,12 @@ export class YjsEvoluHistoryEngine {
     return rows;
   }
 
-  private async applyRemoteSettingUpdate(row: SettingUpdateRow) {
+  private async applyRemoteSettingUpdate(row: SettingUpdateRow): Promise<boolean> {
     const path = row.path;
     try {
       if (!isTrackedSettingPath(path, this.localSyncConfig)) {
         this.logInfo("Skipped remote setting update, path not tracked", { path });
-        return;
+        return true;
       }
 
       if (row.type === "delete") {
@@ -1517,7 +1678,7 @@ export class YjsEvoluHistoryEngine {
           }
         }
         this.logInfo("Applied remote setting delete", { path });
-        return;
+        return true;
       }
 
       const content = await decodeSettingContent(row);
@@ -1538,10 +1699,12 @@ export class YjsEvoluHistoryEngine {
         encoding: row.encoding ?? "raw",
         changed: current !== content,
       });
+      return true;
     } catch (error) {
       this.pendingRemoteSettingWrites.delete(path);
       this.pendingRemoteSettingDeletes.delete(path);
       this.logError("applyRemoteSettingUpdate failed", { path, type: row.type, error });
+      return false;
     }
   }
 
@@ -1671,7 +1834,7 @@ export class YjsEvoluHistoryEngine {
           vaultLen: lastVaultText.length,
         });
         doc.transact(() => {
-          applyBetterDiffToYText(text, yjsText, lastVaultText);
+          applyRebasedTextChangeToYText(text, yjsText, lastVaultText);
         });
       }
     } else if (!snapshotBase64 && lastVaultText && seedFromVault) {
@@ -1726,7 +1889,7 @@ export class YjsEvoluHistoryEngine {
 
   // ---------- writeback ----------
 
-  private async writeYjsToVault(path: string, st: FileState) {
+  private async writeYjsToVault(path: string, st: FileState): Promise<boolean> {
     try {
       const newText = st.text.toString();
       this.logInfo("writeYjsToVault: enter", {
@@ -1753,20 +1916,22 @@ export class YjsEvoluHistoryEngine {
         await this.vault.writeText(path, newText);
         st.lastVaultText = newText;
         this.logInfo("writeYjsToVault: file created", { path });
-        return;
+        return true;
       }
 
       if (newText === st.lastVaultText) {
         this.logInfo("writeYjsToVault: no change, skipping", { path });
-        return;
+        return true;
       }
 
       this.logInfo("writeYjsToVault: modifying file", { path, chars: newText.length });
       st.ignoreNextVaultModify = true;
       await this.vault.writeText(path, newText);
       st.lastVaultText = newText;
+      return true;
     } catch (e) {
       this.logError("writeYjsToVault failed", { path, error: e });
+      return false;
     }
   }
 
@@ -1816,6 +1981,7 @@ export class YjsEvoluHistoryEngine {
    * row so other devices trash the file.
    */
   async onVaultFileDeleted(path: string) {
+    if (this.isStopped) return;
     if (isTrackedSettingPath(path, this.localSyncConfig)) {
       if (this.pendingRemoteSettingDeletes.has(path)) return;
       if (!this.localSyncConfig.syncDeletes) return;
@@ -1855,6 +2021,7 @@ export class YjsEvoluHistoryEngine {
    * made immediately after the rename are diff'd against the correct baseline.
    */
   async onVaultFileRenamed(oldPath: string, newPath: string) {
+    if (this.isStopped) return;
     if (
       isTrackedSettingPath(oldPath, this.localSyncConfig) ||
       isTrackedSettingPath(newPath, this.localSyncConfig)
@@ -1931,6 +2098,7 @@ export class YjsEvoluHistoryEngine {
    * Called concurrently from `start()` alongside `scanVaultForUnsyncedFiles`.
    */
   private async auditSnapshotsForOfflineDeletes(label = "Startup scan") {
+    if (this.isStopped) return;
     if (!this.localSyncConfig.syncDeletes) return;
 
     try {
@@ -1951,6 +2119,7 @@ export class YjsEvoluHistoryEngine {
 
       let audited = 0;
       for (const row of rows) {
+        if (this.isStopped) return;
         const path = row.path;
         if (!path) continue;
         // Skip already-tombstoned snapshots.
@@ -1985,6 +2154,7 @@ export class YjsEvoluHistoryEngine {
   }
 
   private async auditSettingSnapshotsForOfflineDeletes(label = "Startup settings scan") {
+    if (this.isStopped) return;
     if (!this.localSyncConfig.syncObsidianSettings || !this.localSyncConfig.syncDeletes) return;
 
     try {
@@ -2001,6 +2171,7 @@ export class YjsEvoluHistoryEngine {
 
       let audited = 0;
       for (const row of rows) {
+        if (this.isStopped) return;
         const path = row.path;
         if (!path || !isTrackedSettingPath(path, this.localSyncConfig)) continue;
         if (row.contentHash === "DELETED") continue;

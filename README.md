@@ -80,7 +80,9 @@ This system uses Evolu’s **owner mnemonic** as your sync key.
 2. Open settings
 3. Paste mnemonic into **Restore**
 4. Click Restore — wait 5 seconds, then click **Confirm restore?** to proceed
-5. Wait a few seconds for initial sync
+5. LocalSync deletes this device's synced local vault files listed by Obsidian's
+   vault API and the local DB, restores the pasted identity, then rebuilds from
+   remote history
 
 ---
 
@@ -220,11 +222,23 @@ We poll `evolu_history` for:
 ordered by timestamp
 
 A local cursor (`_historyCursor`) prevents reprocessing.
+The cursor is advanced only after contiguous history rows are successfully
+handled; if a referenced synced row is missing or a remote write fails, the
+cursor stays before that row so the next poll retries it.
 
 ### 4) Local-Only Tables
 - `_fileSnapshot`: one snapshot per file (replaced, not accumulated)
 - `_settingSnapshot`: one content hash per synced settings file plus tombstones
 - `_historyCursor`: last processed timestamp
+
+The plugin settings include a dangerous **Reset local sync state** action. It
+deletes this device's tracked synced vault files returned by Obsidian's vault
+API and the LocalSync SQLite database, restores the existing mnemonic into a
+fresh local DB, and restarts sync from remote history. Use it when a local peer's
+LocalSync DB is corrupted or its local cursor/state needs to be rebuilt from
+remote history; wiping the local files first prevents stale vault content from
+being seeded into the fresh DB. The wipe does not recursively delete dotfiles or
+adapter-only `.obsidian` paths.
 
 ### 5) LRU Memory Control
 We keep at most `maxOpenDocs` Yjs docs in memory.

@@ -9,7 +9,7 @@ import {
   type ButtonComponent,
 } from "obsidian";
 
-import { createEvoluClient, generateMnemonic } from "./evoluClient";
+import { createEvoluClient, generateMnemonic, type CloseEvoluDb } from "./evoluClient";
 import type { PlatformIO } from "./sqliteDriver";
 import { Mnemonic } from "@evolu/common";
 import type { Evolu } from "@evolu/common";
@@ -18,9 +18,11 @@ import {
   YjsEvoluHistoryEngine,
   type EngineConfig,
   type LogLevel,
+  type SyncProgress,
 } from "../src-core/engine";
 import {
   DEFAULT_LOCAL_SYNC_CONFIG,
+  isTrackedVaultFile,
   type LocalSyncConfig,
 } from "../src-core/pathPolicy";
 import { formatLogLine } from "../src-core/logFormat";
@@ -257,12 +259,53 @@ function logError(message: string, data?: unknown) {
   console.error(formatLogLine("ERROR", message, data));
 }
 
+function exactArrayBuffer(data: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(data);
+  return copy.buffer;
+}
+
+type ResetProgress = {
+  message: string;
+  current?: number;
+  total?: number;
+};
+
+type ResetProgressReporter = (progress: ResetProgress) => void;
+
+function createProgressNoticeFragment(progress: ResetProgress): DocumentFragment {
+  const fragment = document.createDocumentFragment();
+  const container = document.createElement("div");
+  container.addClass("localsync-progress-notice");
+
+  const label = document.createElement("div");
+  label.textContent = progress.message;
+  container.appendChild(label);
+
+  if (progress.total !== undefined) {
+    const bar = document.createElement("progress");
+    bar.max = progress.total;
+    bar.value = progress.current ?? 0;
+    container.appendChild(bar);
+
+    const detail = document.createElement("div");
+    detail.addClass("localsync-progress-detail");
+    detail.textContent = `${progress.current ?? 0} / ${progress.total}`;
+    container.appendChild(detail);
+  }
+
+  fragment.appendChild(container);
+  return fragment;
+}
+
+const SYNC_PROGRESS_NOTICE_MIN_ROWS = 5;
+
 export default class ObsidianLocalSyncPlugin extends Plugin {
   settings!: PluginSettings;
 
   evolu!: Evolu<Database>;
-  closeEvoluDb: (() => Promise<void>) | null = null;
-  engine!: YjsEvoluHistoryEngine;
+  closeEvoluDb: CloseEvoluDb | null = null;
+  engine: YjsEvoluHistoryEngine | null = null;
   mnemonicCache: Mnemonic | null = null;
 
   /**
@@ -271,6 +314,10 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
    * before registering vault event handlers or starting the poll loop.
    */
   private _unloaded = false;
+  private suppressVaultEvents = false;
+  private syncProgressNotice: Notice | null = null;
+  private syncProgressHideTimer: number | null = null;
+  private syncProgressStatus: SyncProgress["status"] = "caught-up";
 
   async onload() {
     // Wait for any previous instance to fully stop before starting a new one.
@@ -340,7 +387,31 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
         }
       },
       writeFile: async (data: Uint8Array) => {
-        await this.app.vault.adapter.writeBinary(dbPath, data.buffer as ArrayBuffer);
+        const tempPath = `${dbPath}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+        const adapter = this.app.vault.adapter;
+        await adapter.writeBinary(tempPath, exactArrayBuffer(data));
+        try {
+          await adapter.rename(tempPath, dbPath);
+        } catch (renameError) {
+          // Some mobile adapters do not replace existing files on rename.
+          // Fall back to remove+rename; less atomic, but still avoids leaving a
+          // partially-written target when replacement rename is supported.
+          try {
+            if (await adapter.exists(dbPath)) await adapter.remove(dbPath);
+            await adapter.rename(tempPath, dbPath);
+          } catch (fallbackError) {
+            try {
+              if (await adapter.exists(tempPath)) await adapter.remove(tempPath);
+            } catch {
+              // Best effort cleanup only.
+            }
+            throw fallbackError instanceof Error ? fallbackError : renameError;
+          }
+        }
+      },
+      deleteFile: async () => {
+        const adapter = this.app.vault.adapter;
+        if (await adapter.exists(dbPath)) await adapter.remove(dbPath);
       },
     };
   }
@@ -395,6 +466,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       config: toEngineConfig(this.settings),
       localSyncConfig: toLocalSyncConfig(this.settings),
       logLevel: this.settings.logLevel,
+      reportSyncProgress: (progress) => this.handleSyncProgress(progress),
     });
 
     await this.engine.start();
@@ -403,7 +475,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // Without this check a superseded instance would register vault event
     // handlers that outlive the instance, firing into a stopped engine.
     if (this._unloaded) {
-      void this.engine.stop();
+      void this.engine?.stop();
       return;
     }
 
@@ -412,24 +484,27 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // ----------------------------
     this.registerEvent(
       this.app.vault.on("modify", async (file) => {
+        if (this.suppressVaultEvents) return;
         if (file instanceof TFile) {
-          await this.engine.onVaultFileChanged(file.path);
+          await this.engine?.onVaultFileChanged(file.path);
         }
       }),
     );
 
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
+        if (this.suppressVaultEvents) return;
         if (file instanceof TFile) {
-          void this.engine.onVaultFileDeleted(file.path);
+          void this.engine?.onVaultFileDeleted(file.path);
         }
       }),
     );
 
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
+        if (this.suppressVaultEvents) return;
         if (file instanceof TFile) {
-          void this.engine.onVaultFileRenamed(oldPath, file.path);
+          void this.engine?.onVaultFileRenamed(oldPath, file.path);
         }
       }),
     );
@@ -438,18 +513,18 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // Active / inactive tracking
     // ----------------------------
     this.registerDomEvent(window, "focus", () => {
-      void this.engine.setActive();
+      void this.engine?.setActive();
     });
 
     this.registerDomEvent(window, "blur", () => {
-      this.engine.setInactive();
+      this.engine?.setInactive();
     });
 
     this.registerDomEvent(document, "visibilitychange", () => {
       if (document.visibilityState === "visible") {
-        void this.engine.setActive();
+        void this.engine?.setActive();
       } else {
-        this.engine.setInactive();
+        this.engine?.setInactive();
       }
     });
   }
@@ -471,6 +546,12 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     _previousInstanceStop = _previousInstanceStop.then(() =>
       (this.engine?.stop() ?? Promise.resolve()).then(() => this.closeEvoluDb?.()),
     );
+    if (this.syncProgressHideTimer != null) {
+      window.clearTimeout(this.syncProgressHideTimer);
+      this.syncProgressHideTimer = null;
+    }
+    this.syncProgressNotice?.hide();
+    this.syncProgressNotice = null;
   }
 
   async loadSettings() {
@@ -524,7 +605,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
 
   async applyEngineConfigFromSettings() {
     await this.saveSettings();
-    await this.engine.updateConfig(toEngineConfig(this.settings));
+    await this.engine?.updateConfig(toEngineConfig(this.settings));
   }
 
   async applyLocalSyncConfigFromSettings() {
@@ -535,7 +616,12 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     this.settings.periodicRescanSeconds = normalizeNonNegativeInt(this.settings.periodicRescanSeconds);
     this.settings.settingsRescanSeconds = normalizeNonNegativeInt(this.settings.settingsRescanSeconds);
     await this.saveSettings();
-    this.engine.updateLocalSyncConfig(toLocalSyncConfig(this.settings));
+    this.engine?.updateLocalSyncConfig(toLocalSyncConfig(this.settings));
+  }
+
+  async applyLogLevelFromSettings() {
+    await this.saveSettings();
+    this.engine?.setLogLevel(this.settings.logLevel);
   }
 
   /**
@@ -550,7 +636,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
    * setTimeout(0) forces those microtasks to flush before the caller proceeds.
    */
   async prepareForOwnerChange() {
-    await this.engine.stop(false);
+    await this.engine?.stop(false);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
 
@@ -589,9 +675,163 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       config: toEngineConfig(this.settings),
       localSyncConfig: toLocalSyncConfig(this.settings),
       logLevel: this.settings.logLevel,
+      reportSyncProgress: (progress) => this.handleSyncProgress(progress),
     });
     await this.engine.start();
   }
+
+  private handleSyncProgress(progress: SyncProgress) {
+    if (this._unloaded) return;
+
+    const shouldShow =
+      progress.status !== "syncing" ||
+      (progress.total ?? 0) >= SYNC_PROGRESS_NOTICE_MIN_ROWS ||
+      this.syncProgressNotice !== null;
+    if (!shouldShow) return;
+
+    if (progress.status === "caught-up" && this.syncProgressStatus === "caught-up") {
+      return;
+    }
+    this.syncProgressStatus = progress.status;
+
+    if (this.syncProgressHideTimer != null) {
+      window.clearTimeout(this.syncProgressHideTimer);
+      this.syncProgressHideTimer = null;
+    }
+
+    if (progress.status === "caught-up" && !this.syncProgressNotice) return;
+
+    if (!this.syncProgressNotice) {
+      this.syncProgressNotice = new Notice(createProgressNoticeFragment(progress), 0);
+    } else {
+      this.syncProgressNotice.setMessage(createProgressNoticeFragment(progress));
+    }
+
+    if (progress.status === "caught-up") {
+      this.syncProgressHideTimer = window.setTimeout(() => {
+        this.syncProgressNotice?.hide();
+        this.syncProgressNotice = null;
+        this.syncProgressHideTimer = null;
+        this.syncProgressStatus = "caught-up";
+      }, 3500);
+    }
+  }
+
+  async resetLocalSyncState(reportProgress?: ResetProgressReporter): Promise<number> {
+    const mnemonic =
+      this.mnemonicCache ??
+      (await this.evolu.appOwner)?.mnemonic;
+    if (!mnemonic) {
+      throw new Error("Cannot reset LocalSync state: no Evolu owner mnemonic found");
+    }
+
+    return this.recreateLocalStateWithMnemonic(mnemonic, "existing", reportProgress);
+  }
+
+  async restoreMnemonicWithLocalWipe(
+    mnemonic: Mnemonic,
+    reportProgress?: ResetProgressReporter,
+  ): Promise<number> {
+    return this.recreateLocalStateWithMnemonic(mnemonic, "restored", reportProgress);
+  }
+
+  private async recreateLocalStateWithMnemonic(
+    mnemonic: Mnemonic,
+    mnemonicLabel: "existing" | "restored",
+    reportProgress?: ResetProgressReporter,
+  ): Promise<number> {
+    reportProgress?.({ message: "Stopping LocalSync engine..." });
+    await this.engine?.stop(false);
+
+    const deleted = await this.wipeSyncedVaultFiles(reportProgress);
+
+    reportProgress?.({ message: "Closing local database..." });
+    await this.closeEvoluDb?.({ flush: false });
+    this.closeEvoluDb = null;
+
+    reportProgress?.({ message: "Deleting local database..." });
+    const io = this.buildIO(this.settings.appName);
+    await io.deleteFile?.();
+
+    reportProgress?.({ message: "Creating fresh local database..." });
+    const { evolu, closeDb } = createEvoluClient(
+      this.settings.appName,
+      this.settings.relayUrl,
+      io,
+      { forceNew: true },
+    );
+    this.evolu = evolu;
+    this.closeEvoluDb = closeDb;
+    reportProgress?.({ message: `Restoring ${mnemonicLabel} mnemonic...` });
+    await this.evolu.restoreAppOwner(mnemonic, { reload: false });
+    this.mnemonicCache = mnemonic;
+    reportProgress?.({ message: "Restarting sync..." });
+    await this.restartEngine();
+    reportProgress?.({ message: `Reset complete. Deleted ${deleted} local file(s).` });
+    return deleted;
+  }
+
+  private async wipeSyncedVaultFiles(reportProgress?: ResetProgressReporter): Promise<number> {
+    const config = toLocalSyncConfig(this.settings);
+    const paths = new Set<string>();
+
+    for (const file of this.app.vault.getFiles()) {
+      if (isTrackedVaultFile(file, config)) paths.add(file.path);
+    }
+
+    this.suppressVaultEvents = true;
+    try {
+      let deleted = 0;
+      const failed: string[] = [];
+      const orderedPaths = Array.from(paths).sort().reverse();
+      reportProgress?.({
+        message: orderedPaths.length > 0 ? "Deleting synced vault files..." : "No synced vault files to delete.",
+        current: 0,
+        total: orderedPaths.length,
+      });
+
+      for (let index = 0; index < orderedPaths.length; index++) {
+        const path = orderedPaths[index];
+        try {
+          if (!(await this.app.vault.adapter.exists(path))) {
+            reportProgress?.({
+              message: "Deleting synced vault files...",
+              current: index + 1,
+              total: orderedPaths.length,
+            });
+            continue;
+          }
+          await this.app.vault.adapter.remove(path);
+          if (await this.app.vault.adapter.exists(path)) {
+            failed.push(path);
+            reportProgress?.({
+              message: "Deleting synced vault files...",
+              current: index + 1,
+              total: orderedPaths.length,
+            });
+            continue;
+          }
+          deleted++;
+        } catch (error) {
+          failed.push(path);
+          logError("LocalSync synced vault file wipe failed", { path, error });
+        }
+        reportProgress?.({
+          message: "Deleting synced vault files...",
+          current: index + 1,
+          total: orderedPaths.length,
+        });
+      }
+      logWarn("LocalSync synced vault files wiped", { deleted, failed: failed.length });
+      if (failed.length > 0) {
+        throw new Error(`Failed to delete ${failed.length} synced vault file(s)`);
+      }
+      return deleted;
+    } finally {
+      this.suppressVaultEvents = false;
+    }
+  }
+
 }
 
 class LocalSyncSettingTab extends PluginSettingTab {
@@ -631,8 +871,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
 
         dd.onChange(async (value) => {
           this.plugin.settings.logLevel = value as LogLevel;
-          await this.plugin.saveSettings();
-          this.plugin.engine.setLogLevel(this.plugin.settings.logLevel);
+          await this.plugin.applyLogLevelFromSettings();
           new Notice(`Log level set to ${value}`);
         });
       });
@@ -1048,6 +1287,8 @@ class LocalSyncSettingTab extends PluginSettingTab {
         });
       });
 
+    containerEl.createEl("h3", { text: "Danger zone" });
+
     // -- Restore --
     let restoreValue = "";
     let restorePending = false;
@@ -1063,7 +1304,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
 
     markWide(new Setting(containerEl))
       .setName("Restore mnemonic")
-      .setDesc("Paste your 24-word key to restore an existing identity on this device.")
+      .setDesc("Deletes this device's synced local files and LocalSync database, then restores the pasted identity.")
       .addTextArea((ta) => {
         ta.setPlaceholder("word1 word2 word3 …");
         ta.inputEl.rows = 2;
@@ -1076,7 +1317,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
         btn_restore = btn;
         btn
           .setButtonText("Restore")
-          .setCta()
+          .setWarning()
           .onClick(async () => {
             if (!restoreValue) {
               new Notice("Paste your mnemonic first");
@@ -1087,14 +1328,28 @@ class LocalSyncSettingTab extends PluginSettingTab {
               restorePending = false;
               restoreReady = false;
               btn.setButtonText("Restore");
-              await this.plugin.prepareForOwnerChange();
-              const parsed = Mnemonic.orThrow(restoreValue);
-              await this.plugin.evolu.restoreAppOwner(parsed, { reload: false });
-              this.plugin.mnemonicCache = parsed;
-              logInfo("Evolu owner restored");
-              await this.plugin.restartEngine();
-              new Notice("Owner restored — engine restarted.");
-              this.display();
+              const progressNotice = new Notice(
+                createProgressNoticeFragment({ message: "Starting mnemonic restore..." }),
+                0,
+              );
+              try {
+                const parsed = Mnemonic.orThrow(restoreValue);
+                const deleted = await this.plugin.restoreMnemonicWithLocalWipe(parsed, (progress) => {
+                  progressNotice.setMessage(createProgressNoticeFragment(progress));
+                });
+                logInfo("Evolu owner restored with local wipe");
+                progressNotice.setMessage(
+                  createProgressNoticeFragment({
+                    message: `Owner restored. Deleted ${deleted} local file(s), sync restarted.`,
+                  }),
+                );
+                window.setTimeout(() => progressNotice.hide(), 5000);
+                this.display();
+              } catch (e) {
+                logError("Mnemonic restore failed", e);
+                progressNotice.setMessage("Mnemonic restore failed — check console.");
+                window.setTimeout(() => progressNotice.hide(), 8000);
+              }
               return;
             }
             // If waiting period is in progress — ignore
@@ -1110,11 +1365,10 @@ class LocalSyncSettingTab extends PluginSettingTab {
             btn.setButtonText("Please wait 5s…");
             new Notice(
               hasFiles
-                ? "⚠️ Your vault has existing notes. Restoring into a non-empty vault will " +
-                  "CRDT-merge local and synced content — files at the same path on both " +
-                  "sides will have their text concatenated. " +
+                ? "⚠️ This will delete local synced vault files, restore the pasted mnemonic, " +
+                  "and rebuild from remote history. " +
                   "Confirm restore in 5 seconds."
-                : "⚠️ Restoring mnemonic — confirm in 5 seconds.",
+                : "⚠️ Restoring mnemonic and rebuilding local sync state — confirm in 5 seconds.",
               5000,
             );
             window.setTimeout(() => {
@@ -1130,7 +1384,76 @@ class LocalSyncSettingTab extends PluginSettingTab {
           });
       });
 
-    // -- Reset --
+    // -- Reset local sync state --
+    let localResetPending = false;
+    let localResetReady = false;
+
+    const resetLocalResetState = () => {
+      localResetPending = false;
+      localResetReady = false;
+      btn_local_reset.setButtonText("Reset local state");
+    };
+
+    let btn_local_reset: ButtonComponent;
+
+    new Setting(containerEl)
+      .setName("Reset local sync state")
+      .setDesc("Deletes this device's synced vault files and LocalSync database, then restarts sync with the existing mnemonic.")
+      .addButton((btn) => {
+        btn_local_reset = btn;
+        btn
+          .setWarning()
+          .setButtonText("Reset local state")
+          .onClick(async () => {
+            if (localResetReady) {
+              localResetPending = false;
+              localResetReady = false;
+              btn.setButtonText("Reset local state");
+              const progressNotice = new Notice(
+                createProgressNoticeFragment({ message: "Starting local reset..." }),
+                0,
+              );
+              try {
+                const deleted = await this.plugin.resetLocalSyncState((progress) => {
+                  progressNotice.setMessage(createProgressNoticeFragment(progress));
+                });
+                logWarn("LocalSync local state reset");
+                progressNotice.setMessage(
+                  createProgressNoticeFragment({
+                    message: `LocalSync state reset complete. Deleted ${deleted} local file(s).`,
+                  }),
+                );
+                window.setTimeout(() => progressNotice.hide(), 5000);
+                this.display();
+              } catch (e) {
+                logError("LocalSync local state reset failed", e);
+                progressNotice.setMessage("LocalSync state reset failed — check console.");
+                window.setTimeout(() => progressNotice.hide(), 8000);
+              }
+              return;
+            }
+            if (localResetPending) return;
+
+            localResetPending = true;
+            localResetReady = false;
+            btn.setButtonText("Please wait 5s…");
+            new Notice(
+              "This deletes synced vault files and the LocalSync database on this device only. Confirm reset in 5 seconds.",
+              5000,
+            );
+            window.setTimeout(() => {
+              if (localResetPending) {
+                localResetReady = true;
+                btn.setButtonText("Confirm local reset?");
+                window.setTimeout(() => {
+                  if (localResetPending && localResetReady) resetLocalResetState();
+                }, 10000);
+              }
+            }, 5000);
+          });
+      });
+
+    // -- Reset owner --
     let resetPending = false;
     let resetReady = false;
 

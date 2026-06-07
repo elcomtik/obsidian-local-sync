@@ -23,6 +23,7 @@ const SAVE_DEBOUNCE_MS = 5_000;
 export type PlatformIO = {
   readFile: () => Promise<Uint8Array | null>;
   writeFile: (data: Uint8Array) => Promise<void>;
+  deleteFile?: () => Promise<void>;
 };
 
 /**
@@ -62,11 +63,22 @@ export function createPersistentSqlJsDriver(
     // an old driver instance overwriting the new instance's saved state.
     let isFlushed = false;
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
+    let writeChain: Promise<void> = Promise.resolve();
+    let writeGeneration = 0;
+
+    function persistToDisk(data: Uint8Array, force = false): Promise<void> {
+      const generation = writeGeneration;
+      writeChain = writeChain.then(async () => {
+        if (!force && (isDisposed || isFlushed || generation !== writeGeneration)) return;
+        await io.writeFile(data);
+      });
+      return writeChain;
+    }
 
     function saveToDisk(): void {
       if (isDisposed || isFlushed) return;
       const data = db.export();
-      io.writeFile(data).catch((e) => {
+      persistToDisk(data).catch((e) => {
         console.error(logFormatter("ERROR", "Failed to save database", e));
       });
     }
@@ -99,14 +111,25 @@ export function createPersistentSqlJsDriver(
       isFlushed = true; // Seal before IO — prevents new saves from arming.
       const data = db.export();
       try {
-        await io.writeFile(data);
+        await persistToDisk(data, true);
       } catch (e) {
         console.error(logFormatter("ERROR", "Failed to save database", e));
       }
     }
 
+    function discardPendingWrites(): void {
+      if (isDisposed) return;
+      if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+      }
+      isFlushed = true;
+      writeGeneration++;
+    }
+
     return {
       flush: flushToDisk,
+      discard: discardPendingWrites,
 
       exec: (query, isMutation) => {
         // After dispose the sql.js DB is closed; return empty results rather
@@ -150,7 +173,7 @@ export function createPersistentSqlJsDriver(
         if (!isFlushed) {
           // Export before closing DB, then write asynchronously.
           const data = db.export();
-          io.writeFile(data).catch((e) => {
+          persistToDisk(data).catch((e) => {
             console.error(logFormatter("ERROR", "Failed to save database", e));
           });
         }

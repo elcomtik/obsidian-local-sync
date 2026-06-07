@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.3.1 — 2026-06-07
+
+### Added
+
+- **Danger zone local state reset**:
+  added a two-step confirmed action that deletes this device's tracked synced
+  vault files and LocalSync SQLite database, restores the existing mnemonic into
+  a fresh DB, and restarts sync from remote history. This gives mobile peers a
+  UI path to recover from local DB corruption without manually deleting plugin
+  files from the vault. The wipe removes files directly through the vault
+  adapter, verifies they are gone, and reports the deleted count. The destructive
+  file wipe is limited to tracked files returned by Obsidian's vault API; it does
+  not recursively delete dotfiles or adapter-only `.obsidian` paths.
+
+- **Danger zone grouping for mnemonic restore**:
+  moved Restore mnemonic under the dangerous actions group alongside local state
+  reset and owner reset.
+
+- **Wipe-first mnemonic restore**:
+  restoring a mnemonic now deletes this device's tracked synced vault files and
+  LocalSync database before restoring the pasted identity. This prevents stale
+  local vault content from being seeded or merged into the restored owner. The
+  file wipe uses only Obsidian-indexed vault files, not recursive adapter
+  traversal.
+
+- **Local reset progress notice**:
+  the local state reset and mnemonic restore actions now show a persistent
+  progress notification for engine stop, synced file deletion, local DB reset,
+  mnemonic restore, and sync restart. During file deletion it displays a
+  progress bar and deleted-file count.
+
+- **Normal sync progress notice**:
+  remote-history catch-up now shows a persistent progress notification while
+  LocalSync is applying incoming rows, including a warning not to edit until the
+  local copy catches up. The notice switches to caught-up status and then hides.
+
+- **Restore mnemonic warning style**:
+  the Restore mnemonic button now uses the same warning styling as the local
+  state reset button.
+
+### Fixed
+
+- **Atomic plugin DB persistence**:
+  plugin SQLite exports now write to a temporary file and rename it into place,
+  with serialized writes to prevent older exports from racing newer ones. This
+  matches the daemon's atomic persistence model more closely and reduces the
+  risk of truncated DB files on mobile adapters.
+
+- **History cursor checkpoint safety**:
+  `pollHistoryOnce` now advances `_historyCursor` only through contiguous
+  history rows that were actually handled. Missing `fileUpdate` /
+  `settingUpdate` content rows or failed remote vault writes stop the batch and
+  leave the cursor before the failed row so the next poll retries instead of
+  permanently skipping data.
+
 ## 0.3.0 — 2026-06-05
 
 ### Added
