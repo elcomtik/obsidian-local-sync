@@ -18,6 +18,7 @@ import {
   YjsEvoluHistoryEngine,
   type EngineConfig,
   type LogLevel,
+  type MaterializationRepairResult,
   type SyncProgress,
 } from "../src-core/engine";
 import {
@@ -296,6 +297,16 @@ function createProgressNoticeFragment(progress: ResetProgress): DocumentFragment
 
   fragment.appendChild(container);
   return fragment;
+}
+
+function formatMaterializationRepairSummary(result: MaterializationRepairResult): string {
+  const planned = result.files.planned + result.settings.planned;
+  const written = result.files.written + result.settings.written;
+  const deleted = result.files.deleted + result.settings.deleted;
+  const unchanged = result.files.unchanged + result.settings.unchanged;
+  const skipped = result.files.skippedLocalDrift + result.settings.skippedLocalDrift;
+  const failed = result.files.failed + result.settings.failed;
+  return `Materialization repair done: planned ${planned}, wrote ${written}, deleted ${deleted}, unchanged ${unchanged}, skipped local drift ${skipped}, failed ${failed}.`;
 }
 
 const SYNC_PROGRESS_NOTICE_MIN_ROWS = 5;
@@ -622,6 +633,13 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
   async applyLogLevelFromSettings() {
     await this.saveSettings();
     this.engine?.setLogLevel(this.settings.logLevel);
+  }
+
+  async runMaterializationRepairNow(): Promise<MaterializationRepairResult> {
+    if (!this.engine) {
+      throw new Error("LocalSync engine is not running");
+    }
+    return this.engine.runMaterializationRepairNow();
   }
 
   /**
@@ -1001,6 +1019,31 @@ class LocalSyncSettingTab extends PluginSettingTab {
         ta.onChange(async (value) => {
           this.plugin.settings.excludeGlobs = value.split(/\r?\n/);
           await this.plugin.applyLocalSyncConfigFromSettings();
+        });
+      });
+
+    containerEl.createEl("h3", { text: "Maintenance" });
+
+    new Setting(containerEl)
+      .setName("Materialization repair")
+      .setDesc("Rebuild local files from synced LocalSync rows now. Files with local drift are skipped.")
+      .addButton((btn) => {
+        btn.setButtonText("Run now").onClick(async () => {
+          btn.setDisabled(true);
+          btn.setButtonText("Running...");
+          const notice = new Notice("Running LocalSync materialization repair...", 0);
+          try {
+            const result = await this.plugin.runMaterializationRepairNow();
+            notice.setMessage(formatMaterializationRepairSummary(result));
+            window.setTimeout(() => notice.hide(), 8000);
+          } catch (error) {
+            logError("Manual materialization repair failed", error);
+            notice.setMessage("Materialization repair failed. Check console.");
+            window.setTimeout(() => notice.hide(), 8000);
+          } finally {
+            btn.setButtonText("Run now");
+            btn.setDisabled(false);
+          }
         });
       });
 

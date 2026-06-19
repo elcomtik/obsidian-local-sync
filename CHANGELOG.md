@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.4.0 — 2026-06-19
+
+### Added
+
+- **Query-driven materialization**:
+  LocalSync now materializes note and settings projections from subscribed
+  `fileUpdate` / `settingUpdate` table queries instead of relying on an
+  application-owned `_historyCursor` over Evolu's internal history table. This
+  avoids missing late-replicated rows whose internal timestamp is older than the
+  saved cursor.
+
+- **Local materialization checkpoints**:
+  added local-only `_fileMaterialization` and `_settingMaterialization` tables
+  that store per-path signatures for the synced rows already materialized on
+  this device. Signatures include ordered row IDs and operation type so content
+  and delete ordering changes re-run only the affected path.
+
+- **Manual materialization repair**:
+  added a Maintenance action in plugin settings to force a drift-safe
+  materialization pass on demand. It rebuilds local projections from synced
+  LocalSync rows, writes only when disk still matches the local snapshot, skips
+  local drift, and reports planned/written/deleted/unchanged/skipped/failed
+  counts.
+
+### Fixed
+
+- **Stale local projections after late replication**:
+  files whose `fileUpdate` rows were present locally but never materialized are
+  now detected by the subscribed table materializer and repaired without a
+  periodic snapshot-vs-history sweep.
+
+- **Open document materialization**:
+  clean open Yjs documents can now be closed, materialized from synced rows, and
+  kept open with their outgoing update listener intact. Locally drifted open
+  files are skipped.
+
 ## 0.3.1 — 2026-06-07
 
 ### Added

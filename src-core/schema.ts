@@ -7,6 +7,8 @@ export const FileSnapshotId = Evolu.id("FileSnapshot");
 export const SettingUpdateId = Evolu.id("SettingUpdate");
 export const SettingSnapshotId = Evolu.id("SettingSnapshot");
 export const HistoryCursorId = Evolu.id("HistoryCursor");
+export const FileMaterializationId = Evolu.id("FileMaterialization");
+export const SettingMaterializationId = Evolu.id("SettingMaterialization");
 
 export const Schema = {
   // -------- synced --------
@@ -45,6 +47,18 @@ export const Schema = {
   _historyCursor: {
     id: HistoryCursorId,
     lastTimestamp: Evolu.nullOr(TimestampBytes)
+  },
+
+  _fileMaterialization: {
+    id: FileMaterializationId,
+    path: Evolu.NonEmptyString1000,
+    signature: Evolu.NonEmptyString
+  },
+
+  _settingMaterialization: {
+    id: SettingMaterializationId,
+    path: Evolu.NonEmptyString1000,
+    signature: Evolu.NonEmptyString
   }
 } as const;
 
