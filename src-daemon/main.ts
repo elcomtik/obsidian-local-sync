@@ -80,6 +80,9 @@ const usePolling = readBoolean("LOCALSYNC_USE_POLLING", false);
 const pollIntervalMs = readPositiveInt("LOCALSYNC_POLL_INTERVAL_MS", 1000);
 const ownerReadTimeoutMs = readPositiveInt("LOCALSYNC_OWNER_READ_TIMEOUT_MS", 30_000);
 const logFormatter = createDaemonLogFormatter("obsidian-local-sync", {});
+const ATOMIC_DB_TEMP_MAX_AGE_MS = readPositiveInt("LOCALSYNC_DB_TEMP_MAX_AGE_MS", 15 * 60_000);
+
+await cleanupStaleAtomicTempFiles(dbPath, ATOMIC_DB_TEMP_MAX_AGE_MS);
 
 const io: PlatformIO = {
   async readFile() {
@@ -91,6 +94,7 @@ const io: PlatformIO = {
     }
   },
   async writeFile(data) {
+    await cleanupStaleAtomicTempFiles(dbPath, ATOMIC_DB_TEMP_MAX_AGE_MS);
     await writeFileAtomic(dbPath, data);
   },
 };
@@ -352,8 +356,53 @@ async function fileExists(filePath: string): Promise<boolean> {
 async function writeFileAtomic(filePath: string, data: string | Uint8Array): Promise<void> {
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(tempPath, data);
-  await fs.rename(tempPath, filePath);
+  try {
+    await fs.writeFile(tempPath, data);
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function cleanupStaleAtomicTempFiles(filePath: string, maxAgeMs: number): Promise<void> {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const now = Date.now();
+  let deleted = 0;
+  let reclaimedBytes = 0;
+
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch (error) {
+    if (isMissingFile(error)) return;
+    throw error;
+  }
+
+  for (const entry of entries) {
+    if (!entry.startsWith(`${base}.`) || !entry.endsWith(".tmp")) continue;
+    const tempPath = path.join(dir, entry);
+    try {
+      const stat = await fs.stat(tempPath);
+      if (!stat.isFile()) continue;
+      if (now - stat.mtimeMs < maxAgeMs) continue;
+      await fs.rm(tempPath, { force: true });
+      deleted++;
+      reclaimedBytes += stat.size;
+    } catch (error) {
+      if (!isMissingFile(error)) logWarn("Failed to cleanup stale DB temp file", { path: tempPath, error });
+    }
+  }
+
+  if (deleted > 0) {
+    logInfo("Cleaned stale DB temp files", {
+      dir,
+      deleted,
+      reclaimedBytes,
+      maxAgeMs,
+    });
+  }
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {

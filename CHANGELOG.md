@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1 — 2026-06-20
+
+### Fixed
+
+- **Stale SQLite temp files after interrupted writes**:
+  the daemon and plugin now clean old `obsidian-local-sync.db.*.tmp` files
+  before DB writes, and failed atomic writes remove their own temp file
+  immediately. The daemon also cleans stale DB temp files on startup, preventing
+  old files left by OOM kills or hard restarts from filling the vault PVC.
+
 ## 0.4.0 — 2026-06-19
 
 ### Added

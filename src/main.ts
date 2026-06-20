@@ -7,6 +7,7 @@ import {
   Setting,
   TFile,
   type ButtonComponent,
+  type DataAdapter,
 } from "obsidian";
 
 import { createEvoluClient, generateMnemonic, type CloseEvoluDb } from "./evoluClient";
@@ -119,6 +120,7 @@ const OBSOLETE_VAULT_EXCLUDE_GLOBS = new Set([
 ]);
 
 const SETTINGS_SYNC_RESCAN_SECONDS = 30;
+const ATOMIC_DB_TEMP_MAX_AGE_MS = 15 * 60_000;
 
 function toEngineConfig(s: PluginSettings): EngineConfig {
   return {
@@ -266,6 +268,59 @@ function exactArrayBuffer(data: Uint8Array): ArrayBuffer {
   return copy.buffer;
 }
 
+function normalizedDirname(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? "" : path.slice(0, slash);
+}
+
+function normalizedBasename(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? path : path.slice(slash + 1);
+}
+
+async function cleanupStaleAdapterTempFiles(
+  adapter: DataAdapter,
+  filePath: string,
+  maxAgeMs = ATOMIC_DB_TEMP_MAX_AGE_MS,
+): Promise<void> {
+  const dir = normalizedDirname(filePath);
+  const base = normalizedBasename(filePath);
+  const now = Date.now();
+  let deleted = 0;
+  let reclaimedBytes = 0;
+
+  let listed;
+  try {
+    listed = await adapter.list(dir);
+  } catch {
+    return;
+  }
+
+  for (const tempPath of listed.files) {
+    const name = normalizedBasename(tempPath);
+    if (!name.startsWith(`${base}.`) || !name.endsWith(".tmp")) continue;
+
+    try {
+      const stat = await adapter.stat(tempPath);
+      if (!stat || now - stat.mtime < maxAgeMs) continue;
+      await adapter.remove(tempPath);
+      deleted++;
+      reclaimedBytes += stat.size;
+    } catch (error) {
+      logWarn("Failed to cleanup stale DB temp file", { path: tempPath, error });
+    }
+  }
+
+  if (deleted > 0) {
+    logInfo("Cleaned stale DB temp files", {
+      dir,
+      deleted,
+      reclaimedBytes,
+      maxAgeMs,
+    });
+  }
+}
+
 type ResetProgress = {
   message: string;
   current?: number;
@@ -400,24 +455,29 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       writeFile: async (data: Uint8Array) => {
         const tempPath = `${dbPath}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
         const adapter = this.app.vault.adapter;
-        await adapter.writeBinary(tempPath, exactArrayBuffer(data));
+        await cleanupStaleAdapterTempFiles(adapter, dbPath);
         try {
-          await adapter.rename(tempPath, dbPath);
-        } catch (renameError) {
-          // Some mobile adapters do not replace existing files on rename.
-          // Fall back to remove+rename; less atomic, but still avoids leaving a
-          // partially-written target when replacement rename is supported.
+          await adapter.writeBinary(tempPath, exactArrayBuffer(data));
           try {
-            if (await adapter.exists(dbPath)) await adapter.remove(dbPath);
             await adapter.rename(tempPath, dbPath);
-          } catch (fallbackError) {
+          } catch (renameError) {
+            // Some mobile adapters do not replace existing files on rename.
+            // Fall back to remove+rename; less atomic, but still avoids leaving a
+            // partially-written target when replacement rename is supported.
             try {
-              if (await adapter.exists(tempPath)) await adapter.remove(tempPath);
-            } catch {
-              // Best effort cleanup only.
+              if (await adapter.exists(dbPath)) await adapter.remove(dbPath);
+              await adapter.rename(tempPath, dbPath);
+            } catch (fallbackError) {
+              throw fallbackError instanceof Error ? fallbackError : renameError;
             }
-            throw fallbackError instanceof Error ? fallbackError : renameError;
           }
+        } catch (error) {
+          try {
+            if (await adapter.exists(tempPath)) await adapter.remove(tempPath);
+          } catch {
+            // Best effort cleanup only.
+          }
+          throw error;
         }
       },
       deleteFile: async () => {
