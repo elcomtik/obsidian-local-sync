@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.3 — 2026-06-21
+
+### Fixed
+
+- **Large vault startup OOM after materializer repair**:
+  the daemon filesystem adapter now prunes excluded directories such as
+  `.git/**` while walking the vault, startup scan skip details are debug-only,
+  and file materialization waits until startup scan finishes reconciling local
+  drift. This prevents `.git` object enumeration and stops the startup scan
+  from racing the materializer on thousands of drifted files.
+
 ## 0.4.2 — 2026-06-21
 
 ### Fixed

@@ -543,14 +543,14 @@ export class YjsEvoluHistoryEngine {
         if (decision.reason === "extension") {
           const key = decision.extension || "(none)";
           skippedByExtension.set(key, (skippedByExtension.get(key) ?? 0) + 1);
-          if (label === "Startup scan") this.logInfo(`${label}: skipped file`, {
+          if (this.logLevel === "debug") this.logDebug(`${label}: skipped file`, {
             path: file.path,
             reason: decision.reason,
             extension: key,
           });
         } else {
           skippedByRule.set(decision.rule, (skippedByRule.get(decision.rule) ?? 0) + 1);
-          if (label === "Startup scan") this.logInfo(`${label}: skipped file`, {
+          if (this.logLevel === "debug") this.logDebug(`${label}: skipped file`, {
             path: file.path,
             reason: decision.reason,
             rule: decision.rule,
@@ -591,6 +591,9 @@ export class YjsEvoluHistoryEngine {
       this.scanComplete = true; // allow drain even if scan errored
     } finally {
       this.isScanningVault = false;
+      if (label === "Startup scan") {
+        void this.refreshFileMaterializationPlans("startup scan complete");
+      }
     }
   }
 
@@ -1216,6 +1219,9 @@ export class YjsEvoluHistoryEngine {
 
   private async refreshFileMaterializationPlans(label: string) {
     if (this.isStopped || !this.isActive) return;
+    if (this.localSyncConfig.startupScan && !this.scanComplete) {
+      return;
+    }
     if (this.fileMaterializationRefreshRunning) {
       this.scheduleFileMaterializationRefresh(label);
       return;

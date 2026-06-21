@@ -144,7 +144,7 @@ function globToRegex(glob: string): string {
   return out;
 }
 
-function getPathRuleDecision(path: string, rules: string[]): { included: boolean; rule: string } {
+export function getPathRuleDecision(path: string, rules: string[]): { included: boolean; rule: string } {
   let included = true;
   let matchedRule = "";
 

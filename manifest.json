@@ -1,7 +1,7 @@
 {
   "id": "obsidian-local-sync",
   "name": "LocalSync",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "minAppVersion": "1.0.0",
   "description": "Local-first CRDT-based incremental sync for Obsidian using Yjs and Evolu.",
   "author": "Roman Danko",

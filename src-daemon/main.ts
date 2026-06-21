@@ -10,6 +10,7 @@ import {
 import {
   DEFAULT_LOCAL_SYNC_CONFIG,
   getExtension,
+  getPathRuleDecision,
   isTrackedSettingPath,
   isTrackedVaultPath,
   type LocalSyncConfig,
@@ -133,7 +134,9 @@ evolu.subscribeError(() => {
   }
 });
 
-const vault = new NodeFsVaultAdapter(vaultRoot);
+const vault = new NodeFsVaultAdapter(vaultRoot, (vaultPath) =>
+  getPathRuleDecision(vaultPath, localSyncConfig.excludeGlobs).included,
+);
 const engine = new YjsEvoluHistoryEngine({
   vault,
   evolu,

@@ -5,9 +5,11 @@ import { getExtension } from "../src-core/pathPolicy";
 
 export class NodeFsVaultAdapter implements VaultAdapter {
   private root: string;
+  private shouldDescendDirectory: (vaultPath: string) => boolean;
 
-  constructor(root: string) {
+  constructor(root: string, shouldDescendDirectory: (vaultPath: string) => boolean = () => true) {
     this.root = path.resolve(root);
+    this.shouldDescendDirectory = shouldDescendDirectory;
   }
 
   async listFiles(): Promise<VaultFile[]> {
@@ -18,6 +20,8 @@ export class NodeFsVaultAdapter implements VaultAdapter {
       for (const entry of entries) {
         const absolutePath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
+          const vaultPath = this.toVaultPath(absolutePath);
+          if (!this.shouldDescendDirectory(vaultPath)) continue;
           await walk(absolutePath);
           continue;
         }

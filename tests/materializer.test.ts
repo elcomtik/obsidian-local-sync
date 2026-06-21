@@ -157,6 +157,36 @@ test("file materializer does not replan unchanged signatures blocked by local dr
   assert.equal((await privateEngine.collectFileMaterializationPlans(true)).length, 1);
 });
 
+test("file materializer refresh waits for startup scan completion", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const engine = makeEngine(makeVault(files, calls));
+
+  const privateEngine = engine as unknown as {
+    scanComplete: boolean;
+    refreshFileMaterializationPlans(label: string): Promise<void>;
+    collectFileMaterializationPlans(force: boolean): Promise<Array<{ path: string; ids: string[]; signature: string; latestType: string | null }>>;
+    fileMaterializationQueue: Set<string>;
+    fileMaterializationPlans: Map<string, { path: string; ids: string[]; signature: string; latestType: string | null }>;
+  };
+
+  let collectCalls = 0;
+  privateEngine.collectFileMaterializationPlans = async () => {
+    collectCalls++;
+    return [{ path: "a.md", ids: ["a"], signature: "a", latestType: null }];
+  };
+
+  privateEngine.scanComplete = false;
+  await privateEngine.refreshFileMaterializationPlans("subscription during startup scan");
+  assert.equal(collectCalls, 0);
+  assert.equal(privateEngine.fileMaterializationQueue.size, 0);
+
+  privateEngine.scanComplete = true;
+  await privateEngine.refreshFileMaterializationPlans("startup scan complete");
+  assert.equal(collectCalls, 1);
+  assert.equal(privateEngine.fileMaterializationPlans.has("a.md"), true);
+});
+
 test("file materializer materializes clean open doc and keeps local update listener", async () => {
   const path = "reviews/weekly-review-template.md";
   const files = new Map([[path, "old"]]);
