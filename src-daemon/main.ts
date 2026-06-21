@@ -102,7 +102,7 @@ const io: PlatformIO = {
   },
 };
 
-let { evolu, closeDb } = createEvoluClient(appName, relayUrl, io, {
+let { evolu, closeDb, persistDb } = createEvoluClient(appName, relayUrl, io, {
   logFormatter,
   sqliteDriverOptions: { saveDebounceMs: dbSaveDebounceMs },
 });
@@ -120,7 +120,7 @@ if (mnemonic) {
     logInfo("Restoring daemon owner from LOCALSYNC_MNEMONIC");
     await evolu.restoreAppOwner(Mnemonic.orThrow(mnemonic), { reload: false });
     await closeDb();
-    ({ evolu, closeDb } = createEvoluClient(appName, relayUrl, io, {
+    ({ evolu, closeDb, persistDb } = createEvoluClient(appName, relayUrl, io, {
       forceNew: true,
       logFormatter,
       sqliteDriverOptions: { saveDebounceMs: dbSaveDebounceMs },
@@ -150,6 +150,7 @@ const engine = new YjsEvoluHistoryEngine({
   localSyncConfig,
   logLevel,
   logFormatter,
+  persistLocalDb: persistDb,
 });
 
 await engine.start();

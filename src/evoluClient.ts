@@ -58,8 +58,9 @@ function createEvoluConsole(logFormatter: LogFormatter) {
  * unload to persist the history cursor.
  */
 export type CloseEvoluDb = (options?: { flush?: boolean }) => Promise<void>;
+export type PersistEvoluDb = () => Promise<void>;
 
-let _cached: { evolu: Evolu<Database>; close: CloseEvoluDb } | null = null;
+let _cached: { evolu: Evolu<Database>; close: CloseEvoluDb; persist: PersistEvoluDb } | null = null;
 
 /**
  * Returns the Evolu client for `appName` / `relayUrl`, creating it on the
@@ -84,10 +85,11 @@ export function createEvoluClient(
   }: { forceNew?: boolean; logFormatter?: LogFormatter; sqliteDriverOptions?: SqlJsDriverOptions } = {},
 ) {
   if (_cached && !forceNew) {
-    return { evolu: _cached.evolu, closeDb: _cached.close };
+    return { evolu: _cached.evolu, closeDb: _cached.close, persistDb: _cached.persist };
   }
 
   let flush: () => Promise<void> = async () => {};
+  let persist: () => Promise<void> = async () => {};
   let discard: () => void = () => {};
 
   const evoluConsole = createEvoluConsole(logFormatter);
@@ -95,6 +97,7 @@ export function createEvoluClient(
   const wrappedFactory: CreateSqliteDriver = async (_name, options) => {
     const driver = await innerFactory(_name, options);
     flush = async () => { await (driver as any).flush?.(); };
+    persist = async () => { await (driver as any).persist?.(); };
     discard = () => { (driver as any).discard?.(); };
     return driver;
   };
@@ -138,8 +141,11 @@ export function createEvoluClient(
     }
     await flush();
   };
-  _cached = { evolu, close: closeDb };
-  return { evolu, closeDb };  // closeDb: () => Promise<void>
+  const persistDb: PersistEvoluDb = async () => {
+    await persist();
+  };
+  _cached = { evolu, close: closeDb, persist: persistDb };
+  return { evolu, closeDb, persistDb };  // closeDb: () => Promise<void>
 }
 
 /**

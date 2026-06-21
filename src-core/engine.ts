@@ -135,6 +135,17 @@ function hashText(text: string): string {
   return hash.toString(16).padStart(16, "0");
 }
 
+function hashTextToClientId(text: string): number {
+  const id = Number.parseInt(hashText(text).slice(0, 8), 16) >>> 0;
+  return id === 0 ? 1 : id;
+}
+
+function getLocalSyncOutgoingId(origin: unknown): string | null {
+  if (!origin || typeof origin !== "object") return null;
+  const id = (origin as { localSyncOutgoingId?: unknown }).localSyncOutgoingId;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
 async function encodeSettingContent(text: string): Promise<{
   contentBase64: string;
   encoding: string | null;
@@ -267,6 +278,7 @@ type FileState = {
 
   // outgoing update batching
   pendingUpdates: Uint8Array[];
+  pendingOutgoingId: string | null;
   flushTimer: ReturnType<typeof setTimeout> | null;
 
 };
@@ -337,6 +349,7 @@ export class YjsEvoluHistoryEngine {
   private logLevel: LogLevel;
   private formatLogLine: LogFormatter = formatLogLine;
   private reportSyncProgress?: SyncProgressReporter;
+  private persistLocalDb?: () => Promise<void>;
 
   private states = new Map<string, FileState>();
 
@@ -446,6 +459,7 @@ export class YjsEvoluHistoryEngine {
     logLevel: LogLevel;
     logFormatter?: LogFormatter;
     reportSyncProgress?: SyncProgressReporter;
+    persistLocalDb?: () => Promise<void>;
   }) {
     this.vault = args.vault;
     this.evolu = args.evolu;
@@ -455,6 +469,7 @@ export class YjsEvoluHistoryEngine {
     this.logLevel = args.logLevel;
     this.formatLogLine = args.logFormatter ?? formatLogLine;
     this.reportSyncProgress = args.reportSyncProgress;
+    this.persistLocalDb = args.persistLocalDb;
   }
 
   // ---------- logging helpers ----------
@@ -1332,6 +1347,7 @@ export class YjsEvoluHistoryEngine {
         lastVaultText: historyText,
         ignoreNextVaultModify: false,
         pendingUpdates: [],
+        pendingOutgoingId: null,
         flushTimer: null,
       });
       await this.saveFileMaterializationSignature(plan.path, plan.signature);
@@ -2463,6 +2479,7 @@ export class YjsEvoluHistoryEngine {
       lastVaultText,
       ignoreNextVaultModify,
       pendingUpdates: [],
+      pendingOutgoingId: null,
       flushTimer: null,
     };
 
@@ -2470,6 +2487,12 @@ export class YjsEvoluHistoryEngine {
       // Skip updates applied from the materializer/poll path. Those remote
       // updates must not be echoed back to the network.
       if (origin === "remote") return;
+      const outgoingId = getLocalSyncOutgoingId(origin);
+      if (outgoingId) {
+        st.pendingOutgoingId = st.pendingUpdates.length === 0 ? outgoingId : null;
+      } else {
+        st.pendingOutgoingId = null;
+      }
       st.pendingUpdates.push(u);
       this.scheduleOutgoingFlush(path, st);
     });
@@ -2516,17 +2539,38 @@ export class YjsEvoluHistoryEngine {
     if (snapshotBase64 && lastVaultText) {
       const yjsText = text.toString();
       if (yjsText !== lastVaultText) {
+        const snapshotHash = hashText(snapshotBase64);
+        const vaultHash = hashText(lastVaultText);
+        const outgoingId = createIdFromString<"FileUpdate">(
+          `catchup:${path}:${this.deviceId}:${snapshotHash}:${vaultHash}`,
+        );
+        const previousClientId = doc.clientID;
+        doc.clientID = hashTextToClientId(`catchup-client:${path}:${this.deviceId}:${snapshotHash}:${vaultHash}`);
         this.logInfo("getOrLoadFileState: vault drifted from snapshot, applying catch-up diff", {
           path,
           yjsLen: yjsText.length,
           vaultLen: lastVaultText.length,
         });
-        doc.transact(() => {
-          applyRebasedTextChangeToYText(text, yjsText, lastVaultText);
-        });
+        try {
+          doc.transact(() => {
+            applyRebasedTextChangeToYText(text, yjsText, lastVaultText);
+          }, { localSyncOutgoingId: outgoingId });
+        } finally {
+          doc.clientID = previousClientId;
+        }
       }
     } else if (!snapshotBase64 && lastVaultText && seedFromVault) {
-      doc.transact(() => text.insert(0, lastVaultText));
+      const vaultHash = hashText(lastVaultText);
+      const outgoingId = createIdFromString<"FileUpdate">(
+        `seed:${path}:${this.deviceId}:${vaultHash}`,
+      );
+      const previousClientId = doc.clientID;
+      doc.clientID = hashTextToClientId(`seed-client:${path}:${this.deviceId}:${vaultHash}`);
+      try {
+        doc.transact(() => text.insert(0, lastVaultText), { localSyncOutgoingId: outgoingId });
+      } finally {
+        doc.clientID = previousClientId;
+      }
     }
 
     this.states.set(path, st);
@@ -2641,17 +2685,21 @@ export class YjsEvoluHistoryEngine {
       const merged = Y.mergeUpdates(st.pendingUpdates);
 
       const updateBase64 = toBase64(merged);
-      const id = createIdFromString<"FileUpdate">(
-        `upd:${path}:${this.deviceId}:${Date.now()}:${Math.random()}`,
-      );
+      const id = st.pendingOutgoingId
+        ? (st.pendingOutgoingId as any)
+        : createIdFromString<"FileUpdate">(
+            `upd:${path}:${this.deviceId}:${Date.now()}:${Math.random()}`,
+          );
 
       this.evolu.upsert("fileUpdate", { id, path, updateBase64 });
       this.outgoingIds.add(id);
       st.pendingUpdates = [];
+      st.pendingOutgoingId = null;
 
       this.logInfo("Sent outgoing update", { path, bytes: merged.length });
 
       await this.saveLocalSnapshot(path, st);
+      await this.persistLocalDb?.();
       return true;
     } catch (e) {
       this.logError("flushOutgoingUpdates failed", { path, error: e });

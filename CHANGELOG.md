@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.5 — 2026-06-21
+
+### Fixed
+
+- **Repeated startup catch-up corruption during crashloops**:
+  startup drift catch-up and initial seed operations now use deterministic
+  `fileUpdate` row IDs and deterministic Yjs client IDs derived from the file
+  path, device ID, local snapshot hash, and vault text hash. If a daemon crashes
+  before persisting its updated snapshot, the next restart emits the same update
+  bytes into the same row instead of creating a fresh Yjs operation for the same
+  textual diff. This prevents duplicated catch-up edits from multiplying content
+  such as repeated frontmatter permalink prefixes.
+- **Outgoing update durability window**:
+  after a vault-origin `fileUpdate` is written, LocalSync now persists the local
+  sql.js database immediately after saving the matching `_fileSnapshot`. This
+  keeps local snapshot state durable even when the daemon is OOM-killed before
+  the normal database save debounce fires.
+
 ## 0.4.4 — 2026-06-21
 
 ### Fixed

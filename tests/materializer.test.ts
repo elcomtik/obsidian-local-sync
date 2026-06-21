@@ -14,7 +14,7 @@ function makeYjsTextDoc(content: string): { doc: Y.Doc; text: Y.Text } {
   return { doc, text };
 }
 
-function makeEngine(vault: VaultAdapter): YjsEvoluHistoryEngine {
+function makeEngine(vault: VaultAdapter, persistLocalDb?: () => Promise<void>): YjsEvoluHistoryEngine {
   return new YjsEvoluHistoryEngine({
     vault,
     evolu: {
@@ -35,6 +35,7 @@ function makeEngine(vault: VaultAdapter): YjsEvoluHistoryEngine {
     },
     localSyncConfig: DEFAULT_LOCAL_SYNC_CONFIG,
     logLevel: "off",
+    persistLocalDb,
   });
 }
 
@@ -185,6 +186,73 @@ test("file materializer refresh waits for startup scan completion", async () => 
   await privateEngine.refreshFileMaterializationPlans("startup scan complete");
   assert.equal(collectCalls, 1);
   assert.equal(privateEngine.fileMaterializationPlans.has("a.md"), true);
+});
+
+test("startup catch-up emits deterministic updates for repeated same drift", async () => {
+  const path = "addressbook/Andrej Slebodnik.md";
+  const snapshotDoc = makeYjsTextDoc("old");
+  const snapshotBase64 = Buffer.from(Y.encodeStateAsUpdate(snapshotDoc.doc)).toString("base64");
+  snapshotDoc.doc.destroy();
+
+  const collectCatchUp = async () => {
+    const files = new Map([[path, "old plus"]]);
+    const calls = { writes: [] as string[], deletes: [] as string[] };
+    const fileUpdates: Array<{ id: string; path: string; updateBase64: string }> = [];
+    const engine = makeEngine(makeVault(files, calls));
+
+    const privateEngine = engine as unknown as {
+      evolu: { upsert(table: string, row: Record<string, unknown>): void };
+      getOrLoadFileState(path: string): Promise<unknown>;
+      closeDoc(path: string): Promise<boolean>;
+      loadLocalSnapshot(path: string): Promise<string | null>;
+    };
+
+    privateEngine.evolu.upsert = (table, row) => {
+      if (table === "fileUpdate") {
+        fileUpdates.push({
+          id: row.id as string,
+          path: row.path as string,
+          updateBase64: row.updateBase64 as string,
+        });
+      }
+    };
+    privateEngine.loadLocalSnapshot = async () => snapshotBase64;
+
+    await privateEngine.getOrLoadFileState(path);
+    await privateEngine.closeDoc(path);
+
+    assert.equal(fileUpdates.length, 1);
+    return fileUpdates[0];
+  };
+
+  assert.deepEqual(await collectCatchUp(), await collectCatchUp());
+});
+
+test("outgoing file flush persists local db after snapshot", async () => {
+  const path = "reviews/weekly-review-template.md";
+  const files = new Map([[path, "old plus"]]);
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const events: string[] = [];
+  const engine = makeEngine(makeVault(files, calls), async () => {
+    events.push("persist");
+  });
+
+  const privateEngine = engine as unknown as {
+    evolu: { upsert(table: string, row: Record<string, unknown>): void };
+    loadLocalSnapshot(path: string): Promise<string | null>;
+    getOrLoadFileState(path: string): Promise<unknown>;
+    closeDoc(path: string): Promise<boolean>;
+  };
+
+  privateEngine.evolu.upsert = (table) => {
+    events.push(table);
+  };
+  privateEngine.loadLocalSnapshot = async () => null;
+
+  await privateEngine.getOrLoadFileState(path);
+  await privateEngine.closeDoc(path);
+
+  assert.deepEqual(events, ["fileUpdate", "_fileSnapshot", "persist", "_fileSnapshot"]);
 });
 
 test("file materializer materializes clean open doc and keeps local update listener", async () => {

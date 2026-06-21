@@ -10,7 +10,7 @@ import {
   type DataAdapter,
 } from "obsidian";
 
-import { createEvoluClient, generateMnemonic, type CloseEvoluDb } from "./evoluClient";
+import { createEvoluClient, generateMnemonic, type CloseEvoluDb, type PersistEvoluDb } from "./evoluClient";
 import type { PlatformIO } from "./sqliteDriver";
 import { Mnemonic } from "@evolu/common";
 import type { Evolu } from "@evolu/common";
@@ -371,6 +371,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
 
   evolu!: Evolu<Database>;
   closeEvoluDb: CloseEvoluDb | null = null;
+  persistEvoluDb: PersistEvoluDb | null = null;
   engine: YjsEvoluHistoryEngine | null = null;
   mnemonicCache: Mnemonic | null = null;
 
@@ -491,13 +492,14 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // ----------------------------
     // Create Evolu client
     // ----------------------------
-    const { evolu, closeDb } = createEvoluClient(
+    const { evolu, closeDb, persistDb } = createEvoluClient(
       this.settings.appName,
       this.settings.relayUrl,
       this.buildIO(this.settings.appName),
     );
     this.evolu = evolu;
     this.closeEvoluDb = closeDb;
+    this.persistEvoluDb = persistDb;
 
     if (this.settings.logLevel !== "off") {
       logInfo("Evolu client created", {
@@ -538,6 +540,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       localSyncConfig: toLocalSyncConfig(this.settings),
       logLevel: this.settings.logLevel,
       reportSyncProgress: (progress) => this.handleSyncProgress(progress),
+      persistLocalDb: this.persistEvoluDb,
     });
 
     await this.engine.start();
@@ -735,9 +738,10 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // Flush the new DB state (written by restoreAppOwner) to disk.
     await this.closeEvoluDb?.();
     this.closeEvoluDb = null;
+    this.persistEvoluDb = null;
 
     // Recreate the Evolu client: fresh DB connection + new relay WebSocket.
-    const { evolu, closeDb } = createEvoluClient(
+    const { evolu, closeDb, persistDb } = createEvoluClient(
       this.settings.appName,
       this.settings.relayUrl,
       this.buildIO(this.settings.appName),
@@ -745,6 +749,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     );
     this.evolu = evolu;
     this.closeEvoluDb = closeDb;
+    this.persistEvoluDb = persistDb;
 
     this.engine = new YjsEvoluHistoryEngine({
       vault: new ObsidianVaultAdapter(this.app.vault),
@@ -754,6 +759,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       localSyncConfig: toLocalSyncConfig(this.settings),
       logLevel: this.settings.logLevel,
       reportSyncProgress: (progress) => this.handleSyncProgress(progress),
+      persistLocalDb: this.persistEvoluDb,
     });
     await this.engine.start();
   }
@@ -826,13 +832,14 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     reportProgress?.({ message: "Closing local database..." });
     await this.closeEvoluDb?.({ flush: false });
     this.closeEvoluDb = null;
+    this.persistEvoluDb = null;
 
     reportProgress?.({ message: "Deleting local database..." });
     const io = this.buildIO(this.settings.appName);
     await io.deleteFile?.();
 
     reportProgress?.({ message: "Creating fresh local database..." });
-    const { evolu, closeDb } = createEvoluClient(
+    const { evolu, closeDb, persistDb } = createEvoluClient(
       this.settings.appName,
       this.settings.relayUrl,
       io,
@@ -840,6 +847,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     );
     this.evolu = evolu;
     this.closeEvoluDb = closeDb;
+    this.persistEvoluDb = persistDb;
     reportProgress?.({ message: `Restoring ${mnemonicLabel} mnemonic...` });
     await this.evolu.restoreAppOwner(mnemonic, { reload: false });
     this.mnemonicCache = mnemonic;

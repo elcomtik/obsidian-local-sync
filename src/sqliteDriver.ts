@@ -36,7 +36,8 @@ export type SqlJsDriverOptions = {
  *
  * 1. On open: loads the existing DB file via `io.readFile()`, or starts fresh.
  * 2. After each mutation: arms a {@link SAVE_DEBOUNCE_MS}-ms debounce write.
- * 3. On `flush()`: cancels the debounce and immediately awaits the write.
+ * 3. On `persist()`: immediately awaits a write without sealing the driver.
+ * 4. On `flush()`: cancels the debounce and immediately awaits the write.
  *    Call this on plugin unload to guarantee the cursor and recent mutations
  *    are persisted before the process can be interrupted.
  *
@@ -123,6 +124,16 @@ export function createPersistentSqlJsDriver(
       }
     }
 
+    async function persistCurrentState(): Promise<void> {
+      if (isDisposed || isFlushed) return;
+      const data = db.export();
+      try {
+        await persistToDisk(data, true);
+      } catch (e) {
+        console.error(logFormatter("ERROR", "Failed to save database", e));
+      }
+    }
+
     function discardPendingWrites(): void {
       if (isDisposed) return;
       if (saveTimer) {
@@ -134,6 +145,7 @@ export function createPersistentSqlJsDriver(
     }
 
     return {
+      persist: persistCurrentState,
       flush: flushToDisk,
       discard: discardPendingWrites,
 
