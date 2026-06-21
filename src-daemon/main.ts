@@ -38,6 +38,7 @@ const logLevelRank: Record<LogLevel, number> = {
 };
 const DAEMON_DEFAULT_EXCLUDE_GLOBS = [
   ".git/**",
+  ".obsidian/plugins/obsidian-local-sync/**",
   ".trash/**",
   ".DS_Store",
   "*.tmp",

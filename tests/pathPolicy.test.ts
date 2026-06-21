@@ -15,13 +15,13 @@ test("default policy tracks Markdown, text, and canvas files", () => {
   assert.equal(isTrackedVaultPath("boards/a.canvas"), true);
 });
 
-test("default policy has no path excludes and skips non-content extensions", () => {
+test("default policy excludes local metadata before extension checks", () => {
   assert.deepEqual(getTrackingDecision({ path: ".git/config" }), {
     tracked: false,
-    reason: "extension",
-    extension: "",
+    reason: "excludeRule",
+    rule: ".git/**",
   });
-  assert.equal(isTrackedVaultPath(".git/ignored.md"), true);
+  assert.equal(isTrackedVaultPath(".git/ignored.md"), false);
   assert.equal(isTrackedVaultPath(".trash/deleted.md"), true);
   assert.deepEqual(getTrackingDecision({ path: ".obsidian/workspace.json" }), {
     tracked: false,
@@ -30,12 +30,12 @@ test("default policy has no path excludes and skips non-content extensions", () 
   });
   assert.deepEqual(getTrackingDecision({ path: ".obsidian/plugins/obsidian-local-sync/obsidian-local-sync.db" }), {
     tracked: false,
-    reason: "extension",
-    extension: "db",
+    reason: "excludeRule",
+    rule: ".obsidian/plugins/obsidian-local-sync/**",
   });
 });
 
-test("extension allow-list runs before exclude rules", () => {
+test("exclude rules run before extension allow-list", () => {
   const decision = getTrackingDecision({ path: ".trash/deleted.json" }, {
     ...DEFAULT_LOCAL_SYNC_CONFIG,
     includeExtensions: ["json"],
@@ -62,8 +62,8 @@ test("later negated exclude rules re-include matching paths", () => {
 
   assert.deepEqual(getTrackingDecision({ path: ".obsidian/plugins/plugin/main.js" }, config), {
     tracked: false,
-    reason: "extension",
-    extension: "js",
+    reason: "excludeRule",
+    rule: ".obsidian/**",
   });
   assert.equal(isTrackedVaultPath(".obsidian/appearance.json", config), false);
   assert.equal(isTrackedVaultPath(".obsidian/app.json", config), true);

@@ -32,6 +32,8 @@ const levelRank: Record<LogLevel, number> = {
   debug: 4,
 };
 
+const MATERIALIZER_REFRESH_DEBOUNCE_MS = 250;
+
 /**
  * Runtime configuration for {@link YjsEvoluHistoryEngine}.
  * All values are hot-swappable via {@link YjsEvoluHistoryEngine.updateConfig}.
@@ -413,6 +415,13 @@ export class YjsEvoluHistoryEngine {
   private settingMaterializerRunning = false;
   private fileMaterializerInitialized = false;
   private settingMaterializerInitialized = false;
+  private fileMaterializationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private settingMaterializationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private fileMaterializationRefreshRunning = false;
+  private settingMaterializationRefreshRunning = false;
+  private fileMaterializationRefreshQueuedLabel: string | null = null;
+  private settingMaterializationRefreshQueuedLabel: string | null = null;
+  private fileMaterializationBlockedSignatures = new Map<string, string>();
 
   /**
    * A minimal empty Yjs update (full state of a new empty Y.Doc), base64-encoded.
@@ -835,6 +844,7 @@ export class YjsEvoluHistoryEngine {
       this.stopPollingTimer();
       this.stopRescanTimer();
       this.stopMaterializerSubscriptions();
+      this.stopMaterializerRefreshTimers();
       // Wait for any in-progress materialization work to finish before closing
       // open docs and flushing the database.
       await this.ongoingPoll;
@@ -948,6 +958,7 @@ export class YjsEvoluHistoryEngine {
   /** Updates path policy used by scans, vault events, and remote write/delete handling. */
   updateLocalSyncConfig(config: LocalSyncConfig) {
     this.localSyncConfig = config;
+    this.fileMaterializationBlockedSignatures.clear();
     this.stopRescanTimer();
     this.startRescanTimer();
     void this.refreshFileMaterializationPlans("path policy updated");
@@ -1015,6 +1026,7 @@ export class YjsEvoluHistoryEngine {
     }
 
     if (!isTrackedVaultPath(path, this.localSyncConfig)) return;
+    this.fileMaterializationBlockedSignatures.delete(path);
 
     try {
       const newVaultText = await this.vault.readText(path);
@@ -1083,12 +1095,12 @@ export class YjsEvoluHistoryEngine {
 
     this.unsubscribers.push(
       this.evolu.subscribeQuery(fileQuery)(() => {
-        void this.refreshFileMaterializationPlans("fileUpdate subscription");
+        this.scheduleFileMaterializationRefresh("fileUpdate subscription");
       }),
     );
     this.unsubscribers.push(
       this.evolu.subscribeQuery(settingQuery)(() => {
-        void this.refreshSettingMaterializationPlans("settingUpdate subscription");
+        this.scheduleSettingMaterializationRefresh("settingUpdate subscription");
       }),
     );
 
@@ -1105,6 +1117,47 @@ export class YjsEvoluHistoryEngine {
       }
     }
     this.unsubscribers = [];
+  }
+
+  private stopMaterializerRefreshTimers() {
+    if (this.fileMaterializationRefreshTimer != null) {
+      clearTimeout(this.fileMaterializationRefreshTimer);
+      this.fileMaterializationRefreshTimer = null;
+    }
+    if (this.settingMaterializationRefreshTimer != null) {
+      clearTimeout(this.settingMaterializationRefreshTimer);
+      this.settingMaterializationRefreshTimer = null;
+    }
+  }
+
+  private scheduleFileMaterializationRefresh(label: string) {
+    if (this.isStopped) return;
+    this.fileMaterializationRefreshQueuedLabel = this.fileMaterializationRefreshQueuedLabel
+      ? "multiple fileUpdate subscription events"
+      : label;
+    if (this.fileMaterializationRefreshTimer != null) return;
+
+    this.fileMaterializationRefreshTimer = setTimeout(() => {
+      this.fileMaterializationRefreshTimer = null;
+      const queuedLabel = this.fileMaterializationRefreshQueuedLabel ?? label;
+      this.fileMaterializationRefreshQueuedLabel = null;
+      void this.refreshFileMaterializationPlans(queuedLabel);
+    }, MATERIALIZER_REFRESH_DEBOUNCE_MS);
+  }
+
+  private scheduleSettingMaterializationRefresh(label: string) {
+    if (this.isStopped) return;
+    this.settingMaterializationRefreshQueuedLabel = this.settingMaterializationRefreshQueuedLabel
+      ? "multiple settingUpdate subscription events"
+      : label;
+    if (this.settingMaterializationRefreshTimer != null) return;
+
+    this.settingMaterializationRefreshTimer = setTimeout(() => {
+      this.settingMaterializationRefreshTimer = null;
+      const queuedLabel = this.settingMaterializationRefreshQueuedLabel ?? label;
+      this.settingMaterializationRefreshQueuedLabel = null;
+      void this.refreshSettingMaterializationPlans(queuedLabel);
+    }, MATERIALIZER_REFRESH_DEBOUNCE_MS);
   }
 
   private createFileUpdateMetaQuery() {
@@ -1155,6 +1208,7 @@ export class YjsEvoluHistoryEngine {
       const signature = this.createMaterializationSignature(signaturePartsByPath.get(path) ?? ids);
       const savedSignature = await this.loadFileMaterializationSignature(path);
       if (!force && savedSignature === signature) continue;
+      if (!force && this.fileMaterializationBlockedSignatures.get(path) === signature) continue;
       plans.push({ path, ids, signature, latestType });
     }
     return plans;
@@ -1162,7 +1216,12 @@ export class YjsEvoluHistoryEngine {
 
   private async refreshFileMaterializationPlans(label: string) {
     if (this.isStopped || !this.isActive) return;
+    if (this.fileMaterializationRefreshRunning) {
+      this.scheduleFileMaterializationRefresh(label);
+      return;
+    }
 
+    this.fileMaterializationRefreshRunning = true;
     try {
       const plans = await this.collectFileMaterializationPlans(false);
       for (const plan of plans) {
@@ -1180,6 +1239,8 @@ export class YjsEvoluHistoryEngine {
       void this.handleHistoryQuietTick();
     } catch (error) {
       this.logError("refreshFileMaterializationPlans failed", { label, error });
+    } finally {
+      this.fileMaterializationRefreshRunning = false;
     }
   }
 
@@ -1212,6 +1273,7 @@ export class YjsEvoluHistoryEngine {
       const currentText = await this.vault.readText(plan.path);
       const snapshotText = await this.loadLocalSnapshotText(plan.path);
       if (currentText !== null && snapshotText !== currentText) {
+        this.fileMaterializationBlockedSignatures.set(plan.path, plan.signature);
         this.logWarn("File materializer skipped delete due to local drift", { path: plan.path });
         return "skipped-local-drift";
       }
@@ -1228,6 +1290,7 @@ export class YjsEvoluHistoryEngine {
         }
       }
       await this.saveFileMaterializationSignature(plan.path, plan.signature);
+      this.fileMaterializationBlockedSignatures.delete(plan.path);
       this.logInfo("File materializer applied delete", { path: plan.path });
       return currentText !== null ? "deleted" : "unchanged";
     }
@@ -1235,6 +1298,7 @@ export class YjsEvoluHistoryEngine {
     const currentText = await this.vault.readText(plan.path);
     const snapshotText = await this.loadLocalSnapshotText(plan.path);
     if (currentText !== null && snapshotText !== currentText) {
+      this.fileMaterializationBlockedSignatures.set(plan.path, plan.signature);
       this.logWarn("File materializer skipped update due to local drift", { path: plan.path });
       return "skipped-local-drift";
     }
@@ -1261,6 +1325,7 @@ export class YjsEvoluHistoryEngine {
         flushTimer: null,
       });
       await this.saveFileMaterializationSignature(plan.path, plan.signature);
+      this.fileMaterializationBlockedSignatures.delete(plan.path);
       materialized.doc.destroy();
       return "unchanged";
     }
@@ -1281,6 +1346,7 @@ export class YjsEvoluHistoryEngine {
     this.states.set(plan.path, repairState);
     await this.saveLocalSnapshot(plan.path, repairState);
     await this.saveFileMaterializationSignature(plan.path, plan.signature);
+    this.fileMaterializationBlockedSignatures.delete(plan.path);
     this.pendingVaultSeed.delete(plan.path);
     this.logInfo("File materializer wrote vault file", {
       path: plan.path,
@@ -1333,7 +1399,12 @@ export class YjsEvoluHistoryEngine {
       this.settingMaterializerInitialized = true;
       return;
     }
+    if (this.settingMaterializationRefreshRunning) {
+      this.scheduleSettingMaterializationRefresh(label);
+      return;
+    }
 
+    this.settingMaterializationRefreshRunning = true;
     try {
       const plans = await this.collectSettingMaterializationPlans(false);
 
@@ -1352,6 +1423,8 @@ export class YjsEvoluHistoryEngine {
       void this.handleHistoryQuietTick();
     } catch (error) {
       this.logError("refreshSettingMaterializationPlans failed", { label, error });
+    } finally {
+      this.settingMaterializationRefreshRunning = false;
     }
   }
 
@@ -2595,6 +2668,7 @@ export class YjsEvoluHistoryEngine {
     }
 
     if (!isTrackedVaultPath(path, this.localSyncConfig)) return;
+    this.fileMaterializationBlockedSignatures.delete(path);
     if (this.pendingRemoteDeletes.has(path)) return; // remote-initiated trash — suppress echo
     if (!this.localSyncConfig.syncDeletes) return;
     try {
@@ -2665,6 +2739,8 @@ export class YjsEvoluHistoryEngine {
       }
 
       this.pendingVaultSeed.delete(oldPath);
+      this.fileMaterializationBlockedSignatures.delete(oldPath);
+      this.fileMaterializationBlockedSignatures.delete(newPath);
       this.tombstoneSnapshot(oldPath);
 
       // Propagate the deletion of the old path.

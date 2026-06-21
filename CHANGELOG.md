@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.2 — 2026-06-21
+
+### Fixed
+
+- **Materializer startup OOM loop**:
+  coalesced `fileUpdate` / `settingUpdate` subscription refreshes, prevented
+  unchanged locally drifted file signatures from being replanned forever, and
+  excluded `.git/**` plus LocalSync's own plugin data before extension checks.
+  Large vaults no longer repeatedly enqueue the full materialization backlog
+  while startup scan is still reconciling local drift.
+
 ## 0.4.1 — 2026-06-20
 
 ### Fixed

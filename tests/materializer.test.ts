@@ -129,6 +129,34 @@ test("file materializer skips update when vault diverged from snapshot", async (
   assert.equal(files.get(path), "local edit");
 });
 
+test("file materializer does not replan unchanged signatures blocked by local drift", async () => {
+  const path = "reviews/weekly-review-template.md";
+  const files = new Map([[path, "local edit"]]);
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const engine = makeEngine(makeVault(files, calls));
+
+  const privateEngine = engine as unknown as {
+    fileMaterializationBlockedSignatures: Map<string, string>;
+    collectFileMaterializationPlans(force: boolean): Promise<Array<{ path: string; ids: string[]; signature: string; latestType: string | null }>>;
+    loadFileMaterializationSignature(path: string): Promise<string | null>;
+    evolu: { loadQuery(query: unknown): Promise<unknown[]> };
+  };
+
+  privateEngine.evolu.loadQuery = async () => [
+    { id: "row-1", path, type: null },
+    { id: "row-2", path, type: null },
+  ];
+  privateEngine.loadFileMaterializationSignature = async () => null;
+
+  const firstPlans = await privateEngine.collectFileMaterializationPlans(false);
+  assert.equal(firstPlans.length, 1);
+
+  privateEngine.fileMaterializationBlockedSignatures.set(path, firstPlans[0].signature);
+
+  assert.deepEqual(await privateEngine.collectFileMaterializationPlans(false), []);
+  assert.equal((await privateEngine.collectFileMaterializationPlans(true)).length, 1);
+});
+
 test("file materializer materializes clean open doc and keeps local update listener", async () => {
   const path = "reviews/weekly-review-template.md";
   const files = new Map([[path, "old"]]);

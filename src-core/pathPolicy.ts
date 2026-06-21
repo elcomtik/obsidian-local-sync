@@ -19,7 +19,10 @@ export type TrackingDecision =
 
 export const DEFAULT_LOCAL_SYNC_CONFIG: LocalSyncConfig = {
   includeExtensions: ["md", "txt", "canvas"],
-  excludeGlobs: [],
+  excludeGlobs: [
+    ".git/**",
+    ".obsidian/plugins/obsidian-local-sync/**",
+  ],
   syncObsidianSettings: false,
   settingsIncludeGlobs: [
     ".obsidian/**/*.json",
@@ -54,14 +57,14 @@ export function getTrackingDecision(
   file: Pick<VaultFile, "path" | "extension">,
   config: LocalSyncConfig = DEFAULT_LOCAL_SYNC_CONFIG,
 ): TrackingDecision {
-  const extension = (file.extension ?? getExtension(file.path) ?? "").toLowerCase();
-  if (!config.includeExtensions.includes(extension)) {
-    return { tracked: false, reason: "extension", extension };
-  }
-
   const pathDecision = getPathRuleDecision(file.path, config.excludeGlobs);
   if (!pathDecision.included) {
     return { tracked: false, reason: "excludeRule", rule: pathDecision.rule };
+  }
+
+  const extension = (file.extension ?? getExtension(file.path) ?? "").toLowerCase();
+  if (!config.includeExtensions.includes(extension)) {
+    return { tracked: false, reason: "extension", extension };
   }
 
   return { tracked: true };
