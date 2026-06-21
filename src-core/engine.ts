@@ -575,6 +575,10 @@ export class YjsEvoluHistoryEngine {
           deferred++;
         } else if (result === "loaded") {
           loaded++;
+          if (label === "Startup scan") {
+            await this.closeDoc(file.path);
+            this.states.delete(file.path);
+          }
         }
       }
 

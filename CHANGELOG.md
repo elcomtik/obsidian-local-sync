@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.4 — 2026-06-21
+
+### Fixed
+
+- **Startup drift catch-up OOM in large daemon vaults**:
+  daemon SQLite persistence now uses a longer default save debounce
+  (`LOCALSYNC_DB_SAVE_DEBOUNCE_MS=120000`) so sql.js does not repeatedly export
+  the full database during startup scan. Startup scan also closes reconciled
+  Yjs documents immediately after flushing their catch-up updates, keeping open
+  document memory bounded while many files drifted offline.
+
 ## 0.4.3 — 2026-06-21
 
 ### Fixed

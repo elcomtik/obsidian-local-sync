@@ -11,7 +11,7 @@ import { createOwnerSecret, ownerSecretToMnemonic } from "@evolu/common/local-fi
 import { createDbWorkerForPlatform } from "@evolu/common/local-first";
 import type { CreateSqliteDriver, Evolu, EvoluDeps, Mnemonic } from "@evolu/common";
 import type { Database } from "../src-core/schema";
-import { createPersistentSqlJsDriver, type PlatformIO } from "./sqliteDriver";
+import { createPersistentSqlJsDriver, type PlatformIO, type SqlJsDriverOptions } from "./sqliteDriver";
 import { Schema } from "../src-core/schema";
 import { formatLogLine, type LogFormatter } from "../src-core/logFormat";
 
@@ -80,7 +80,8 @@ export function createEvoluClient(
   {
     forceNew = false,
     logFormatter = formatLogLine,
-  }: { forceNew?: boolean; logFormatter?: LogFormatter } = {},
+    sqliteDriverOptions = {},
+  }: { forceNew?: boolean; logFormatter?: LogFormatter; sqliteDriverOptions?: SqlJsDriverOptions } = {},
 ) {
   if (_cached && !forceNew) {
     return { evolu: _cached.evolu, closeDb: _cached.close };
@@ -90,7 +91,7 @@ export function createEvoluClient(
   let discard: () => void = () => {};
 
   const evoluConsole = createEvoluConsole(logFormatter);
-  const innerFactory = createPersistentSqlJsDriver(io, logFormatter);
+  const innerFactory = createPersistentSqlJsDriver(io, logFormatter, sqliteDriverOptions);
   const wrappedFactory: CreateSqliteDriver = async (_name, options) => {
     const driver = await innerFactory(_name, options);
     flush = async () => { await (driver as any).flush?.(); };

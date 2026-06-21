@@ -26,6 +26,10 @@ export type PlatformIO = {
   deleteFile?: () => Promise<void>;
 };
 
+export type SqlJsDriverOptions = {
+  saveDebounceMs?: number;
+};
+
 /**
  * Creates an Evolu `CreateSqliteDriver` factory backed by sql.js (asm.js) with
  * file-based persistence via the platform-independent `io` abstraction.
@@ -42,6 +46,7 @@ export type PlatformIO = {
 export function createPersistentSqlJsDriver(
   io: PlatformIO,
   logFormatter: LogFormatter = formatLogLine,
+  driverOptions: SqlJsDriverOptions = {},
 ): CreateSqliteDriver {
   return async (_name, options) => {
     const SQL = await getSql();
@@ -62,6 +67,7 @@ export function createPersistentSqlJsDriver(
     // Set to true after flush() — prevents stale post-reload disk writes from
     // an old driver instance overwriting the new instance's saved state.
     let isFlushed = false;
+    const saveDebounceMs = driverOptions.saveDebounceMs ?? SAVE_DEBOUNCE_MS;
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
     let writeChain: Promise<void> = Promise.resolve();
     let writeGeneration = 0;
@@ -89,7 +95,7 @@ export function createPersistentSqlJsDriver(
       saveTimer = setTimeout(() => {
         saveTimer = null;
         saveToDisk();
-      }, SAVE_DEBOUNCE_MS);
+      }, saveDebounceMs);
     }
 
     /**

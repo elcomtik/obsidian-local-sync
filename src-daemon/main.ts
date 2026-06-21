@@ -83,6 +83,7 @@ const pollIntervalMs = readPositiveInt("LOCALSYNC_POLL_INTERVAL_MS", 1000);
 const ownerReadTimeoutMs = readPositiveInt("LOCALSYNC_OWNER_READ_TIMEOUT_MS", 30_000);
 const logFormatter = createDaemonLogFormatter("obsidian-local-sync", {});
 const ATOMIC_DB_TEMP_MAX_AGE_MS = readPositiveInt("LOCALSYNC_DB_TEMP_MAX_AGE_MS", 15 * 60_000);
+const dbSaveDebounceMs = readPositiveInt("LOCALSYNC_DB_SAVE_DEBOUNCE_MS", 120_000);
 
 await cleanupStaleAtomicTempFiles(dbPath, ATOMIC_DB_TEMP_MAX_AGE_MS);
 
@@ -101,7 +102,10 @@ const io: PlatformIO = {
   },
 };
 
-let { evolu, closeDb } = createEvoluClient(appName, relayUrl, io, { logFormatter });
+let { evolu, closeDb } = createEvoluClient(appName, relayUrl, io, {
+  logFormatter,
+  sqliteDriverOptions: { saveDebounceMs: dbSaveDebounceMs },
+});
 
 const mnemonic = process.env.LOCALSYNC_MNEMONIC?.trim();
 if (mnemonic) {
@@ -119,6 +123,7 @@ if (mnemonic) {
     ({ evolu, closeDb } = createEvoluClient(appName, relayUrl, io, {
       forceNew: true,
       logFormatter,
+      sqliteDriverOptions: { saveDebounceMs: dbSaveDebounceMs },
     }));
   }
 } else {
