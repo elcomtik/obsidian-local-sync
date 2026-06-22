@@ -228,7 +228,7 @@ test("startup catch-up emits deterministic updates for repeated same drift", asy
   assert.deepEqual(await collectCatchUp(), await collectCatchUp());
 });
 
-test("outgoing file flush persists local db after snapshot", async () => {
+test("outgoing file flush does not force local db persist", async () => {
   const path = "reviews/weekly-review-template.md";
   const files = new Map([[path, "old plus"]]);
   const calls = { writes: [] as string[], deletes: [] as string[] };
@@ -252,7 +252,96 @@ test("outgoing file flush persists local db after snapshot", async () => {
   await privateEngine.getOrLoadFileState(path);
   await privateEngine.closeDoc(path);
 
-  assert.deepEqual(events, ["fileUpdate", "_fileSnapshot", "persist", "_fileSnapshot"]);
+  assert.deepEqual(events, ["fileUpdate", "_fileSnapshot", "_fileSnapshot"]);
+});
+
+test("file materializer persists local db after writing vault file", async () => {
+  const path = "reviews/weekly-review-template.md";
+  const files = new Map([[path, "old"]]);
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  let persists = 0;
+  const engine = makeEngine(makeVault(files, calls), async () => {
+    persists++;
+  });
+
+  const privateEngine = engine as unknown as {
+    materializeFilePlan(plan: { path: string; ids: string[]; signature: string; latestType: string | null }): Promise<void>;
+    loadLocalSnapshotText(path: string): Promise<string | null>;
+    materializeFileHistory(ids: string[]): Promise<{ doc: Y.Doc; text: Y.Text } | null>;
+  };
+
+  privateEngine.loadLocalSnapshotText = async () => "old";
+  privateEngine.materializeFileHistory = async () => makeYjsTextDoc("remote");
+
+  await privateEngine.materializeFilePlan({ path, ids: ["a"], signature: "sig-persist", latestType: null });
+
+  assert.deepEqual(calls.writes, [path]);
+  assert.equal(files.get(path), "remote");
+  assert.equal(persists, 1);
+});
+
+test("periodic settings rescan waits for startup vault scan", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const engine = makeEngine(makeVault(files, calls));
+  const privateEngine = engine as unknown as {
+    localSyncConfig: typeof DEFAULT_LOCAL_SYNC_CONFIG;
+    scanComplete: boolean;
+    runPeriodicSettingsRescan(): Promise<void>;
+    scanSettingsForUnsyncedFiles(label: string): Promise<void>;
+  };
+  let scans = 0;
+
+  privateEngine.localSyncConfig = {
+    ...DEFAULT_LOCAL_SYNC_CONFIG,
+    syncObsidianSettings: true,
+    startupScan: true,
+  };
+  privateEngine.scanComplete = false;
+  privateEngine.scanSettingsForUnsyncedFiles = async () => {
+    scans++;
+  };
+
+  await privateEngine.runPeriodicSettingsRescan();
+
+  assert.equal(scans, 0);
+});
+
+test("settings scans do not overlap", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const engine = makeEngine(makeVault(files, calls));
+  const privateEngine = engine as unknown as {
+    localSyncConfig: typeof DEFAULT_LOCAL_SYNC_CONFIG;
+    scanSettingsForUnsyncedFiles(label: string): Promise<void>;
+    repairSettingsFromRemoteState(label: string): Promise<void>;
+    listTrackedSettingPaths(): Promise<string[]>;
+  };
+  let repairs = 0;
+  let releaseFirstScan!: () => void;
+  const firstScanStarted = new Promise<void>((resolve) => {
+    privateEngine.repairSettingsFromRemoteState = async () => {
+      repairs++;
+      resolve();
+      await new Promise<void>((release) => {
+        releaseFirstScan = release;
+      });
+    };
+  });
+
+  privateEngine.localSyncConfig = {
+    ...DEFAULT_LOCAL_SYNC_CONFIG,
+    syncObsidianSettings: true,
+  };
+  privateEngine.listTrackedSettingPaths = async () => [];
+
+  const firstScan = privateEngine.scanSettingsForUnsyncedFiles("first");
+  await firstScanStarted;
+  await privateEngine.scanSettingsForUnsyncedFiles("second");
+  releaseFirstScan();
+  await firstScan;
+
+  assert.equal(repairs, 1);
 });
 
 test("file materializer materializes clean open doc and keeps local update listener", async () => {

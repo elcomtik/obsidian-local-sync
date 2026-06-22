@@ -358,6 +358,7 @@ export class YjsEvoluHistoryEngine {
   private settingsRescanTimer: ReturnType<typeof setInterval> | null = null;
   private isPolling = false;
   private isScanningVault = false;
+  private isScanningSettings = false;
   private isStopped = false;
   private unsubscribers: Array<() => void> = [];
   /** Resolves when the current poll cycle completes. Awaited by stop(). */
@@ -619,12 +620,17 @@ export class YjsEvoluHistoryEngine {
   private async scanSettingsForUnsyncedFiles(label: string) {
     if (this.isStopped) return;
     if (!this.localSyncConfig.syncObsidianSettings) return;
+    if (this.isScanningSettings) {
+      this.logDebug(`${label}: settings scan already running, skipping`);
+      return;
+    }
 
+    this.isScanningSettings = true;
     try {
       await this.repairSettingsFromRemoteState(`${label}: remote settings repair`);
 
       const paths = await this.listTrackedSettingPaths();
-      this.logInfo(`${label}: begin`, { trackedSettings: paths.length });
+      this.logDebug(`${label}: begin`, { trackedSettings: paths.length });
 
       let advertised = 0;
       let deferred = 0;
@@ -638,14 +644,21 @@ export class YjsEvoluHistoryEngine {
         else if (result === "unchanged") unchanged++;
       }
 
-      this.logInfo(`${label}: done`, {
+      const result = {
         trackedSettings: paths.length,
         advertised,
         deferred,
         unchanged,
-      });
+      };
+      if (advertised > 0 || deferred > 0) {
+        this.logInfo(`${label}: done`, result);
+      } else {
+        this.logDebug(`${label}: done`, result);
+      }
     } catch (e) {
       this.logError(`${label}: scanSettingsForUnsyncedFiles failed`, e);
+    } finally {
+      this.isScanningSettings = false;
     }
   }
 
@@ -1372,6 +1385,7 @@ export class YjsEvoluHistoryEngine {
     this.states.set(plan.path, repairState);
     await this.saveLocalSnapshot(plan.path, repairState);
     await this.saveFileMaterializationSignature(plan.path, plan.signature);
+    await this.persistLocalDb?.();
     this.fileMaterializationBlockedSignatures.delete(plan.path);
     this.pendingVaultSeed.delete(plan.path);
     this.logInfo("File materializer wrote vault file", {
@@ -1441,10 +1455,15 @@ export class YjsEvoluHistoryEngine {
 
       this.settingMaterializerInitialized = true;
       if (plans.length > 0) this.hasLoggedQuietSyncInventory = false;
-      this.logInfo("Setting materialization plans refreshed", {
+      const payload = {
         label,
         enqueued: plans.length,
-      });
+      };
+      if (plans.length > 0) {
+        this.logInfo("Setting materialization plans refreshed", payload);
+      } else {
+        this.logDebug("Setting materialization plans refreshed", payload);
+      }
       void this.runSettingMaterializer();
       void this.handleHistoryQuietTick();
     } catch (error) {
@@ -1603,7 +1622,11 @@ export class YjsEvoluHistoryEngine {
 
   private async runPeriodicSettingsRescan() {
     if (!this.isActive || !this.localSyncConfig.syncObsidianSettings) return;
-    this.logInfo("Periodic settings rescan: tick");
+    if (this.localSyncConfig.startupScan && !this.scanComplete) {
+      this.logDebug("Periodic settings rescan: startup vault scan not complete, skipping");
+      return;
+    }
+    this.logDebug("Periodic settings rescan: tick");
     if (this.localSyncConfig.syncDeletes) {
       await this.auditSettingSnapshotsForOfflineDeletes("Periodic settings rescan");
     }
@@ -1706,6 +1729,7 @@ export class YjsEvoluHistoryEngine {
         const touchedPaths = new Set<string>();
         let lastHandledTimestamp: TimestampBytes | null = null;
         let stoppedAtMissingRow = false;
+        let shouldPersistAfterRemoteApply = false;
 
         for (const [rowIdx, h] of histRows.entries()) {
           const id = idBytesToId(h.id as unknown as IdBytes);
@@ -1771,6 +1795,7 @@ export class YjsEvoluHistoryEngine {
               this.pendingRemoteDeletes.add(path);
               try {
                 await this.vault.deleteFile(path);
+                shouldPersistAfterRemoteApply = true;
               } finally {
                 this.pendingRemoteDeletes.delete(path);
               }
@@ -1830,6 +1855,7 @@ export class YjsEvoluHistoryEngine {
               stoppedAtMissingRow = true;
               break;
             }
+            shouldPersistAfterRemoteApply = true;
           }
 
           touchedPaths.add(path);
@@ -1853,6 +1879,9 @@ export class YjsEvoluHistoryEngine {
 
         if (lastHandledTimestamp != null) {
           await this.saveHistoryCursor(lastHandledTimestamp);
+        }
+        if (shouldPersistAfterRemoteApply) {
+          await this.persistLocalDb?.();
         }
         if (stoppedAtMissingRow) {
           this.reportSyncProgress?.({
@@ -2165,7 +2194,7 @@ export class YjsEvoluHistoryEngine {
     try {
       const remoteSettings = await this.loadLatestSettingUpdatesFromHistory();
       if (remoteSettings.size === 0) {
-        this.logInfo(label, { remoteSettings: 0, applied: 0, unchanged: 0, skipped: 0 });
+        this.logDebug(label, { remoteSettings: 0, applied: 0, unchanged: 0, skipped: 0 });
         return;
       }
 
@@ -2221,12 +2250,17 @@ export class YjsEvoluHistoryEngine {
         applied++;
       }
 
-      this.logInfo(label, {
+      const result = {
         remoteSettings: remoteSettings.size,
         applied,
         unchanged,
         skipped,
-      });
+      };
+      if (applied > 0 || skipped > 0) {
+        this.logInfo(label, result);
+      } else {
+        this.logDebug(label, result);
+      }
     } catch (e) {
       this.logError(`${label}: repairSettingsFromRemoteState failed`, e);
     }
@@ -2699,7 +2733,6 @@ export class YjsEvoluHistoryEngine {
       this.logInfo("Sent outgoing update", { path, bytes: merged.length });
 
       await this.saveLocalSnapshot(path, st);
-      await this.persistLocalDb?.();
       return true;
     } catch (e) {
       this.logError("flushOutgoingUpdates failed", { path, error: e });

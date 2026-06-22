@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.6 — 2026-06-22
+
+### Fixed
+
+- **Startup scan throughput with many local catch-up writes**:
+  LocalSync no longer forces a full sql.js database persist after each
+  vault-origin outgoing update. Deterministic catch-up row/client IDs still keep
+  repeated startup catch-up idempotent after a crash, while avoiding a full
+  database export for every drifted file.
+- **Remote materialization durability**:
+  remote history/materializer writes now persist the local database after the
+  matching `_fileSnapshot` and cursor/signature updates are saved. This keeps
+  vault files written from remote state aligned with durable local snapshots.
+- **Periodic settings scan noise and contention**:
+  periodic settings scans no longer overlap or run while the startup vault scan
+  is still active. Routine unchanged settings scan logs moved to debug; info is
+  reserved for actual setting changes, deferred seeds, applied remote updates,
+  and warnings/errors.
+
 ## 0.4.5 — 2026-06-21
 
 ### Fixed
