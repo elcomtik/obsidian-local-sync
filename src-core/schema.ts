@@ -38,7 +38,8 @@ export const Schema = {
   _fileSnapshot: {
     id: FileSnapshotId,
     path: Evolu.NonEmptyString1000,
-    snapshotBase64: Evolu.NonEmptyString
+    snapshotBase64: Evolu.NonEmptyString,
+    contentHash: Evolu.nullOr(Evolu.NonEmptyString1000)
   },
 
   _settingSnapshot: {

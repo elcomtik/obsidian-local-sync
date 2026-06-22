@@ -75,7 +75,7 @@ export type SyncProgress =
 
 export type SyncProgressReporter = (progress: SyncProgress) => void;
 
-export type ReconcileResult = "loaded" | "deferred" | "skipped";
+export type ReconcileResult = "loaded" | "unchanged" | "deferred" | "skipped";
 
 export type MaterializationRepairStats = {
   planned: number;
@@ -289,6 +289,11 @@ type FileState = {
   pendingOutgoingId: string | null;
   flushTimer: ReturnType<typeof setTimeout> | null;
 
+};
+
+type FileSnapshot = {
+  snapshotBase64: string;
+  contentHash: string | null;
 };
 
 type SettingSnapshot = {
@@ -600,6 +605,7 @@ export class YjsEvoluHistoryEngine {
         skippedByRule: Object.fromEntries(skippedByRule),
       });
       let loaded = 0;
+      let unchanged = 0;
       let deferred = 0;
       let processed = 0;
       const scanStartedAt = Date.now();
@@ -619,6 +625,8 @@ export class YjsEvoluHistoryEngine {
             await this.closeDoc(file.path);
             this.states.delete(file.path);
           }
+        } else if (result === "unchanged") {
+          unchanged++;
         }
         if (label === "Startup scan") {
           this.startupUnscannedPaths.delete(file.path);
@@ -645,6 +653,7 @@ export class YjsEvoluHistoryEngine {
             processed,
             trackedFiles: files.length,
             loaded,
+            unchanged,
             deferred,
             elapsedMs: now - scanStartedAt,
             path: file.path,
@@ -657,6 +666,7 @@ export class YjsEvoluHistoryEngine {
             processed,
             trackedFiles: files.length,
             loaded,
+            unchanged,
             deferred,
             elapsedMs: now - scanStartedAt,
           });
@@ -665,6 +675,7 @@ export class YjsEvoluHistoryEngine {
 
       this.logInfo(`${label}: done`, {
         loaded,
+        unchanged,
         deferred,
         trackedFiles: files.length,
         adapterFiles: allFiles.length,
@@ -783,11 +794,16 @@ export class YjsEvoluHistoryEngine {
     if (this.isStopped) return "skipped";
     if (!isTrackedVaultPath(path, this.localSyncConfig)) return "skipped";
 
-    const snapshot = await this.loadLocalSnapshot(path);
+    const snapshot = await this.loadLocalSnapshotRecord(path);
     if (snapshot === null) {
       this.logInfo(`${label}: deferring new file seed`, { path });
       this.pendingVaultSeed.add(path);
       return "deferred";
+    }
+
+    const vaultText = await this.vault.readText(path);
+    if (vaultText !== null && snapshot.contentHash === hashText(vaultText)) {
+      return "unchanged";
     }
 
     await this.getOrLoadFileState(path);
@@ -2442,7 +2458,7 @@ export class YjsEvoluHistoryEngine {
     // transmitted to other devices.  Only done when seedFromVault is true
     // (false when called from poll context to avoid doubling content with
     // history replay).
-    if (snapshotBase64 && lastVaultText) {
+    if (snapshotBase64) {
       const yjsText = text.toString();
       if (yjsText !== lastVaultText) {
         const snapshotHash = hashText(snapshotBase64);
@@ -2484,12 +2500,16 @@ export class YjsEvoluHistoryEngine {
   }
 
   private async loadLocalSnapshot(path: string): Promise<string | null> {
+    return (await this.loadLocalSnapshotRecord(path))?.snapshotBase64 ?? null;
+  }
+
+  private async loadLocalSnapshotRecord(path: string): Promise<FileSnapshot | null> {
     const id = createIdFromString<"FileSnapshot">(`snapshot:${path}`);
 
     const q = this.evolu.createQuery((db) =>
       db
         .selectFrom("_fileSnapshot")
-        .select(["snapshotBase64"])
+        .select(["snapshotBase64", "contentHash"])
         .where("id", "=", id)
         .where("isDeleted", "is", null)
         .limit(1),
@@ -2501,15 +2521,23 @@ export class YjsEvoluHistoryEngine {
     // "DELETED" is a tombstone written by the delete/rename handlers and the
     // offline-delete audit.  Treat it as no snapshot so the path is handled
     // as a brand-new file if it is ever re-created.
-    if (val === "DELETED") return null;
-    return val;
+    if (!val || val === "DELETED") return null;
+    return {
+      snapshotBase64: val,
+      contentHash: rows[0].contentHash ?? null,
+    };
   }
 
   private async saveLocalSnapshot(path: string, st: FileState) {
     const snapshotBytes = Y.encodeStateAsUpdate(st.doc);
     const snapshotBase64 = toBase64(snapshotBytes);
     const id = createIdFromString<"FileSnapshot">(`snapshot:${path}`);
-    this.evolu.upsert("_fileSnapshot", { id, path, snapshotBase64 });
+    this.evolu.upsert("_fileSnapshot", {
+      id,
+      path,
+      snapshotBase64,
+      contentHash: hashText(st.text.toString()),
+    });
   }
 
   /**
@@ -2522,7 +2550,7 @@ export class YjsEvoluHistoryEngine {
    */
   private tombstoneSnapshot(path: string) {
     const id = createIdFromString<"FileSnapshot">(`snapshot:${path}`);
-    this.evolu.upsert("_fileSnapshot", { id, path, snapshotBase64: "DELETED" });
+    this.evolu.upsert("_fileSnapshot", { id, path, snapshotBase64: "DELETED", contentHash: null });
   }
 
   // ---------- writeback ----------

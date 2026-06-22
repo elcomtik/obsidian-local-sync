@@ -335,6 +335,64 @@ test("processed markers distinguish newer versions of deterministic rows", async
   assert.notEqual(markerIds[0], markerIds[1]);
 });
 
+test("startup scan skips Yjs and snapshot writes when the vault hash matches", async () => {
+  const path = "reviews/weekly-review-template.md";
+  const files = new Map([[path, "unchanged content"]]);
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const engine = makeEngine(makeVault(files, calls));
+  let loaded = false;
+  let contentHash: string | null = null;
+  const state = makeYjsTextDoc("unchanged content");
+
+  const privateEngine = engine as unknown as {
+    evolu: { upsert(table: string, row: Record<string, unknown>): void };
+    reconcileVaultFile(path: string): Promise<string>;
+    loadLocalSnapshotRecord(path: string): Promise<{ snapshotBase64: string; contentHash: string | null }>;
+    getOrLoadFileState(path: string): Promise<unknown>;
+    saveLocalSnapshot(path: string, state: { doc: Y.Doc; text: Y.Text }): Promise<void>;
+  };
+
+  privateEngine.evolu.upsert = (table, row) => {
+    if (table === "_fileSnapshot") contentHash = row.contentHash as string;
+  };
+  await privateEngine.saveLocalSnapshot(path, state);
+  state.doc.destroy();
+
+  privateEngine.loadLocalSnapshotRecord = async () => ({
+    snapshotBase64: "snapshot",
+    contentHash,
+  });
+  privateEngine.getOrLoadFileState = async () => {
+    loaded = true;
+    return {};
+  };
+
+  assert.equal(await privateEngine.reconcileVaultFile(path), "unchanged");
+  assert.equal(loaded, false);
+});
+
+test("saved file snapshots include the materialized content hash", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const engine = makeEngine(makeVault(files, calls));
+  let savedRow: Record<string, unknown> | null = null;
+  const state = makeYjsTextDoc("snapshot content");
+
+  const privateEngine = engine as unknown as {
+    evolu: { upsert(table: string, row: Record<string, unknown>): void };
+    saveLocalSnapshot(path: string, state: { doc: Y.Doc; text: Y.Text }): Promise<void>;
+  };
+  privateEngine.evolu.upsert = (table, row) => {
+    if (table === "_fileSnapshot") savedRow = row;
+  };
+
+  await privateEngine.saveLocalSnapshot("notes/example.md", state);
+  state.doc.destroy();
+
+  assert.equal(typeof savedRow?.contentHash, "string");
+  assert.equal((savedRow?.contentHash as string).length, 16);
+});
+
 test("startup catch-up emits deterministic updates for repeated same drift", async () => {
   const path = "addressbook/Andrej Slebodnik.md";
   const snapshotDoc = makeYjsTextDoc("old");
@@ -375,6 +433,33 @@ test("startup catch-up emits deterministic updates for repeated same drift", asy
   };
 
   assert.deepEqual(await collectCatchUp(), await collectCatchUp());
+});
+
+test("startup catch-up propagates an offline edit that empties a file", async () => {
+  const path = "notes/emptied.md";
+  const snapshotDoc = makeYjsTextDoc("previous content");
+  const snapshotBase64 = Buffer.from(Y.encodeStateAsUpdate(snapshotDoc.doc)).toString("base64");
+  snapshotDoc.doc.destroy();
+  const files = new Map([[path, ""]]);
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const fileUpdates: Record<string, unknown>[] = [];
+  const engine = makeEngine(makeVault(files, calls));
+
+  const privateEngine = engine as unknown as {
+    evolu: { upsert(table: string, row: Record<string, unknown>): void };
+    loadLocalSnapshot(path: string): Promise<string | null>;
+    getOrLoadFileState(path: string): Promise<unknown>;
+    closeDoc(path: string): Promise<boolean>;
+  };
+  privateEngine.evolu.upsert = (table, row) => {
+    if (table === "fileUpdate") fileUpdates.push(row);
+  };
+  privateEngine.loadLocalSnapshot = async () => snapshotBase64;
+
+  await privateEngine.getOrLoadFileState(path);
+  await privateEngine.closeDoc(path);
+
+  assert.equal(fileUpdates.length, 1);
 });
 
 test("outgoing file flush does not force local db persist", async () => {

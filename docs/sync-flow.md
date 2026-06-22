@@ -46,6 +46,12 @@ flowchart TD
   I --> L[Startup local scan complete]
 ```
 
+For files with an existing local snapshot, the scan first compares the current
+vault content hash with the hash stored beside the Yjs snapshot. Matching files
+need no Yjs reconstruction or snapshot database write. A missing hash, as on
+the first startup after upgrading, takes the full reconciliation path once and
+backfills the hash.
+
 Remote paths not present in the initial local file list can materialize as soon
 as that list is known. Existing paths can materialize immediately after their
 own local reconciliation completes; they do not wait for the entire vault.

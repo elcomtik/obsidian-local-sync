@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1 — 2026-06-22
+
+### Changed
+
+- File snapshots now store a hash of their materialized text. Startup and
+  periodic vault scans skip Yjs reconstruction and snapshot database mutations
+  when the current vault content matches that hash. Existing snapshots are
+  backfilled naturally during their first scan.
+
 ## 0.6.0 — 2026-06-22
 
 ### Changed
