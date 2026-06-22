@@ -582,6 +582,55 @@ test("settings scans do not overlap", async () => {
   assert.equal(listings, 1);
 });
 
+test("rename retargets pending and future outgoing updates to the new path", async () => {
+  const oldPath = "notes/old.md";
+  const newPath = "notes/new.md";
+  const files = new Map([[newPath, "before"]]);
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const engine = makeEngine(makeVault(files, calls));
+  const openDoc = makeYjsTextDoc("before");
+  const outgoing: Array<{ path: string; type: string | null }> = [];
+
+  const privateEngine = engine as unknown as {
+    states: Map<string, { path: string; doc: Y.Doc; text: Y.Text }>;
+    evolu: { upsert(table: string, row: Record<string, unknown>): void };
+    createFileStateFromDoc(
+      path: string,
+      doc: Y.Doc,
+      text: Y.Text,
+      lastVaultText: string,
+      ignoreNextVaultModify: boolean,
+    ): { path: string; doc: Y.Doc; text: Y.Text };
+  };
+  privateEngine.evolu.upsert = (table, row) => {
+    if (table === "fileUpdate") {
+      outgoing.push({
+        path: row.path as string,
+        type: (row.type as string | null) ?? null,
+      });
+    }
+  };
+  const state = privateEngine.createFileStateFromDoc(
+    oldPath,
+    openDoc.doc,
+    openDoc.text,
+    "before",
+    false,
+  );
+  privateEngine.states.set(oldPath, state);
+
+  await engine.onVaultFileRenamed(oldPath, newPath);
+  state.text.insert(state.text.length, "!");
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(state.path, newPath);
+  assert.equal(privateEngine.states.has(oldPath), false);
+  assert.equal(privateEngine.states.get(newPath), state);
+  assert.equal(outgoing.some((row) => row.path === oldPath && row.type === null), false);
+  assert.equal(outgoing.filter((row) => row.path === newPath && row.type === null).length, 2);
+  state.doc.destroy();
+});
+
 test("file materializer materializes clean open doc and keeps local update listener", async () => {
   const path = "reviews/weekly-review-template.md";
   const files = new Map([[path, "old"]]);

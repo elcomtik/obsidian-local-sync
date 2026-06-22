@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.3 — 2026-06-23
+
+### Fixed
+
+- Renaming an open file now retargets its Yjs state and outgoing debounce to
+  the new path. Pending pre-rename operations are covered by the full-state
+  rename retransmit instead of later being sent under the old filename.
+
 ## 0.6.2 — 2026-06-23
 
 ### Fixed

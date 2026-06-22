@@ -7,7 +7,7 @@ is available only through the manual materialization repair action.
 ## Incremental Inbox
 
 Each peer has local-only processed-marker tables. The subscribed query returns
-only synced rows for which this peer has no marker matching `(id, updatedAt)`.
+only synced rows for which this peer has no marker matching `(id, row version)`.
 This detects rows that replicate late even when their Evolu timestamp is older
 than previously received rows.
 
@@ -75,6 +75,9 @@ receive and apply it incrementally.
 
 The durable marker version is `updatedAt ?? createdAt`: inserted Evolu rows
 have no `updatedAt`, while deterministic rows gain one when changed later.
+
+Renames cancel the old-path outgoing debounce, retarget the open Yjs state,
+then send an old-path delete and a full-state update for the new path.
 
 ## Normal Remote Edit
 

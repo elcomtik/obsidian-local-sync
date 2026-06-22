@@ -275,6 +275,7 @@ function applyRebasedTextChangeToYText(
 }
 
 type FileState = {
+  path: string;
   doc: Y.Doc;
   text: Y.Text;
 
@@ -1941,6 +1942,7 @@ export class YjsEvoluHistoryEngine {
 
     if (currentText === historyText) {
       await this.saveLocalSnapshot(plan.path, {
+        path: plan.path,
         doc: materialized.doc,
         text: materialized.text,
         lastVaultText: historyText,
@@ -2419,6 +2421,7 @@ export class YjsEvoluHistoryEngine {
     ignoreNextVaultModify: boolean,
   ): FileState {
     const st: FileState = {
+      path,
       doc,
       text,
       lastVaultText,
@@ -2439,7 +2442,7 @@ export class YjsEvoluHistoryEngine {
         st.pendingOutgoingId = null;
       }
       st.pendingUpdates.push(u);
-      this.scheduleOutgoingFlush(path, st);
+      this.scheduleOutgoingFlush(st);
     });
 
     return st;
@@ -2626,12 +2629,12 @@ export class YjsEvoluHistoryEngine {
 
   // ---------- outgoing batching ----------
 
-  private scheduleOutgoingFlush(path: string, st: FileState) {
+  private scheduleOutgoingFlush(st: FileState) {
     if (st.flushTimer != null) return;
 
     st.flushTimer = setTimeout(async () => {
       st.flushTimer = null;
-      await this.flushOutgoingUpdates(path, st);
+      await this.flushOutgoingUpdates(st.path, st);
     }, this.config.outgoingBatchMs);
   }
 
@@ -2746,6 +2749,14 @@ export class YjsEvoluHistoryEngine {
       // Re-key in-memory state to the new path.
       const st = this.states.get(oldPath);
       if (st) {
+        if (st.flushTimer != null) {
+          clearTimeout(st.flushTimer);
+          st.flushTimer = null;
+        }
+        // The full-state retransmit below already contains these operations.
+        st.pendingUpdates = [];
+        st.pendingOutgoingId = null;
+        st.path = newPath;
         this.states.delete(oldPath);
         this.states.set(newPath, st);
         await this.saveLocalSnapshot(newPath, st);
