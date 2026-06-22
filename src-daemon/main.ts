@@ -3,7 +3,6 @@ import path from "node:path";
 import chokidar from "chokidar";
 import { Mnemonic } from "@evolu/common";
 import {
-  DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
@@ -65,10 +64,6 @@ const engineConfig: EngineConfig = {
   vaultScanInfoProgressEveryMs: readNonNegativeInt(
     "LOCALSYNC_VAULT_SCAN_INFO_PROGRESS_EVERY_MS",
     DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
-  ),
-  materializerRefreshDebounceMs: readNonNegativeInt(
-    "LOCALSYNC_MATERIALIZER_REFRESH_DEBOUNCE_MS",
-    DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
   ),
 };
 const localSyncConfig: LocalSyncConfig = {

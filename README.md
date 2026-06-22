@@ -7,7 +7,7 @@ Single-user, multi-device file sync for Obsidian using:
 
 - **Yjs** → CRDT document engine (source of truth)
 - **Evolu** → local-first database + sync transport
-- **evolu_history** → ordered mutation stream
+- **Durable incremental inbox** → late-arrival-safe remote processing
 - **LRU memory management**
 - **Configurable performance settings**
 - **Mnemonic-based device bootstrap**
@@ -104,10 +104,10 @@ Yjs Document (CRDT, source of truth)
         └── Yjs updates → Evolu fileUpdate table
                          │
                          ▼
-                evolu_history (ordered log)
+                Evolu replication
                          │
                          ▼
-              Other devices poll history
+              Other devices receive pending rows
                          │
                          ▼
                  Apply Yjs update
@@ -132,7 +132,7 @@ Vault files are projections of Yjs state.
 We use Evolu for:
 - local-first storage
 - WebSocket sync transport
-- ordered mutation log (`evolu_history`)
+- replicated `fileUpdate` / `settingUpdate` tables
 
 We store incremental updates:
 ```
@@ -213,29 +213,27 @@ avoid native module compilation issues in Obsidian's Electron environment.
 E2EE is fully preserved — encryption is handled in `@evolu/common` at the
 CRDT message level, independent of the platform layer.
 
-### 3) evolu_history (Incremental Sync)
-We poll `evolu_history` for:
-- table == "fileUpdate"
-- column == "updateBase64"
-- table == "settingUpdate"
-- column == "contentBase64"
-ordered by timestamp
+### 3) Durable Incremental Inbox
+Subscribed anti-join queries return only synced rows without a matching local
+processed marker. Markers use `(row id, updatedAt)`, so delayed replication and
+later versions of deterministic rows are both detected without a timestamp
+cursor. The originating device is filtered through `originDeviceId`.
 
-A local cursor (`_historyCursor`) prevents reprocessing.
-The cursor is advanced only after contiguous history rows are successfully
-handled; if a referenced synced row is missing or a remote write fails, the
-cursor stays before that row so the next poll retries it.
+Content updates are applied incrementally. A delete boundary can rebuild the
+affected path, while complete vault/history validation is available only from
+the manual materialization repair action.
 
 ### 4) Local-Only Tables
 - `_fileSnapshot`: one snapshot per file (replaced, not accumulated)
 - `_settingSnapshot`: one content hash per synced settings file plus tombstones
-- `_historyCursor`: last processed timestamp
+- `_processedFileUpdate` / `_processedSettingUpdate`: durable inbox markers
+- `_inboxState`: one-time migration state
 
 The plugin settings include a dangerous **Reset local sync state** action. It
 deletes this device's tracked synced vault files returned by Obsidian's vault
 API and the LocalSync SQLite database, restores the existing mnemonic into a
 fresh local DB, and restarts sync from remote history. Use it when a local peer's
-LocalSync DB is corrupted or its local cursor/state needs to be rebuilt from
+LocalSync DB is corrupted or its local state needs to be rebuilt from
 remote history; wiping the local files first prevents stale vault content from
 being seeded into the fresh DB. The wipe does not recursively delete dotfiles or
 adapter-only `.obsidian` paths.

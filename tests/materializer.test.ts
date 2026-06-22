@@ -3,7 +3,6 @@ import test from "node:test";
 
 import * as Y from "yjs";
 import {
-  DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
@@ -24,7 +23,10 @@ function makeEngine(vault: VaultAdapter, persistLocalDb?: () => Promise<void>): 
   return new YjsEvoluHistoryEngine({
     vault,
     evolu: {
-      upsert() {},
+      upsert(_table: string, _row: unknown, options?: { onComplete?: () => void }) {
+        options?.onComplete?.();
+        return { ok: true };
+      },
       createQuery(query: unknown) {
         return query;
       },
@@ -41,7 +43,6 @@ function makeEngine(vault: VaultAdapter, persistLocalDb?: () => Promise<void>): 
       vaultScanDebugProgressEveryFiles: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
       vaultScanDebugProgressEveryMs: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
       vaultScanInfoProgressEveryMs: DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
-      materializerRefreshDebounceMs: DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
     },
     localSyncConfig: DEFAULT_LOCAL_SYNC_CONFIG,
     logLevel: "off",
@@ -168,34 +169,170 @@ test("file materializer does not replan unchanged signatures blocked by local dr
   assert.equal((await privateEngine.collectFileMaterializationPlans(true)).length, 1);
 });
 
-test("file materializer refresh waits for startup scan completion", async () => {
+test("incremental inbox gates only unscanned startup paths", async () => {
   const files = new Map<string, string>();
   const calls = { writes: [] as string[], deletes: [] as string[] };
   const engine = makeEngine(makeVault(files, calls));
 
   const privateEngine = engine as unknown as {
+    localSyncConfig: typeof DEFAULT_LOCAL_SYNC_CONFIG;
     scanComplete: boolean;
-    refreshFileMaterializationPlans(label: string): Promise<void>;
-    collectFileMaterializationPlans(force: boolean): Promise<Array<{ path: string; ids: string[]; signature: string; latestType: string | null }>>;
-    fileMaterializationQueue: Set<string>;
-    fileMaterializationPlans: Map<string, { path: string; ids: string[]; signature: string; latestType: string | null }>;
+    startupPathsReady: boolean;
+    startupUnscannedPaths: Set<string>;
+    canProcessIncomingPath(path: string): boolean;
   };
 
-  let collectCalls = 0;
-  privateEngine.collectFileMaterializationPlans = async () => {
-    collectCalls++;
-    return [{ path: "a.md", ids: ["a"], signature: "a", latestType: null }];
+  privateEngine.localSyncConfig = {
+    ...DEFAULT_LOCAL_SYNC_CONFIG,
+    startupScan: true,
   };
-
   privateEngine.scanComplete = false;
-  await privateEngine.refreshFileMaterializationPlans("subscription during startup scan");
-  assert.equal(collectCalls, 0);
-  assert.equal(privateEngine.fileMaterializationQueue.size, 0);
+  privateEngine.startupPathsReady = true;
+  privateEngine.startupUnscannedPaths = new Set(["existing.md"]);
 
+  assert.equal(privateEngine.canProcessIncomingPath("existing.md"), false);
+  assert.equal(privateEngine.canProcessIncomingPath("remote-new.md"), true);
+  privateEngine.startupUnscannedPaths.delete("existing.md");
+  assert.equal(privateEngine.canProcessIncomingPath("existing.md"), true);
   privateEngine.scanComplete = true;
-  await privateEngine.refreshFileMaterializationPlans("startup scan complete");
-  assert.equal(collectCalls, 1);
-  assert.equal(privateEngine.fileMaterializationPlans.has("a.md"), true);
+  assert.equal(privateEngine.canProcessIncomingPath("any.md"), true);
+});
+
+test("incremental file inbox applies only pending content without history replay", async () => {
+  const path = "remote-new.md";
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  let persists = 0;
+  const engine = makeEngine(makeVault(files, calls), async () => {
+    persists++;
+  });
+  const remote = makeYjsTextDoc("remote content");
+  const updateBase64 = Buffer.from(Y.encodeStateAsUpdate(remote.doc)).toString("base64");
+  remote.doc.destroy();
+
+  const privateEngine = engine as unknown as {
+    processPendingFilePath(
+      path: string,
+      rows: Array<{
+        id: string;
+        path: string;
+        updateBase64: string;
+        type: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }>,
+    ): Promise<boolean>;
+    loadFileUpdateRowsForPath(path: string): Promise<unknown>;
+  };
+  privateEngine.loadFileUpdateRowsForPath = async () => {
+    throw new Error("normal content updates must not replay path history");
+  };
+
+  const applied = await privateEngine.processPendingFilePath(path, [
+    {
+      id: "remote-1",
+      path,
+      updateBase64,
+      type: null,
+      createdAt: "2026-06-22T10:00:00.000Z",
+      updatedAt: "2026-06-22T10:00:00.000Z",
+    },
+  ]);
+
+  assert.equal(applied, true);
+  assert.equal(files.get(path), "remote content");
+  assert.deepEqual(calls.writes, [path]);
+  assert.equal(persists, 1);
+});
+
+test("incremental file inbox persists processed marker after snapshot", async () => {
+  const path = "ordered.md";
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const events: string[] = [];
+  const vault = makeVault(files, calls);
+  const originalWrite = vault.writeText;
+  vault.writeText = async (writePath, text) => {
+    events.push("vault");
+    await originalWrite(writePath, text);
+  };
+  const engine = makeEngine(vault, async () => {
+    events.push("persist");
+  });
+  const privateEngine = engine as unknown as {
+    evolu: {
+      upsert(
+        table: string,
+        row: Record<string, unknown>,
+        options?: { onComplete?: () => void },
+      ): { ok: true };
+    };
+    processPendingFilePath(
+      path: string,
+      rows: Array<{
+        id: string;
+        path: string;
+        updateBase64: string;
+        type: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }>,
+    ): Promise<boolean>;
+  };
+  privateEngine.evolu.upsert = (table, _row, options) => {
+    if (table === "_fileSnapshot") events.push("snapshot");
+    if (table === "_processedFileUpdate") events.push("processed");
+    options?.onComplete?.();
+    return { ok: true };
+  };
+  const remote = makeYjsTextDoc("ordered");
+  const updateBase64 = Buffer.from(Y.encodeStateAsUpdate(remote.doc)).toString("base64");
+  remote.doc.destroy();
+
+  await privateEngine.processPendingFilePath(path, [
+    {
+      id: "remote-ordered",
+      path,
+      updateBase64,
+      type: null,
+      createdAt: "2026-06-22T10:00:00.000Z",
+      updatedAt: "2026-06-22T10:00:00.000Z",
+    },
+  ]);
+
+  assert.ok(events.indexOf("vault") < events.indexOf("snapshot"));
+  assert.ok(events.indexOf("snapshot") < events.indexOf("processed"));
+  assert.ok(events.indexOf("processed") < events.indexOf("persist"));
+});
+
+test("processed markers distinguish newer versions of deterministic rows", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const engine = makeEngine(makeVault(files, calls));
+  const markerIds: string[] = [];
+  const privateEngine = engine as unknown as {
+    evolu: {
+      upsert(
+        table: string,
+        row: Record<string, unknown>,
+        options?: { onComplete?: () => void },
+      ): { ok: true };
+    };
+    markFileRowsProcessed(rows: Array<{ id: string; updatedAt: string }>): Promise<void>;
+  };
+  privateEngine.evolu.upsert = (table, row, options) => {
+    if (table === "_processedFileUpdate") markerIds.push(row.id as string);
+    options?.onComplete?.();
+    return { ok: true };
+  };
+
+  await privateEngine.markFileRowsProcessed([
+    { id: "stable-row", updatedAt: "2026-06-22T10:00:00.000Z" },
+    { id: "stable-row", updatedAt: "2026-06-22T11:00:00.000Z" },
+  ]);
+
+  assert.equal(markerIds.length, 2);
+  assert.notEqual(markerIds[0], markerIds[1]);
 });
 
 test("startup catch-up emits deterministic updates for repeated same drift", async () => {
@@ -207,7 +344,7 @@ test("startup catch-up emits deterministic updates for repeated same drift", asy
   const collectCatchUp = async () => {
     const files = new Map([[path, "old plus"]]);
     const calls = { writes: [] as string[], deletes: [] as string[] };
-    const fileUpdates: Array<{ id: string; path: string; updateBase64: string }> = [];
+    const fileUpdates: Array<{ id: string; path: string; updateBase64: string; originDeviceId: string }> = [];
     const engine = makeEngine(makeVault(files, calls));
 
     const privateEngine = engine as unknown as {
@@ -223,6 +360,7 @@ test("startup catch-up emits deterministic updates for repeated same drift", asy
           id: row.id as string,
           path: row.path as string,
           updateBase64: row.updateBase64 as string,
+          originDeviceId: row.originDeviceId as string,
         });
       }
     };
@@ -232,6 +370,7 @@ test("startup catch-up emits deterministic updates for repeated same drift", asy
     await privateEngine.closeDoc(path);
 
     assert.equal(fileUpdates.length, 1);
+    assert.equal(fileUpdates[0].originDeviceId, "test-device");
     return fileUpdates[0];
   };
 
@@ -324,18 +463,18 @@ test("settings scans do not overlap", async () => {
   const privateEngine = engine as unknown as {
     localSyncConfig: typeof DEFAULT_LOCAL_SYNC_CONFIG;
     scanSettingsForUnsyncedFiles(label: string): Promise<void>;
-    repairSettingsFromRemoteState(label: string): Promise<void>;
     listTrackedSettingPaths(): Promise<string[]>;
   };
-  let repairs = 0;
+  let listings = 0;
   let releaseFirstScan!: () => void;
   const firstScanStarted = new Promise<void>((resolve) => {
-    privateEngine.repairSettingsFromRemoteState = async () => {
-      repairs++;
+    privateEngine.listTrackedSettingPaths = async () => {
+      listings++;
       resolve();
       await new Promise<void>((release) => {
         releaseFirstScan = release;
       });
+      return [];
     };
   });
 
@@ -343,15 +482,13 @@ test("settings scans do not overlap", async () => {
     ...DEFAULT_LOCAL_SYNC_CONFIG,
     syncObsidianSettings: true,
   };
-  privateEngine.listTrackedSettingPaths = async () => [];
-
   const firstScan = privateEngine.scanSettingsForUnsyncedFiles("first");
   await firstScanStarted;
   await privateEngine.scanSettingsForUnsyncedFiles("second");
   releaseFirstScan();
   await firstScan;
 
-  assert.equal(repairs, 1);
+  assert.equal(listings, 1);
 });
 
 test("file materializer materializes clean open doc and keeps local update listener", async () => {

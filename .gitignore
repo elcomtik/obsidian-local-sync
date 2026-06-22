@@ -9,6 +9,7 @@ main.js
 dist/
 dist-daemon/
 .esbuild/
+.tmp/
 *.tsbuildinfo
 
 # OS files

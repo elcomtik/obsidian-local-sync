@@ -47,15 +47,15 @@ Workspace PRD: [Basic Memory LocalSync](../docs/prd/basic-memory-localsync.md)
 
 | Method | Async | Description |
 |--------|-------|-------------|
-| `start()` | ✓ | Starts materializer subscriptions, quiet-cycle timer, rescan timers, and optional startup scan. |
+| `start()` | ✓ | Initializes the incremental inbox, subscriptions, quiet-cycle timer, rescan timers, and optional startup scan. |
 | `stop()` | ✓ | Stops timers/subscriptions, awaits current quiet cycle, closes docs, clears state map. |
 | `updateConfig()` | ✓ | Hot-swaps `config`, resets quiet-cycle timer, enforces LRU limit. |
 | `setLogLevel()` | – | Updates runtime log level. |
 | `setActive()` | ✓ | Resumes quiet-cycle checks (called on window `focus` / `visibilitychange`). |
 | `setInactive()` | – | Pauses quiet-cycle checks (window `blur`). |
 | `onVaultFileModified()` | ✓ | Vault → Yjs path. Reads file, diffs against `lastVaultText`, transacts into `Y.Doc`. |
-| `refreshFileMaterializationPlans()` | ✓ (private) | Reads latest `fileUpdate` rows from history and queues paths whose remote signatures changed. |
-| `runFileMaterializer()` | ✓ (private) | Applies queued remote file plans when the vault file still matches the local snapshot. |
+| `runFileInbox()` | ✓ (private) | Applies only unprocessed remote file rows, grouped by affected path. |
+| `runMaterializationRepairNow()` | ✓ | Runs explicit full-history validation and repair on demand. |
 | `enforceLruLimit()` | ✓ (private) | Evicts least-recently-used docs until `states.size ≤ maxOpenDocs`. |
 | `closeDoc()` | ✓ (private) | Flushes pending updates, saves snapshot, destroys `Y.Doc`. |
 | `getOrLoadFileState()` | ✓ (private) | Returns cached state or bootstraps from snapshot/vault. Registers Yjs `"update"` listener. |
@@ -81,12 +81,15 @@ Workspace PRD: [Basic Memory LocalSync](../docs/prd/basic-memory-localsync.md)
 
 | Table | Synced | Schema | Notes |
 |-------|--------|--------|-------|
-| `fileUpdate` | ✓ | `id, path (≤1000 chars), updateBase64, type` | One row per outgoing Yjs update chunk or delete marker. Rows accumulate forever. |
-| `settingUpdate` | ✓ | `id, path, contentBase64, contentHash, encoding, type` | Synced setting-file updates when settings sync is enabled. |
+| `fileUpdate` | ✓ | `id, path, updateBase64, type, originDeviceId` | One row per outgoing Yjs update chunk or delete marker. |
+| `settingUpdate` | ✓ | `id, path, contentBase64, contentHash, encoding, type, originDeviceId` | Synced setting-file updates. |
 | `_fileSnapshot` | ✗ | `id, path, snapshotBase64` | One row per file path. Replaced in-place (deterministic ID: `snapshot:${path}`). Full Yjs state. |
 | `_settingSnapshot` | ✗ | `id, path, contentHash` | Local setting-file snapshot hash. |
 | `_fileMaterialization` | ✗ | `id, path, signature` | Last materialized remote file signature per path. |
 | `_settingMaterialization` | ✗ | `id, path, signature` | Last materialized remote setting signature per path. |
+| `_processedFileUpdate` | ✗ | `id, sourceId, sourceVersion` | Durable incremental file inbox acknowledgements. |
+| `_processedSettingUpdate` | ✗ | `id, sourceId, sourceVersion` | Durable incremental setting inbox acknowledgements. |
+| `_inboxState` | ✗ | `id, version` | One-time inbox migration state. |
 
 ### `src/evoluClient.ts`
 
@@ -116,7 +119,7 @@ All settings live in Obsidian's plugin data (JSON, managed by `Plugin.loadData` 
 | `appName` | `obsidian-local-sync` | — | Evolu app namespace (isolates data on shared relays). |
 | `deviceId` | random hex | — | Stable per-device identifier. Persisted on first load. |
 | `historyPollMs` | `1000` | `100` | Quiet-cycle interval for deferred seed and inventory checks (ms). |
-| `historyBatchSize` | `500` | `10` | Legacy compatibility setting. |
+| `historyBatchSize` | `500` | `10` | Maximum pending incoming rows per subscribed inbox query. |
 | `outgoingBatchMs` | `500` | `50` | Debounce window before sending outgoing Yjs updates (ms). |
 | `maxOpenDocs` | `50` | `5` | LRU cap on simultaneously open Yjs docs. |
 | `logLevel` | `info` | — | Console verbosity: `off \| error \| warn \| info`. |
@@ -145,17 +148,13 @@ vault "modify" event
 ### Incoming (relay → vault)
 
 ```
-Evolu subscription event
-  └─ scheduleFileMaterializationRefresh()
-       └─ refreshFileMaterializationPlans()
-            └─ load latest fileUpdate rows from evolu_history
-            └─ group rows into per-path materialization plans
-            └─ queue paths whose signatures changed
-       └─ runFileMaterializer()
-            └─ skip during startup scan until scanComplete
-            └─ skip if vault content drifted from local snapshot
-            └─ materialize remote Yjs state to vault
-            └─ save local snapshot and materialization signature
+pending-only Evolu subscription result
+  └─ runFileInbox()
+       └─ group pending rows by affected path
+       └─ flush any pending local edit for that path
+       └─ apply only pending Yjs content updates
+       └─ write vault and save local snapshot
+       └─ write processed markers and persist DB
 ```
 
 ### Doc bootstrap (`getOrLoadFileState`)
@@ -191,7 +190,7 @@ main.ts
   ├─ engine.ts          (YjsEvoluHistoryEngine)
   │    ├─ yjs           (Y.Doc, Y.Text, Y.mergeUpdates, Y.applyUpdate, Y.encodeStateAsUpdate)
   │    ├─ diff-match-patch
-  │    ├─ @evolu/common  (Evolu<Database>, createIdFromString, idBytesToId, IdBytes)
+  │    ├─ @evolu/common  (Evolu<Database>, createIdFromString)
   │    └─ schema.ts
   ├─ evoluClient.ts     (createEvoluClient)
   │    ├─ @evolu/common  (createEvolu, createConsole, createRandom, createRandomBytes, createTime, createWebSocket, SimpleName, EvoluDeps)

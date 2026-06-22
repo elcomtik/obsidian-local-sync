@@ -1,7 +1,7 @@
 import * as Y from "yjs";
 import DiffMatchPatch from "diff-match-patch";
-import type { Evolu, IdBytes } from "@evolu/common";
-import { createIdFromString, idBytesToId } from "@evolu/common";
+import type { Evolu } from "@evolu/common";
+import { createIdFromString } from "@evolu/common";
 import type { Database } from "./schema";
 import type { LocalSyncConfig } from "./pathPolicy";
 import {
@@ -32,7 +32,6 @@ const levelRank: Record<LogLevel, number> = {
   debug: 4,
 };
 
-export const DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS = 250;
 export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES = 100;
 export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS = 10_000;
 export const DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS = 60_000;
@@ -42,9 +41,9 @@ export const DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS = 60_000;
  * All values are hot-swappable via {@link YjsEvoluHistoryEngine.updateConfig}.
  */
 export type EngineConfig = {
-  /** Milliseconds between quiet-cycle checks for deferred seeding and inventory repair. */
+  /** Milliseconds between quiet-cycle checks and failed-inbox retries. */
   historyPollMs: number;
-  /** Retained for compatibility with existing settings; materializers do not batch by this value. */
+  /** Maximum pending incoming rows exposed by each subscribed inbox query. */
   historyBatchSize: number;
   /** Debounce window (ms) before flushing accumulated Yjs updates to Evolu. */
   outgoingBatchMs: number;
@@ -56,8 +55,6 @@ export type EngineConfig = {
   vaultScanDebugProgressEveryMs: number;
   /** Info scan progress heartbeat by elapsed milliseconds. Set to 0 to disable info progress. */
   vaultScanInfoProgressEveryMs: number;
-  /** Debounce window before refreshing materialization plans after subscription events. */
-  materializerRefreshDebounceMs: number;
 };
 
 export type SyncProgress =
@@ -294,11 +291,6 @@ type FileState = {
 
 };
 
-type SyncInventory = {
-  vaultPathsMissingFileUpdate: string[];
-  snapshotPathsMissingFileUpdate: string[];
-};
-
 type SettingSnapshot = {
   contentHash: string;
   deleted: boolean;
@@ -313,6 +305,28 @@ type SettingUpdateRow = {
 };
 
 type SettingUpdateWithId = SettingUpdateRow & { id: string };
+
+type PendingFileUpdateRow = {
+  id: string;
+  path: string;
+  updateBase64: string;
+  type: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type PendingSettingUpdateRow = SettingUpdateWithId & {
+  createdAt: string;
+  updatedAt: string;
+};
+
+function compareUpdateOrder(
+  left: { createdAt: string; id: string },
+  right: { createdAt: string; id: string },
+): number {
+  const timestampOrder = left.createdAt.localeCompare(right.createdAt);
+  return timestampOrder !== 0 ? timestampOrder : left.id.localeCompare(right.id);
+}
 
 type FileMaterializationPlan = {
   path: string;
@@ -339,9 +353,9 @@ type SettingMaterializationPlan = {
  * ops inside a transaction, then batched and flushed as `fileUpdate` rows.
  *
  * **Incoming path** (Evolu → vault):
- * Subscribed `fileUpdate` / `settingUpdate` queries refresh materialization
- * plans. The materializers replay synced rows, write vault files when local
- * snapshots still match, and store per-path materialization signatures.
+ * Pending-only subscribed queries expose rows that do not yet have a durable
+ * local processed marker. File updates are applied incrementally to snapshots;
+ * full-history reconstruction is reserved for manual repair.
  *
  * **Memory management**:
  * Open docs are bounded by {@link EngineConfig.maxOpenDocs} using LRU eviction.
@@ -371,7 +385,7 @@ export class YjsEvoluHistoryEngine {
   private isScanningSettings = false;
   private isStopped = false;
   private unsubscribers: Array<() => void> = [];
-  /** Resolves when the current quiet/materializer cycle completes. Awaited by stop(). */
+  /** Resolves when current inbox/manual-repair work completes. Awaited by stop(). */
   private ongoingPoll: Promise<void> = Promise.resolve();
 
   // Only process remote history when Obsidian is active
@@ -381,7 +395,7 @@ export class YjsEvoluHistoryEngine {
    * Paths of vault files that the startup scan identified as having no local
    * snapshot (never seeded) but that are NOT immediately seeded from vault.
    *
-   * Seeding is deferred by one quiet materializer cycle so the relay has time
+   * Seeding is deferred by one quiet inbox cycle so the relay has time
    * to deliver any existing synced rows for these files before we create a new
    * Yjs state.
    * Without this, a reset & restore could seed vault content into an empty doc
@@ -389,7 +403,7 @@ export class YjsEvoluHistoryEngine {
    *
    * Files are removed from this set as soon as materialized remote state covers
    * them. The remaining files are seeded from vault after one full quiet cycle
-   * once materializers have no pending work.
+   * once the incoming inbox has no pending work.
    */
   private pendingVaultSeed = new Set<string>();
   private pendingSettingSeed = new Set<string>();
@@ -415,25 +429,22 @@ export class YjsEvoluHistoryEngine {
   /**
    * Becomes `true` after the first quiet cycle that runs *after* the scan is
    * complete (`scanComplete === true`). Seeding from {@link pendingVaultSeed}
-   * is only allowed once this is true and materializers have no queued work.
+   * is only allowed once this is true and the inbox has no queued work.
    */
   private pendingVaultSeedReady = false;
-  private hasLoggedQuietSyncInventory = false;
 
-  private fileMaterializationQueue = new Set<string>();
-  private settingMaterializationQueue = new Set<string>();
-  private fileMaterializationPlans = new Map<string, FileMaterializationPlan>();
-  private settingMaterializationPlans = new Map<string, SettingMaterializationPlan>();
+  private pendingFileInbox = new Map<string, PendingFileUpdateRow>();
+  private pendingSettingInbox = new Map<string, PendingSettingUpdateRow>();
+  private fileInboxRunning = false;
+  private settingInboxRunning = false;
+  private fileInboxInitialized = false;
+  private settingInboxInitialized = false;
+  private startupPathsReady = false;
+  private startupUnscannedPaths = new Set<string>();
+
+  // Full-history materializers are used only by the manual repair action.
   private fileMaterializerRunning = false;
   private settingMaterializerRunning = false;
-  private fileMaterializerInitialized = false;
-  private settingMaterializerInitialized = false;
-  private fileMaterializationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  private settingMaterializationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  private fileMaterializationRefreshRunning = false;
-  private settingMaterializationRefreshRunning = false;
-  private fileMaterializationRefreshQueuedLabel: string | null = null;
-  private settingMaterializationRefreshQueuedLabel: string | null = null;
   private fileMaterializationBlockedSignatures = new Map<string, string>();
 
   /**
@@ -505,15 +516,16 @@ export class YjsEvoluHistoryEngine {
   async start() {
     try {
       this.isStopped = false;
-      this.startMaterializerSubscriptions();
+      await this.initializeIncrementalInbox();
+      this.startInboxSubscriptions();
       this.startPollingTimer();
       this.startRescanTimer();
       this.logInfo("Engine started", this.config);
       // Kick off the audit and scans concurrently.
       // - auditSnapshotsForOfflineDeletes: detects files deleted/renamed while plugin was off.
       // - scanVaultForUnsyncedFiles: populates pendingVaultSeed (no Yjs mutations).
-      // - materializer subscriptions: relay delivery; deferred seeding runs after
-      //   materializers have observed a quiet cycle.
+      // - inbox subscriptions: relay delivery; deferred seeding runs after the
+      //   incoming inbox has observed a quiet cycle.
       if (this.localSyncConfig.startupScan) {
         void this.auditSnapshotsForOfflineDeletes("Startup scan");
         void this.scanVaultForUnsyncedFiles("Startup scan");
@@ -521,6 +533,8 @@ export class YjsEvoluHistoryEngine {
         void this.scanSettingsForUnsyncedFiles("Startup settings scan");
       } else {
         this.scanComplete = true;
+        this.startupPathsReady = true;
+        this.kickIncrementalInboxes();
       }
     } catch (e) {
       this.logError("Engine start failed", e);
@@ -573,6 +587,12 @@ export class YjsEvoluHistoryEngine {
         }
       }
 
+      if (label === "Startup scan") {
+        this.startupUnscannedPaths = new Set(files.map((file) => file.path));
+        this.startupPathsReady = true;
+        this.kickIncrementalInboxes();
+      }
+
       this.logInfo(`${label}: begin`, {
         adapterFiles: allFiles.length,
         trackedFiles: files.length,
@@ -599,6 +619,10 @@ export class YjsEvoluHistoryEngine {
             await this.closeDoc(file.path);
             this.states.delete(file.path);
           }
+        }
+        if (label === "Startup scan") {
+          this.startupUnscannedPaths.delete(file.path);
+          this.kickIncrementalInboxes();
         }
 
         const now = Date.now();
@@ -645,16 +669,17 @@ export class YjsEvoluHistoryEngine {
         trackedFiles: files.length,
         adapterFiles: allFiles.length,
       });
-      await this.logSyncInventory(label === "Startup scan" ? "startup-scan-done" : "periodic-rescan-done", files);
       this.scanComplete = true;
+      this.startupUnscannedPaths.clear();
+      this.kickIncrementalInboxes();
     } catch (e) {
       this.logError(`${label}: scanVaultForUnsyncedFiles failed`, e);
       this.scanComplete = true; // allow drain even if scan errored
+      this.startupPathsReady = true;
+      this.startupUnscannedPaths.clear();
+      this.kickIncrementalInboxes();
     } finally {
       this.isScanningVault = false;
-      if (label === "Startup scan") {
-        void this.refreshFileMaterializationPlans("startup scan complete");
-      }
     }
   }
 
@@ -668,8 +693,6 @@ export class YjsEvoluHistoryEngine {
 
     this.isScanningSettings = true;
     try {
-      await this.repairSettingsFromRemoteState(`${label}: remote settings repair`);
-
       const paths = await this.listTrackedSettingPaths();
       this.logDebug(`${label}: begin`, { trackedSettings: paths.length });
 
@@ -753,7 +776,7 @@ export class YjsEvoluHistoryEngine {
    * content. If vault content drifted while the engine was stopped, the diff is
    * applied inside {@link getOrLoadFileState} and flushed normally.
    *
-   * **No snapshot:** defer seeding until after a quiet materializer cycle so
+   * **No snapshot:** defer seeding until after a quiet inbox cycle so
    * existing remote state has a chance to arrive first.
    */
   async reconcileVaultFile(path: string, label = "Startup scan"): Promise<ReconcileResult> {
@@ -775,7 +798,7 @@ export class YjsEvoluHistoryEngine {
    * Seeds files from {@link pendingVaultSeed} that have not yet been covered by
    * materialized remote state.
    *
-   * Called after materializers are quiet once {@link pendingVaultSeedReady} is
+   * Called after the incoming inbox is quiet once {@link pendingVaultSeedReady} is
    * true. Files already removed from `pendingVaultSeed` by materialization are
    * skipped automatically by the set iteration.
   */
@@ -785,7 +808,7 @@ export class YjsEvoluHistoryEngine {
     this.logInfo("Deferred seed: seeding files", { count: this.pendingVaultSeed.size });
     for (const path of this.pendingVaultSeed) {
       if (!this.isActive || this.isStopped) break;
-      // Only seed if not already opened by poll (early-return in getOrLoadFileState)
+      // Only seed if incoming processing has not already opened the file.
       if (!this.states.has(path)) {
         this.logInfo("Deferred seed: seeding new file", { path });
         await this.getOrLoadFileState(path); // seedFromVault: true (default)
@@ -800,7 +823,6 @@ export class YjsEvoluHistoryEngine {
     if (this.isStopped) return;
     if (!this.localSyncConfig.syncObsidianSettings || this.pendingSettingSeed.size === 0) return;
 
-    const remoteSettings = await this.loadLatestSettingUpdatesFromHistory();
     this.logInfo("Deferred settings seed: seeding files", { count: this.pendingSettingSeed.size });
     for (const path of this.pendingSettingSeed) {
       if (!this.isActive || this.isStopped) break;
@@ -809,7 +831,7 @@ export class YjsEvoluHistoryEngine {
         continue;
       }
 
-      const remote = remoteSettings.get(path);
+      const remote = await this.loadLatestSettingUpdateForPath(path);
       if (remote) {
         await this.applyRemoteSettingUpdate(remote);
         this.pendingSettingSeed.delete(path);
@@ -845,7 +867,7 @@ export class YjsEvoluHistoryEngine {
       const id = createIdFromString<"FileUpdate">(
         `startup-retransmit:${path}:${this.deviceId}`,
       );
-      this.evolu.upsert("fileUpdate", { id, path, updateBase64 });
+      this.evolu.upsert("fileUpdate", { id, path, updateBase64, originDeviceId: this.deviceId });
       await this.saveLocalSnapshot(path, st);
       this.logInfo("Startup scan: retransmitted", { path, bytes: updateBytes.length });
       return true;
@@ -871,6 +893,7 @@ export class YjsEvoluHistoryEngine {
       contentBase64: encoded.contentBase64,
       contentHash,
       encoding: encoded.encoding,
+      originDeviceId: this.deviceId,
     });
     this.saveSettingSnapshot(path, contentHash);
     this.logInfo(message, {
@@ -894,6 +917,7 @@ export class YjsEvoluHistoryEngine {
       contentHash: "DELETED",
       encoding: null,
       type: "delete",
+      originDeviceId: this.deviceId,
     });
     this.tombstoneSettingSnapshot(path);
     this.logInfo(message, { path });
@@ -915,8 +939,7 @@ export class YjsEvoluHistoryEngine {
       this.isStopped = true;
       this.stopPollingTimer();
       this.stopRescanTimer();
-      this.stopMaterializerSubscriptions();
-      this.stopMaterializerRefreshTimers();
+      this.stopInboxSubscriptions();
       // Wait for any in-progress materialization work to finish before closing
       // open docs and flushing the database.
       await this.ongoingPoll;
@@ -954,6 +977,7 @@ export class YjsEvoluHistoryEngine {
       this.config = newConfig;
       this.stopPollingTimer();
       this.startPollingTimer();
+      this.startInboxSubscriptions();
       await this.enforceLruLimit();
       this.logInfo("Engine config updated", this.config);
     } catch (e) {
@@ -1033,8 +1057,7 @@ export class YjsEvoluHistoryEngine {
     this.fileMaterializationBlockedSignatures.clear();
     this.stopRescanTimer();
     this.startRescanTimer();
-    void this.refreshFileMaterializationPlans("path policy updated");
-    void this.refreshSettingMaterializationPlans("path policy updated");
+    this.kickIncrementalInboxes();
     this.logInfo("Local sync path policy updated", config);
   }
 
@@ -1049,8 +1072,7 @@ export class YjsEvoluHistoryEngine {
     if (this.isStopped) return;
     this.isActive = true;
     this.logInfo("App active");
-    void this.refreshFileMaterializationPlans("active");
-    void this.refreshSettingMaterializationPlans("active");
+    this.kickIncrementalInboxes();
     void this.handleHistoryQuietTick();
   }
 
@@ -1146,11 +1168,14 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
-  // ---------- materializer timer ----------
+  // ---------- inbox subscriptions and quiet timer ----------
 
   private startPollingTimer() {
     this.pollTimer = setInterval(() => {
-      if (this.isActive) void this.handleHistoryQuietTick();
+      if (this.isActive) {
+        this.kickIncrementalInboxes();
+        void this.handleHistoryQuietTick();
+      }
     }, this.config.historyPollMs);
   }
 
@@ -1159,28 +1184,43 @@ export class YjsEvoluHistoryEngine {
     this.pollTimer = null;
   }
 
-  private startMaterializerSubscriptions() {
-    this.stopMaterializerSubscriptions();
+  private startInboxSubscriptions() {
+    this.stopInboxSubscriptions();
 
-    const fileQuery = this.createFileUpdateMetaQuery();
-    const settingQuery = this.createSettingUpdateRowsQuery();
+    const fileQuery = this.createPendingFileUpdateQuery();
+    const settingQuery = this.createPendingSettingUpdateQuery();
+
+    const consumeFileRows = (rows: ReadonlyArray<any>) => {
+      this.fileInboxInitialized = true;
+      this.enqueuePendingFileRows(rows);
+    };
+    const consumeSettingRows = (rows: ReadonlyArray<any>) => {
+      this.settingInboxInitialized = true;
+      this.enqueuePendingSettingRows(rows);
+    };
 
     this.unsubscribers.push(
       this.evolu.subscribeQuery(fileQuery)(() => {
-        this.scheduleFileMaterializationRefresh("fileUpdate subscription");
+        consumeFileRows(this.evolu.getQueryRows(fileQuery) as ReadonlyArray<any>);
       }),
     );
-    this.unsubscribers.push(
-      this.evolu.subscribeQuery(settingQuery)(() => {
-        this.scheduleSettingMaterializationRefresh("settingUpdate subscription");
-      }),
-    );
+    if (this.localSyncConfig.syncObsidianSettings) {
+      this.unsubscribers.push(
+        this.evolu.subscribeQuery(settingQuery)(() => {
+          consumeSettingRows(this.evolu.getQueryRows(settingQuery) as ReadonlyArray<any>);
+        }),
+      );
+    } else {
+      this.settingInboxInitialized = true;
+    }
 
-    void this.refreshFileMaterializationPlans("startup");
-    void this.refreshSettingMaterializationPlans("startup");
+    void this.evolu.loadQuery(fileQuery).then((rows) => consumeFileRows(rows as ReadonlyArray<any>));
+    if (this.localSyncConfig.syncObsidianSettings) {
+      void this.evolu.loadQuery(settingQuery).then((rows) => consumeSettingRows(rows as ReadonlyArray<any>));
+    }
   }
 
-  private stopMaterializerSubscriptions() {
+  private stopInboxSubscriptions() {
     for (const unsubscribe of this.unsubscribers) {
       try {
         unsubscribe();
@@ -1191,52 +1231,579 @@ export class YjsEvoluHistoryEngine {
     this.unsubscribers = [];
   }
 
-  private stopMaterializerRefreshTimers() {
-    if (this.fileMaterializationRefreshTimer != null) {
-      clearTimeout(this.fileMaterializationRefreshTimer);
-      this.fileMaterializationRefreshTimer = null;
+  private createPendingFileUpdateQuery() {
+    return this.evolu.createQuery((db) =>
+      (db as any)
+        .selectFrom("fileUpdate as incoming")
+        .leftJoin("_processedFileUpdate as processed", (join: any) =>
+          join
+            .onRef("processed.sourceId", "=", "incoming.id")
+            .onRef("processed.sourceVersion", "=", "incoming.updatedAt"),
+        )
+        .select([
+          "incoming.id as id",
+          "incoming.path as path",
+          "incoming.updateBase64 as updateBase64",
+          "incoming.type as type",
+          "incoming.createdAt as createdAt",
+          "incoming.updatedAt as updatedAt",
+        ])
+        .where("incoming.isDeleted", "is", null)
+        .where("processed.id", "is", null)
+        .where((eb: any) =>
+          eb.or([
+            eb("incoming.originDeviceId", "is", null),
+            eb("incoming.originDeviceId", "!=", this.deviceId),
+          ]),
+        )
+        .orderBy("incoming.createdAt", "asc")
+        .orderBy("incoming.id", "asc")
+        .limit(this.config.historyBatchSize),
+    );
+  }
+
+  private createPendingSettingUpdateQuery() {
+    return this.evolu.createQuery((db) =>
+      (db as any)
+        .selectFrom("settingUpdate as incoming")
+        .leftJoin("_processedSettingUpdate as processed", (join: any) =>
+          join
+            .onRef("processed.sourceId", "=", "incoming.id")
+            .onRef("processed.sourceVersion", "=", "incoming.updatedAt"),
+        )
+        .select([
+          "incoming.id as id",
+          "incoming.path as path",
+          "incoming.contentBase64 as contentBase64",
+          "incoming.contentHash as contentHash",
+          "incoming.encoding as encoding",
+          "incoming.type as type",
+          "incoming.createdAt as createdAt",
+          "incoming.updatedAt as updatedAt",
+        ])
+        .where("incoming.isDeleted", "is", null)
+        .where("processed.id", "is", null)
+        .where((eb: any) =>
+          eb.or([
+            eb("incoming.originDeviceId", "is", null),
+            eb("incoming.originDeviceId", "!=", this.deviceId),
+          ]),
+        )
+        .orderBy("incoming.createdAt", "asc")
+        .orderBy("incoming.id", "asc")
+        .limit(this.config.historyBatchSize),
+    );
+  }
+
+  private enqueuePendingFileRows(rows: ReadonlyArray<any>) {
+    for (const row of rows) {
+      if (!row.id || !row.path || !row.updateBase64 || !row.createdAt || !row.updatedAt) continue;
+      const pending: PendingFileUpdateRow = {
+        id: row.id as string,
+        path: row.path as string,
+        updateBase64: row.updateBase64 as string,
+        type: (row.type as string | null) ?? null,
+        createdAt: row.createdAt as string,
+        updatedAt: row.updatedAt as string,
+      };
+      this.pendingFileInbox.set(this.inboxKey(pending), pending);
     }
-    if (this.settingMaterializationRefreshTimer != null) {
-      clearTimeout(this.settingMaterializationRefreshTimer);
-      this.settingMaterializationRefreshTimer = null;
+    this.kickIncrementalInboxes();
+  }
+
+  private enqueuePendingSettingRows(rows: ReadonlyArray<any>) {
+    for (const row of rows) {
+      if (!row.id || !row.path || !row.contentHash || !row.createdAt || !row.updatedAt) continue;
+      const pending: PendingSettingUpdateRow = {
+        id: row.id as string,
+        path: row.path as string,
+        contentBase64: (row.contentBase64 as string | null) ?? "",
+        contentHash: row.contentHash as string,
+        encoding: (row.encoding as string | null) ?? null,
+        type: (row.type as string | null) ?? null,
+        createdAt: row.createdAt as string,
+        updatedAt: row.updatedAt as string,
+      };
+      this.pendingSettingInbox.set(this.inboxKey(pending), pending);
+    }
+    this.kickIncrementalInboxes();
+  }
+
+  private inboxKey(row: { id: string; updatedAt: string }): string {
+    return `${row.id}:${row.updatedAt}`;
+  }
+
+  private canProcessIncomingPath(path: string): boolean {
+    if (!this.localSyncConfig.startupScan || this.scanComplete) return true;
+    return this.startupPathsReady && !this.startupUnscannedPaths.has(path);
+  }
+
+  private kickIncrementalInboxes() {
+    if (this.isStopped || !this.isActive) return;
+    void this.runFileInbox();
+    void this.runSettingInbox();
+  }
+
+  private async runFileInbox() {
+    if (this.fileInboxRunning || this.isStopped || !this.isActive) return;
+    const firstEligible = Array.from(this.pendingFileInbox.values()).find((row) =>
+      this.canProcessIncomingPath(row.path),
+    );
+    if (!firstEligible) return;
+
+    this.fileInboxRunning = true;
+    const run = this.ongoingPoll.then(async () => {
+      while (!this.isStopped && this.isActive) {
+        const first = Array.from(this.pendingFileInbox.values()).find((row) =>
+          this.canProcessIncomingPath(row.path),
+        );
+        if (!first) break;
+        const rows = Array.from(this.pendingFileInbox.values())
+          .filter((row) => row.path === first.path)
+          .sort(compareUpdateOrder);
+        if (!(await this.processPendingFilePath(first.path, rows))) break;
+        for (const row of rows) this.pendingFileInbox.delete(this.inboxKey(row));
+      }
+    });
+    this.ongoingPoll = run.then(() => undefined, () => undefined);
+    try {
+      await run;
+    } catch (error) {
+      this.logError("Incremental file inbox failed", error);
+    } finally {
+      this.fileInboxRunning = false;
+      void this.handleHistoryQuietTick();
     }
   }
 
-  private scheduleFileMaterializationRefresh(label: string) {
-    if (this.isStopped) return;
-    this.fileMaterializationRefreshQueuedLabel = this.fileMaterializationRefreshQueuedLabel
-      ? "multiple fileUpdate subscription events"
-      : label;
-    if (this.fileMaterializationRefreshTimer != null) return;
+  private async runSettingInbox() {
+    if (this.settingInboxRunning || this.isStopped || !this.isActive) return;
+    const firstEligible = Array.from(this.pendingSettingInbox.values()).find((row) =>
+      this.canProcessIncomingPath(row.path),
+    );
+    if (!firstEligible) return;
 
-    this.fileMaterializationRefreshTimer = setTimeout(() => {
-      this.fileMaterializationRefreshTimer = null;
-      const queuedLabel = this.fileMaterializationRefreshQueuedLabel ?? label;
-      this.fileMaterializationRefreshQueuedLabel = null;
-      void this.refreshFileMaterializationPlans(queuedLabel);
-    }, this.config.materializerRefreshDebounceMs);
+    this.settingInboxRunning = true;
+    const run = this.ongoingPoll.then(async () => {
+      while (!this.isStopped && this.isActive) {
+        const first = Array.from(this.pendingSettingInbox.values()).find((row) =>
+          this.canProcessIncomingPath(row.path),
+        );
+        if (!first) break;
+        const rows = Array.from(this.pendingSettingInbox.values())
+          .filter((row) => row.path === first.path)
+          .sort(compareUpdateOrder);
+        if (!(await this.processPendingSettingPath(first.path, rows))) break;
+        for (const row of rows) this.pendingSettingInbox.delete(this.inboxKey(row));
+      }
+    });
+    this.ongoingPoll = run.then(() => undefined, () => undefined);
+    try {
+      await run;
+    } catch (error) {
+      this.logError("Incremental setting inbox failed", error);
+    } finally {
+      this.settingInboxRunning = false;
+      void this.handleHistoryQuietTick();
+    }
   }
 
-  private scheduleSettingMaterializationRefresh(label: string) {
-    if (this.isStopped) return;
-    this.settingMaterializationRefreshQueuedLabel = this.settingMaterializationRefreshQueuedLabel
-      ? "multiple settingUpdate subscription events"
-      : label;
-    if (this.settingMaterializationRefreshTimer != null) return;
+  private async initializeIncrementalInbox() {
+    const stateId = createIdFromString<"InboxState">("incremental-inbox-v1");
+    const stateQuery = this.evolu.createQuery((db) =>
+      db
+        .selectFrom("_inboxState")
+        .select(["version"])
+        .where("id", "=", stateId)
+        .where("isDeleted", "is", null)
+        .limit(1),
+    );
+    if ((await this.evolu.loadQuery(stateQuery)).length > 0) return;
 
-    this.settingMaterializationRefreshTimer = setTimeout(() => {
-      this.settingMaterializationRefreshTimer = null;
-      const queuedLabel = this.settingMaterializationRefreshQueuedLabel ?? label;
-      this.settingMaterializationRefreshQueuedLabel = null;
-      void this.refreshSettingMaterializationPlans(queuedLabel);
-    }, this.config.materializerRefreshDebounceMs);
+    const fileSnapshotQuery = this.evolu.createQuery((db) =>
+      db.selectFrom("_fileSnapshot").select(["id"]).limit(1),
+    );
+    const settingSnapshotQuery = this.evolu.createQuery((db) =>
+      db.selectFrom("_settingSnapshot").select(["id"]).limit(1),
+    );
+    const fileMaterializationQuery = this.evolu.createQuery((db) =>
+      db.selectFrom("_fileMaterialization").select(["id"]).limit(1),
+    );
+    const settingMaterializationQuery = this.evolu.createQuery((db) =>
+      db.selectFrom("_settingMaterialization").select(["id"]).limit(1),
+    );
+    const localStateRows = await Promise.all([
+      this.evolu.loadQuery(fileSnapshotQuery),
+      this.evolu.loadQuery(settingSnapshotQuery),
+      this.evolu.loadQuery(fileMaterializationQuery),
+      this.evolu.loadQuery(settingMaterializationQuery),
+    ]);
+    const isExistingPeer = localStateRows.some((rows) => rows.length > 0);
+
+    if (isExistingPeer) {
+      const fileRowsQuery = this.evolu.createQuery((db) =>
+        (db as any)
+          .selectFrom("fileUpdate")
+          .select(["id", "path", "type", "createdAt", "updatedAt"])
+          .where("isDeleted", "is", null)
+          .orderBy("createdAt", "asc")
+          .orderBy("id", "asc"),
+      );
+      const settingRowsQuery = this.evolu.createQuery((db) =>
+        (db as any)
+          .selectFrom("settingUpdate")
+          .select(["id", "path", "contentHash", "type", "createdAt", "updatedAt"])
+          .where("isDeleted", "is", null)
+          .orderBy("createdAt", "asc")
+          .orderBy("id", "asc"),
+      );
+      const fileSignaturesQuery = this.evolu.createQuery((db) =>
+        db
+          .selectFrom("_fileMaterialization")
+          .select(["path", "signature"])
+          .where("isDeleted", "is", null),
+      );
+      const settingSignaturesQuery = this.evolu.createQuery((db) =>
+        db
+          .selectFrom("_settingMaterialization")
+          .select(["path", "signature"])
+          .where("isDeleted", "is", null),
+      );
+      const [fileRows, settingRows, fileSignatures, settingSignatures] = await Promise.all([
+        this.evolu.loadQuery(fileRowsQuery),
+        this.evolu.loadQuery(settingRowsQuery),
+        this.evolu.loadQuery(fileSignaturesQuery),
+        this.evolu.loadQuery(settingSignaturesQuery),
+      ]);
+      const trustedFileRows = this.collectTrustedFileMigrationRows(
+        fileRows as ReadonlyArray<any>,
+        fileSignatures as ReadonlyArray<any>,
+      );
+      const trustedSettingRows = this.collectTrustedSettingMigrationRows(
+        settingRows as ReadonlyArray<any>,
+        settingSignatures as ReadonlyArray<any>,
+      );
+      await this.markFileRowsProcessed(trustedFileRows);
+      await this.markSettingRowsProcessed(trustedSettingRows);
+      this.logInfo("Incremental inbox migration: imported materialization checkpoints", {
+        trustedFileRows: trustedFileRows.length,
+        pendingFileRows: fileRows.length - trustedFileRows.length,
+        trustedSettingRows: trustedSettingRows.length,
+        pendingSettingRows: settingRows.length - trustedSettingRows.length,
+      });
+    }
+
+    await this.upsertAndWait("_inboxState", { id: stateId, version: "1" });
+    await this.persistLocalDb?.();
+  }
+
+  private collectTrustedFileMigrationRows(
+    rows: ReadonlyArray<any>,
+    signatures: ReadonlyArray<any>,
+  ): ReadonlyArray<any> {
+    const savedByPath = new Map<string, string>(
+      signatures
+        .filter((row) => row.path && row.signature)
+        .map((row) => [row.path as string, row.signature as string]),
+    );
+    const rowsByPath = new Map<string, any[]>();
+    for (const row of rows) {
+      if (!row.path || !row.id) continue;
+      const pathRows = rowsByPath.get(row.path as string) ?? [];
+      pathRows.push(row);
+      rowsByPath.set(row.path as string, pathRows);
+    }
+
+    const trusted: any[] = [];
+    for (const [path, pathRows] of rowsByPath) {
+      const signature = this.createMaterializationSignature(
+        pathRows.map((row) => `${row.id as string}:${(row.type as string | null) ?? ""}`),
+      );
+      if (savedByPath.get(path) === signature) trusted.push(...pathRows);
+    }
+    return trusted;
+  }
+
+  private collectTrustedSettingMigrationRows(
+    rows: ReadonlyArray<any>,
+    signatures: ReadonlyArray<any>,
+  ): ReadonlyArray<any> {
+    const savedByPath = new Map<string, string>(
+      signatures
+        .filter((row) => row.path && row.signature)
+        .map((row) => [row.path as string, row.signature as string]),
+    );
+    const rowsByPath = new Map<string, any[]>();
+    for (const row of rows) {
+      if (!row.path || !row.id || !row.contentHash) continue;
+      const pathRows = rowsByPath.get(row.path as string) ?? [];
+      pathRows.push(row);
+      rowsByPath.set(row.path as string, pathRows);
+    }
+
+    const trusted: any[] = [];
+    for (const [path, pathRows] of rowsByPath) {
+      const latest = pathRows[pathRows.length - 1];
+      const signature = this.createMaterializationSignature([
+        latest.id as string,
+        latest.contentHash as string,
+        (latest.type as string | null) ?? "",
+      ]);
+      if (savedByPath.get(path) === signature) trusted.push(...pathRows);
+    }
+    return trusted;
+  }
+
+  private async upsertAndWait(table: string, row: Record<string, unknown>): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const result = (this.evolu.upsert as any)(table, row, { onComplete: resolve });
+      if (result && result.ok === false) {
+        reject(new Error(`Failed to upsert ${table}: ${JSON.stringify(result.error)}`));
+      }
+    });
+  }
+
+  private async markFileRowsProcessed(rows: ReadonlyArray<{ id?: unknown; updatedAt?: unknown }>) {
+    const validRows = rows.filter(
+      (row) => typeof row.id === "string" && typeof row.updatedAt === "string",
+    );
+    for (let offset = 0; offset < validRows.length; offset += 250) {
+      if (validRows.length > 1000 && offset % 2500 === 0) {
+        this.logInfo("Incremental inbox migration: file marker progress", {
+          processed: offset,
+          total: validRows.length,
+        });
+      }
+      await Promise.all(
+        validRows.slice(offset, offset + 250).map((row) => {
+          const sourceId = row.id as string;
+          const sourceVersion = row.updatedAt as string;
+          const id = createIdFromString<"ProcessedFileUpdate">(
+            `processed-file:${sourceId}:${sourceVersion}`,
+          );
+          return this.upsertAndWait("_processedFileUpdate", { id, sourceId, sourceVersion });
+        }),
+      );
+    }
+  }
+
+  private async markSettingRowsProcessed(rows: ReadonlyArray<{ id?: unknown; updatedAt?: unknown }>) {
+    const validRows = rows.filter(
+      (row) => typeof row.id === "string" && typeof row.updatedAt === "string",
+    );
+    for (let offset = 0; offset < validRows.length; offset += 250) {
+      if (validRows.length > 1000 && offset % 2500 === 0) {
+        this.logInfo("Incremental inbox migration: setting marker progress", {
+          processed: offset,
+          total: validRows.length,
+        });
+      }
+      await Promise.all(
+        validRows.slice(offset, offset + 250).map((row) => {
+          const sourceId = row.id as string;
+          const sourceVersion = row.updatedAt as string;
+          const id = createIdFromString<"ProcessedSettingUpdate">(
+            `processed-setting:${sourceId}:${sourceVersion}`,
+          );
+          return this.upsertAndWait("_processedSettingUpdate", { id, sourceId, sourceVersion });
+        }),
+      );
+    }
+  }
+
+  private async reconcileLocalFileBeforeIncoming(path: string): Promise<boolean> {
+    if (this.states.has(path)) {
+      const closed = await this.closeDoc(path);
+      if (!closed) return false;
+      this.states.delete(path);
+    }
+
+    const current = await this.vault.readText(path);
+    const snapshot = await this.loadLocalSnapshotText(path);
+    if (current === null || current === snapshot) return true;
+
+    await this.getOrLoadFileState(path);
+    const closed = await this.closeDoc(path);
+    if (closed) this.states.delete(path);
+    return closed;
+  }
+
+  private async processPendingFilePath(path: string, rows: PendingFileUpdateRow[]): Promise<boolean> {
+    if (!isTrackedVaultPath(path, this.localSyncConfig)) {
+      await this.markFileRowsProcessed(rows);
+      await this.persistLocalDb?.();
+      return true;
+    }
+    if (!(await this.reconcileLocalFileBeforeIncoming(path))) return false;
+
+    try {
+      if (rows.some((row) => row.type === "delete")) {
+        const allRows = await this.loadFileUpdateRowsForPath(path);
+        const materialized = this.materializeFileRows(allRows);
+        if (materialized === null) {
+          const existed = await this.vault.fileExists(path);
+          this.destroyDoc(path);
+          this.tombstoneSnapshot(path);
+          if (existed) {
+            this.pendingRemoteDeletes.add(path);
+            try {
+              await this.vault.deleteFile(path);
+            } finally {
+              this.pendingRemoteDeletes.delete(path);
+            }
+          }
+        } else {
+          await this.writeIncrementalFileState(path, materialized.doc, materialized.text);
+        }
+      } else {
+        const latestDelete = await this.loadLatestFileDelete(path);
+        const applicable = latestDelete
+          ? rows.filter((row) => compareUpdateOrder(row, latestDelete) > 0)
+          : rows;
+
+        if (applicable.length > 0) {
+          const doc = new Y.Doc();
+          const text = doc.getText("content");
+          const snapshot = await this.loadLocalSnapshot(path);
+          if (snapshot) Y.applyUpdate(doc, fromBase64(snapshot));
+          for (const row of applicable) {
+            Y.applyUpdate(doc, fromBase64(row.updateBase64), "remote");
+          }
+          await this.writeIncrementalFileState(path, doc, text);
+        }
+      }
+
+      await this.markFileRowsProcessed(rows);
+      await this.persistLocalDb?.();
+      this.pendingVaultSeed.delete(path);
+      this.logInfo("Incremental file updates applied", { path, updates: rows.length });
+      return true;
+    } catch (error) {
+      this.logError("processPendingFilePath failed", { path, error });
+      return false;
+    }
+  }
+
+  private async writeIncrementalFileState(path: string, doc: Y.Doc, text: Y.Text): Promise<void> {
+    const current = await this.vault.readText(path);
+    const state = this.createFileStateFromDoc(path, doc, text, current ?? "", true);
+    const written = await this.writeYjsToVault(path, state);
+    if (!written) {
+      doc.destroy();
+      throw new Error(`Failed to write incremental file state: ${path}`);
+    }
+    this.states.set(path, state);
+    await this.saveLocalSnapshot(path, state);
+    await this.enforceLruLimit();
+  }
+
+  private async loadFileUpdateRowsForPath(path: string): Promise<PendingFileUpdateRow[]> {
+    const query = this.evolu.createQuery((db) =>
+      (db as any)
+        .selectFrom("fileUpdate")
+        .select(["id", "path", "updateBase64", "type", "createdAt", "updatedAt"])
+        .where("path", "=", path)
+        .where("isDeleted", "is", null)
+        .orderBy("createdAt", "asc")
+        .orderBy("id", "asc"),
+    );
+    return (await this.evolu.loadQuery(query)) as unknown as PendingFileUpdateRow[];
+  }
+
+  private materializeFileRows(rows: PendingFileUpdateRow[]): { doc: Y.Doc; text: Y.Text } | null {
+    let doc = new Y.Doc();
+    let text = doc.getText("content");
+    let sawContent = false;
+    for (const row of rows) {
+      if (row.type === "delete") {
+        doc.destroy();
+        doc = new Y.Doc();
+        text = doc.getText("content");
+        sawContent = false;
+      } else {
+        Y.applyUpdate(doc, fromBase64(row.updateBase64), "remote");
+        sawContent = true;
+      }
+    }
+    if (sawContent) return { doc, text };
+    doc.destroy();
+    return null;
+  }
+
+  private async loadLatestFileDelete(path: string): Promise<{ id: string; createdAt: string } | null> {
+    const query = this.evolu.createQuery((db) =>
+      (db as any)
+        .selectFrom("fileUpdate")
+        .select(["id", "createdAt"])
+        .where("path", "=", path)
+        .where("type", "=", "delete")
+        .where("isDeleted", "is", null)
+        .orderBy("createdAt", "desc")
+        .orderBy("id", "desc")
+        .limit(1),
+    );
+    const rows = (await this.evolu.loadQuery(query)) as ReadonlyArray<any>;
+    if (!rows[0]?.id || !rows[0]?.createdAt) return null;
+    return { id: rows[0].id as string, createdAt: rows[0].createdAt as string };
+  }
+
+  private async processPendingSettingPath(path: string, rows: PendingSettingUpdateRow[]): Promise<boolean> {
+    if (!this.localSyncConfig.syncObsidianSettings || !isTrackedSettingPath(path, this.localSyncConfig)) {
+      await this.markSettingRowsProcessed(rows);
+      await this.persistLocalDb?.();
+      return true;
+    }
+
+    try {
+      const current = await this.vault.readText(path);
+      const snapshot = await this.loadSettingSnapshot(path);
+      const currentHash = current === null ? null : hashText(current);
+      if (current !== null && snapshot?.contentHash !== currentHash) {
+        await this.advertiseSettingContent(path, current, currentHash ?? hashText(current));
+      } else {
+        const latest = await this.loadLatestSettingUpdateForPath(path);
+        if (latest) await this.applyRemoteSettingUpdate(latest);
+      }
+      await this.markSettingRowsProcessed(rows);
+      await this.persistLocalDb?.();
+      this.pendingSettingSeed.delete(path);
+      this.logInfo("Incremental setting updates applied", { path, updates: rows.length });
+      return true;
+    } catch (error) {
+      this.logError("processPendingSettingPath failed", { path, error });
+      return false;
+    }
+  }
+
+  private async loadLatestSettingUpdateForPath(path: string): Promise<SettingUpdateWithId | null> {
+    const query = this.evolu.createQuery((db) =>
+      (db as any)
+        .selectFrom("settingUpdate")
+        .select(["id", "path", "contentBase64", "contentHash", "encoding", "type"])
+        .where("path", "=", path)
+        .where("isDeleted", "is", null)
+        .orderBy("createdAt", "desc")
+        .orderBy("id", "desc")
+        .limit(1),
+    );
+    const rows = (await this.evolu.loadQuery(query)) as ReadonlyArray<any>;
+    const row = rows[0];
+    if (!row?.id || !row?.path || !row?.contentHash) return null;
+    return {
+      id: row.id as string,
+      path: row.path as string,
+      contentBase64: (row.contentBase64 as string | null) ?? "",
+      contentHash: row.contentHash as string,
+      encoding: (row.encoding as string | null) ?? null,
+      type: (row.type as string | null) ?? null,
+    };
   }
 
   private createFileUpdateMetaQuery() {
     return this.evolu.createQuery((db) =>
       (db as any)
         .selectFrom("fileUpdate")
-        .select(["id", "path", "type"])
+        .select(["id", "path", "type", "updatedAt"])
         .where("isDeleted", "is", null)
         .orderBy("createdAt", "asc")
         .orderBy("id", "asc"),
@@ -1247,7 +1814,7 @@ export class YjsEvoluHistoryEngine {
     return this.evolu.createQuery((db) =>
       (db as any)
         .selectFrom("settingUpdate")
-        .select(["id", "path", "contentBase64", "contentHash", "encoding", "type", "createdAt"])
+        .select(["id", "path", "contentBase64", "contentHash", "encoding", "type", "createdAt", "updatedAt"])
         .where("isDeleted", "is", null)
         .orderBy("createdAt", "asc")
         .orderBy("id", "asc"),
@@ -1269,7 +1836,7 @@ export class YjsEvoluHistoryEngine {
       ids.push(row.id as string);
       idsByPath.set(path, ids);
       const signatureParts = signaturePartsByPath.get(path) ?? [];
-      signatureParts.push(`${row.id as string}:${type ?? ""}`);
+      signatureParts.push(`${row.id as string}:${type ?? ""}:${(row.updatedAt as string | null) ?? ""}`);
       signaturePartsByPath.set(path, signatureParts);
       latestTypeByPath.set(path, type);
     }
@@ -1284,63 +1851,6 @@ export class YjsEvoluHistoryEngine {
       plans.push({ path, ids, signature, latestType });
     }
     return plans;
-  }
-
-  private async refreshFileMaterializationPlans(label: string) {
-    if (this.isStopped || !this.isActive) return;
-    if (this.localSyncConfig.startupScan && !this.scanComplete) {
-      return;
-    }
-    if (this.fileMaterializationRefreshRunning) {
-      this.scheduleFileMaterializationRefresh(label);
-      return;
-    }
-
-    this.fileMaterializationRefreshRunning = true;
-    try {
-      const plans = await this.collectFileMaterializationPlans(false);
-      for (const plan of plans) {
-        this.fileMaterializationPlans.set(plan.path, plan);
-        this.fileMaterializationQueue.add(plan.path);
-      }
-
-      this.fileMaterializerInitialized = true;
-      if (plans.length > 0) this.hasLoggedQuietSyncInventory = false;
-      this.logInfo("File materialization plans refreshed", {
-        label,
-        enqueued: plans.length,
-      });
-      void this.runFileMaterializer();
-      void this.handleHistoryQuietTick();
-    } catch (error) {
-      this.logError("refreshFileMaterializationPlans failed", { label, error });
-    } finally {
-      this.fileMaterializationRefreshRunning = false;
-    }
-  }
-
-  private async runFileMaterializer() {
-    if (this.fileMaterializerRunning || this.isStopped || !this.isActive) return;
-    this.fileMaterializerRunning = true;
-    this.ongoingPoll = this.ongoingPoll.then(async () => {
-      try {
-        while (!this.isStopped && this.isActive && this.fileMaterializationQueue.size > 0) {
-          const path = this.fileMaterializationQueue.values().next().value as string | undefined;
-          if (!path) break;
-          this.fileMaterializationQueue.delete(path);
-          const plan = this.fileMaterializationPlans.get(path);
-          if (!plan) continue;
-          await this.materializeFilePlan(plan);
-        }
-      } finally {
-        this.fileMaterializerRunning = false;
-        void this.handleHistoryQuietTick();
-        if (!this.isStopped && this.isActive && this.fileMaterializationQueue.size > 0) {
-          void this.runFileMaterializer();
-        }
-      }
-    });
-    await this.ongoingPoll;
   }
 
   private async materializeFilePlan(plan: FileMaterializationPlan): Promise<MaterializationOutcome> {
@@ -1457,6 +1967,7 @@ export class YjsEvoluHistoryEngine {
         setting.id,
         setting.contentHash,
         setting.type ?? "",
+        (row.updatedAt as string | null) ?? "",
       ]);
       latestByPath.set(path, { path, id: setting.id, signature, row: setting });
     }
@@ -1468,70 +1979,6 @@ export class YjsEvoluHistoryEngine {
       plans.push(plan);
     }
     return plans;
-  }
-
-  private async refreshSettingMaterializationPlans(label: string) {
-    if (this.isStopped || !this.isActive) return;
-    if (!this.localSyncConfig.syncObsidianSettings) {
-      this.settingMaterializerInitialized = true;
-      return;
-    }
-    if (this.settingMaterializationRefreshRunning) {
-      this.scheduleSettingMaterializationRefresh(label);
-      return;
-    }
-
-    this.settingMaterializationRefreshRunning = true;
-    try {
-      const plans = await this.collectSettingMaterializationPlans(false);
-
-      for (const plan of plans) {
-        this.settingMaterializationPlans.set(plan.path, plan);
-        this.settingMaterializationQueue.add(plan.path);
-      }
-
-      this.settingMaterializerInitialized = true;
-      if (plans.length > 0) this.hasLoggedQuietSyncInventory = false;
-      const payload = {
-        label,
-        enqueued: plans.length,
-      };
-      if (plans.length > 0) {
-        this.logInfo("Setting materialization plans refreshed", payload);
-      } else {
-        this.logDebug("Setting materialization plans refreshed", payload);
-      }
-      void this.runSettingMaterializer();
-      void this.handleHistoryQuietTick();
-    } catch (error) {
-      this.logError("refreshSettingMaterializationPlans failed", { label, error });
-    } finally {
-      this.settingMaterializationRefreshRunning = false;
-    }
-  }
-
-  private async runSettingMaterializer() {
-    if (this.settingMaterializerRunning || this.isStopped || !this.isActive) return;
-    this.settingMaterializerRunning = true;
-    this.ongoingPoll = this.ongoingPoll.then(async () => {
-      try {
-        while (!this.isStopped && this.isActive && this.settingMaterializationQueue.size > 0) {
-          const path = this.settingMaterializationQueue.values().next().value as string | undefined;
-          if (!path) break;
-          this.settingMaterializationQueue.delete(path);
-          const plan = this.settingMaterializationPlans.get(path);
-          if (!plan) continue;
-          await this.materializeSettingPlan(plan);
-        }
-      } finally {
-        this.settingMaterializerRunning = false;
-        void this.handleHistoryQuietTick();
-        if (!this.isStopped && this.isActive && this.settingMaterializationQueue.size > 0) {
-          void this.runSettingMaterializer();
-        }
-      }
-    });
-    await this.ongoingPoll;
   }
 
   private async materializeSettingPlan(plan: SettingMaterializationPlan): Promise<MaterializationOutcome> {
@@ -1583,12 +2030,14 @@ export class YjsEvoluHistoryEngine {
 
   private async handleHistoryQuietTick() {
     if (this.isStopped || !this.isActive) return;
-    if (!this.fileMaterializerInitialized || !this.settingMaterializerInitialized) return;
+    if (!this.fileInboxInitialized || !this.settingInboxInitialized) return;
     if (
+      this.fileInboxRunning ||
+      this.settingInboxRunning ||
       this.fileMaterializerRunning ||
       this.settingMaterializerRunning ||
-      this.fileMaterializationQueue.size > 0 ||
-      this.settingMaterializationQueue.size > 0
+      this.pendingFileInbox.size > 0 ||
+      this.pendingSettingInbox.size > 0
     ) {
       return;
     }
@@ -1603,17 +2052,8 @@ export class YjsEvoluHistoryEngine {
     if (!this.pendingVaultSeedReady) {
       this.pendingVaultSeedReady = true;
     } else {
-      if (this.pendingSettingSeed.size > 0) {
-        await this.repairSettingsFromRemoteState("History quiet settings repair");
-      }
       await this.drainPendingVaultSeed();
       await this.drainPendingSettingSeed();
-    }
-
-    if (!this.hasLoggedQuietSyncInventory) {
-      this.hasLoggedQuietSyncInventory = true;
-      const inventory = await this.logSyncInventory("history-quiet");
-      await this.repairMissingFileUpdates(inventory.vaultPathsMissingFileUpdate);
     }
   }
 
@@ -1736,138 +2176,6 @@ export class YjsEvoluHistoryEngine {
     this.states.delete(path);
   }
 
-  private async logSyncInventory(
-    stage: string,
-    trackedFiles?: VaultFile[],
-  ): Promise<SyncInventory> {
-    try {
-      const files =
-        trackedFiles ??
-        (await this.vault.listFiles()).filter((file) =>
-          isTrackedVaultFile(file, this.localSyncConfig),
-        );
-      const vaultPaths = new Set(files.map((file) => file.path));
-
-      const snapshotQ = this.evolu.createQuery((db) =>
-        db
-          .selectFrom("_fileSnapshot")
-          .select(["path", "snapshotBase64"])
-          .where("isDeleted", "is", null),
-      );
-      const snapshotRows = await this.evolu.loadQuery(snapshotQ);
-      const snapshotPaths = new Set<string>();
-      const tombstonePaths = new Set<string>();
-      for (const row of snapshotRows) {
-        if (!row.path) continue;
-        if (row.snapshotBase64 === "DELETED") {
-          tombstonePaths.add(row.path);
-        } else {
-          snapshotPaths.add(row.path);
-        }
-      }
-
-      // fileUpdate rows are the sync-history representation that other peers
-      // can learn from once Evolu has replicated them. _fileSnapshot rows are
-      // local-only cache and must be counted separately.
-      const historyQ = this.evolu.createQuery((db) =>
-        db
-          .selectFrom("evolu_history")
-          .select(["id", "timestamp"])
-          .where("table", "==", "fileUpdate")
-          .where("column", "==", "updateBase64")
-          .orderBy("timestamp", "asc")
-          .limit(100000),
-      );
-      const historyRows = await this.evolu.loadQuery(historyQ);
-      const ids = historyRows.map((row) => idBytesToId(row.id as unknown as IdBytes));
-      const fileUpdateRows = await this.loadFileUpdateRows(ids);
-      const rowsById = new Map(
-        fileUpdateRows
-          .filter((row) => row.id && row.path)
-          .map((row) => [
-            row.id,
-            { path: row.path, type: row.type ?? null },
-          ]),
-      );
-
-      const latestTypeByPath = new Map<string, string | null>();
-      let visibleHistoryRows = 0;
-      for (const row of historyRows) {
-        const id = idBytesToId(row.id as unknown as IdBytes);
-        const fileUpdate = rowsById.get(id);
-        if (!fileUpdate) continue;
-        visibleHistoryRows++;
-        latestTypeByPath.set(fileUpdate.path, fileUpdate.type);
-      }
-
-      const fileUpdatePaths = new Set(latestTypeByPath.keys());
-      const fileUpdatePresentPaths = new Set(
-        Array.from(latestTypeByPath.entries())
-          .filter(([, type]) => type !== "delete")
-          .map(([path]) => path),
-      );
-      const fileUpdateDeletedPaths = new Set(
-        Array.from(latestTypeByPath.entries())
-          .filter(([, type]) => type === "delete")
-          .map(([path]) => path),
-      );
-
-      const missingFileUpdatePaths = Array.from(vaultPaths)
-        .filter((path) => !fileUpdatePresentPaths.has(path))
-        .sort();
-      const snapshotOnlyPaths = Array.from(snapshotPaths)
-        .filter((path) => !fileUpdatePresentPaths.has(path))
-        .sort();
-
-      this.logInfo("Sync inventory", {
-        stage,
-        vaultTrackedFiles: vaultPaths.size,
-        localSnapshotPaths: snapshotPaths.size,
-        localSnapshotTombstones: tombstonePaths.size,
-        fileUpdateHistoryRows: historyRows.length,
-        visibleFileUpdateRows: visibleHistoryRows,
-        fileUpdatePaths: fileUpdatePaths.size,
-        fileUpdatePresentPaths: fileUpdatePresentPaths.size,
-        fileUpdateDeletedPaths: fileUpdateDeletedPaths.size,
-        vaultPathsMissingFileUpdate: missingFileUpdatePaths.length,
-        snapshotPathsMissingFileUpdate: snapshotOnlyPaths.length,
-        sampleVaultPathsMissingFileUpdate: missingFileUpdatePaths.slice(0, 20),
-        sampleSnapshotPathsMissingFileUpdate: snapshotOnlyPaths.slice(0, 20),
-      });
-      return {
-        vaultPathsMissingFileUpdate: missingFileUpdatePaths,
-        snapshotPathsMissingFileUpdate: snapshotOnlyPaths,
-      };
-    } catch (e) {
-      this.logError("logSyncInventory failed", { stage, error: e });
-      return { vaultPathsMissingFileUpdate: [], snapshotPathsMissingFileUpdate: [] };
-    }
-  }
-
-  private async repairMissingFileUpdates(paths: string[]) {
-    if (paths.length === 0) return;
-
-    this.logInfo("Sync inventory repair: retransmitting missing fileUpdate paths", {
-      count: paths.length,
-      sample: paths.slice(0, 20),
-    });
-
-    let repaired = 0;
-    for (const path of paths) {
-      if (!this.isActive) break;
-      if (!(await this.vault.fileExists(path))) continue;
-      if (!isTrackedVaultPath(path, this.localSyncConfig)) continue;
-
-      const ok = await this.retransmitCurrentState(path);
-      if (ok) repaired++;
-    }
-
-    this.logInfo("Sync inventory repair: done", {
-      requested: paths.length,
-      repaired,
-    });
-  }
-
   private async materializeFileHistory(ids: string[]): Promise<{ doc: Y.Doc; text: Y.Text } | null> {
     const rows = await this.loadFileUpdateContentRows(ids);
     const rowsById = new Map<
@@ -1925,112 +2233,6 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
-  private async repairSettingsFromRemoteState(label: string) {
-    if (!this.localSyncConfig.syncObsidianSettings) return;
-
-    try {
-      const remoteSettings = await this.loadLatestSettingUpdatesFromHistory();
-      if (remoteSettings.size === 0) {
-        this.logDebug(label, { remoteSettings: 0, applied: 0, unchanged: 0, skipped: 0 });
-        return;
-      }
-
-      let applied = 0;
-      let unchanged = 0;
-      let skipped = 0;
-
-      for (const [path, remote] of remoteSettings) {
-        if (!isTrackedSettingPath(path, this.localSyncConfig)) {
-          skipped++;
-          continue;
-        }
-
-        const snapshot = await this.loadSettingSnapshot(path);
-        if (remote.type === "delete") {
-          const exists = await this.vault.fileExists(path);
-          if (snapshot?.deleted && !exists) {
-            this.pendingSettingSeed.delete(path);
-            unchanged++;
-            continue;
-          }
-
-          await this.applyRemoteSettingUpdate(remote);
-          applied++;
-          continue;
-        }
-
-        const current = await this.vault.readText(path);
-        const currentHash = current === null ? null : hashText(current);
-        const currentMatches = currentHash === remote.contentHash;
-        if (snapshot?.contentHash === remote.contentHash && currentHash !== null && currentHash !== remote.contentHash) {
-          // We have already seen this remote setting state, but the local file
-          // has changed since our last local snapshot. Do not repair it back to
-          // the old remote value; the following settings scan will advertise
-          // the local change instead.
-          this.logInfo(`${label}: keeping local setting change`, {
-            path,
-            snapshotHash: snapshot.contentHash,
-            remoteHash: remote.contentHash,
-            currentHash,
-          });
-          unchanged++;
-          continue;
-        }
-
-        if (snapshot?.contentHash === remote.contentHash && currentMatches) {
-          this.pendingSettingSeed.delete(path);
-          unchanged++;
-          continue;
-        }
-
-        await this.applyRemoteSettingUpdate(remote);
-        applied++;
-      }
-
-      const result = {
-        remoteSettings: remoteSettings.size,
-        applied,
-        unchanged,
-        skipped,
-      };
-      if (applied > 0 || skipped > 0) {
-        this.logInfo(label, result);
-      } else {
-        this.logDebug(label, result);
-      }
-    } catch (e) {
-      this.logError(`${label}: repairSettingsFromRemoteState failed`, e);
-    }
-  }
-
-  private async loadLatestSettingUpdatesFromHistory(): Promise<Map<string, SettingUpdateWithId>> {
-    const historyQ = this.evolu.createQuery((db) =>
-      db
-        .selectFrom("evolu_history")
-        .select(["id", "timestamp"])
-        .where("table", "==", "settingUpdate")
-        .where("column", "==", "contentBase64")
-        .orderBy("timestamp", "asc")
-        .limit(100000),
-    );
-    const historyRows = await this.evolu.loadQuery(historyQ);
-    if (historyRows.length === 0) return new Map();
-
-    const ids = historyRows.map((row) => idBytesToId(row.id as unknown as IdBytes));
-    const settingRows = await this.loadSettingUpdateRows(ids);
-    const rowsById = new Map(settingRows.map((row) => [row.id, row]));
-    const latestByPath = new Map<string, SettingUpdateWithId>();
-
-    for (const historyRow of historyRows) {
-      const id = idBytesToId(historyRow.id as unknown as IdBytes);
-      const setting = rowsById.get(id);
-      if (!setting) continue;
-      latestByPath.set(setting.path, setting);
-    }
-
-    return latestByPath;
-  }
-
   private async loadFileUpdateContentRows(ids: string[]) {
     if (ids.length === 0) return [];
 
@@ -2044,40 +2246,6 @@ export class YjsEvoluHistoryEngine {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return (await this.evolu.loadQuery(fileUpdateQ)) as ReadonlyArray<any>;
-  }
-
-  private async loadSettingUpdateRows(ids: string[]): Promise<Array<SettingUpdateRow & { id: string }>> {
-    const rows: Array<SettingUpdateRow & { id: string }> = [];
-    const batchSize = 500;
-    for (let i = 0; i < ids.length; i += batchSize) {
-      const batch = ids.slice(i, i + batchSize);
-      if (batch.length === 0) continue;
-
-      const settingUpdateQ = this.evolu.createQuery((db) =>
-        (db as any)
-          .selectFrom("settingUpdate")
-          .select(["id", "path", "contentBase64", "contentHash", "encoding", "type"])
-          .where("id", "in", batch as any)
-          .where("isDeleted", "is", null),
-      );
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const batchRows = (await this.evolu.loadQuery(settingUpdateQ)) as ReadonlyArray<any>;
-      rows.push(
-        ...batchRows
-          .filter((row) => row.id && row.path && row.contentHash)
-          .map((row) => ({
-            id: row.id as string,
-            path: row.path as string,
-            contentBase64: (row.contentBase64 as string | null) ?? "",
-            contentHash: row.contentHash as string,
-            encoding: (row.encoding as string | null) ?? null,
-            type: (row.type as string | null) ?? null,
-          })),
-      );
-    }
-
-    return rows;
   }
 
   private async applyRemoteSettingUpdate(row: SettingUpdateRow): Promise<boolean> {
@@ -2128,34 +2296,6 @@ export class YjsEvoluHistoryEngine {
       this.logError("applyRemoteSettingUpdate failed", { path, type: row.type, error });
       return false;
     }
-  }
-
-  private async loadFileUpdateRows(ids: string[]) {
-    const rows: Array<{ id: string; path: string; type: string | null }> = [];
-    const batchSize = 500;
-    for (let i = 0; i < ids.length; i += batchSize) {
-      const batch = ids.slice(i, i + batchSize);
-      if (batch.length === 0) continue;
-      const fileUpdateQ = this.evolu.createQuery((db) =>
-        (db as any)
-          .selectFrom("fileUpdate")
-          .select(["id", "path", "type"])
-          .where("id", "in", batch as any)
-          .where("isDeleted", "is", null),
-      );
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const batchRows = (await this.evolu.loadQuery(fileUpdateQ)) as ReadonlyArray<any>;
-      rows.push(
-        ...batchRows
-          .filter((row) => row.id && row.path)
-          .map((row) => ({
-            id: row.id as string,
-            path: row.path as string,
-            type: (row.type as string | null) ?? null,
-          })),
-      );
-    }
-    return rows;
   }
 
   private createMaterializationSignature(parts: string[]): string {
@@ -2250,7 +2390,7 @@ export class YjsEvoluHistoryEngine {
     };
 
     doc.on("update", (u: Uint8Array, origin: unknown) => {
-      // Skip updates applied from the materializer/poll path. Those remote
+      // Skip updates applied from the incoming/manual-repair path. Those remote
       // updates must not be echoed back to the network.
       if (origin === "remote") return;
       const outgoingId = getLocalSyncOutgoingId(origin);
@@ -2457,7 +2597,7 @@ export class YjsEvoluHistoryEngine {
             `upd:${path}:${this.deviceId}:${Date.now()}:${Math.random()}`,
           );
 
-      this.evolu.upsert("fileUpdate", { id, path, updateBase64 });
+      this.evolu.upsert("fileUpdate", { id, path, updateBase64, originDeviceId: this.deviceId });
       st.pendingUpdates = [];
       st.pendingOutgoingId = null;
 
@@ -2506,6 +2646,7 @@ export class YjsEvoluHistoryEngine {
         path,
         updateBase64: this.emptyYjsUpdateBase64,
         type: "delete",
+        originDeviceId: this.deviceId,
       });
       this.logInfo("Vault file deleted, propagating", { path });
     } catch (e) {
@@ -2573,6 +2714,7 @@ export class YjsEvoluHistoryEngine {
         path: oldPath,
         updateBase64: this.emptyYjsUpdateBase64,
         type: "delete",
+        originDeviceId: this.deviceId,
       });
 
       // Broadcast full state under the new path.
@@ -2641,6 +2783,7 @@ export class YjsEvoluHistoryEngine {
           path,
           updateBase64: this.emptyYjsUpdateBase64,
           type: "delete",
+          originDeviceId: this.deviceId,
         });
         audited++;
       }

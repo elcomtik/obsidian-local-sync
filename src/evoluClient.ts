@@ -55,7 +55,7 @@ function createEvoluConsole(logFormatter: LogFormatter) {
  * enable cycles.  A new client is created only when reset/restore genuinely
  * needs a fresh relay identity (different mnemonic → different WebSocket
  * authentication).  The SQLite driver's `flush()` is still called on every
- * unload to persist the history cursor.
+ * unload to persist local snapshots and incremental inbox markers.
  */
 export type CloseEvoluDb = (options?: { flush?: boolean }) => Promise<void>;
 export type PersistEvoluDb = () => Promise<void>;
@@ -132,6 +132,16 @@ export function createEvoluClient(
   const evolu = createEvolu(deps)(Schema, {
     name: SimpleName.orThrow(instanceName),
     transports: [{ type: "WebSocket", url: relayUrl }],
+    indexes: (create) => [
+      create("fileUpdatePathCreatedAt").on("fileUpdate").columns(["path", "createdAt"]),
+      create("settingUpdatePathCreatedAt").on("settingUpdate").columns(["path", "createdAt"]),
+      create("processedFileUpdateSourceVersion")
+        .on("_processedFileUpdate")
+        .columns(["sourceId", "sourceVersion"]),
+      create("processedSettingUpdateSourceVersion")
+        .on("_processedSettingUpdate")
+        .columns(["sourceId", "sourceVersion"]),
+    ],
   });
 
   const closeDb: CloseEvoluDb = async (options = {}) => {

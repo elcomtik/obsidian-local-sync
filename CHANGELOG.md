@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.0 — 2026-06-22
+
+### Changed
+
+- Replaced global query-driven materialization on every update with a durable
+  pending-update inbox. Local-only processed markers keyed by synced row ID and
+  `updatedAt` detect late replication and changed deterministic rows without a
+  timestamp cursor.
+- Normal file synchronization applies only pending Yjs content updates. Delete
+  boundaries may rebuild the affected path; full-vault/history reconstruction
+  is now restricted to the explicit manual materialization repair action.
+- Outgoing file and setting rows include `originDeviceId`, preventing a peer
+  from consuming and writing back its own updates.
+- During startup, new remote paths can materialize after the initial vault list
+  is known, while existing paths become eligible immediately after their own
+  local drift reconciliation completes.
+- Existing peers perform a one-time metadata-only inbox migration. Rows covered
+  by matching materialization checkpoints are acknowledged; mismatches remain
+  pending for incremental reconciliation.
+- Removed the obsolete materializer refresh debounce setting and daemon
+  environment variable.
+
 ## 0.5.0 — 2026-06-22
 
 ### Changed

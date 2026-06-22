@@ -38,14 +38,13 @@ deployment that must join an existing sync owner.
 | `LOCALSYNC_SYNC_OBSIDIAN_SETTINGS` | `false` | Sync allowlisted `.obsidian` settings as plain last-writer-wins files. |
 | `LOCALSYNC_SETTINGS_INCLUDE_GLOBS` | JSON settings, themes, snippets | Comma or newline separated settings include rules. Used only when settings sync is enabled. |
 | `LOCALSYNC_SETTINGS_EXCLUDE_GLOBS` | workspace state and LocalSync plugin dir | Comma or newline separated settings exclude rules. Later rules win; prefix a rule with `!` to re-include. |
-| `LOCALSYNC_HISTORY_POLL_MS` | `1000` | Remote history poll interval. |
-| `LOCALSYNC_HISTORY_BATCH_SIZE` | `500` | Remote history rows consumed per poll. |
+| `LOCALSYNC_HISTORY_POLL_MS` | `1000` | Quiet-cycle and failed-inbox retry interval. |
+| `LOCALSYNC_HISTORY_BATCH_SIZE` | `500` | Maximum pending incoming rows per subscribed inbox query. |
 | `LOCALSYNC_OUTGOING_BATCH_MS` | `500` | Local Yjs update flush debounce. |
 | `LOCALSYNC_MAX_OPEN_DOCS` | `50` | Maximum open Yjs documents. |
 | `LOCALSYNC_VAULT_SCAN_INFO_PROGRESS_EVERY_MS` | `60000` | Info-level aggregate vault scan progress interval. Set to `0` to disable. |
 | `LOCALSYNC_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS` | `10000` | Debug-level vault scan progress interval. Set to `0` to disable. |
 | `LOCALSYNC_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES` | `100` | Debug-level vault scan progress by processed tracked files. Set to `0` to disable. |
-| `LOCALSYNC_MATERIALIZER_REFRESH_DEBOUNCE_MS` | `250` | Debounce materialization plan refreshes after subscription events. |
 | `LOCALSYNC_STARTUP_SCAN` | `true` | Scan vault on startup. |
 | `LOCALSYNC_SYNC_DELETES` | `true` | Propagate local deletes and run startup offline-delete audit. |
 | `LOCALSYNC_PERIODIC_RESCAN_SECONDS` | `0` | Periodically rescan tracked vault files. Set to `0` to disable. |
@@ -56,7 +55,7 @@ deployment that must join an existing sync owner.
 `LOCALSYNC_PERIODIC_RESCAN_SECONDS` is disabled by default. When enabled, the
 daemon repeats the same tracked-file reconciliation used at startup: existing
 snapshots are checked for offline drift, files with no local snapshot are
-deferred until relay history is quiet, and offline-delete auditing runs when
+deferred until the incoming inbox is quiet, and offline-delete auditing runs when
 `LOCALSYNC_SYNC_DELETES=true`. This is useful for vaults that may be changed by
 tools outside the file watcher.
 

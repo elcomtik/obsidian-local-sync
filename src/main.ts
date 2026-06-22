@@ -16,7 +16,6 @@ import { Mnemonic } from "@evolu/common";
 import type { Evolu } from "@evolu/common";
 import type { Database } from "../src-core/schema";
 import {
-  DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
@@ -60,7 +59,6 @@ type PluginSettings = {
   vaultScanDebugProgressEveryFiles: number;
   vaultScanDebugProgressEveryMs: number;
   vaultScanInfoProgressEveryMs: number;
-  materializerRefreshDebounceMs: number;
 
   includeExtensions: string[];
   excludeGlobs: string[];
@@ -95,7 +93,6 @@ const DEFAULT_SETTINGS: PluginSettings = {
   vaultScanDebugProgressEveryFiles: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   vaultScanDebugProgressEveryMs: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   vaultScanInfoProgressEveryMs: DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
-  materializerRefreshDebounceMs: DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
 
   includeExtensions: DEFAULT_LOCAL_SYNC_CONFIG.includeExtensions,
   excludeGlobs: DEFAULT_LOCAL_SYNC_CONFIG.excludeGlobs,
@@ -143,7 +140,6 @@ function toEngineConfig(s: PluginSettings): EngineConfig {
     vaultScanDebugProgressEveryFiles: s.vaultScanDebugProgressEveryFiles,
     vaultScanDebugProgressEveryMs: s.vaultScanDebugProgressEveryMs,
     vaultScanInfoProgressEveryMs: s.vaultScanInfoProgressEveryMs,
-    materializerRefreshDebounceMs: s.materializerRefreshDebounceMs,
   };
 }
 
@@ -990,7 +986,6 @@ class LocalSyncSettingTab extends PluginSettingTab {
         | "vaultScanDebugProgressEveryFiles"
         | "vaultScanDebugProgressEveryMs"
         | "vaultScanInfoProgressEveryMs"
-        | "materializerRefreshDebounceMs"
       >,
       min: number,
       noticeLabel: string,
@@ -1353,19 +1348,11 @@ class LocalSyncSettingTab extends PluginSettingTab {
 
     addEngineNumberSetting("Quiet cycle interval (ms)", "How often to run deferred seed and inventory checks.", "historyPollMs", 100, "Quiet interval");
 
-    addEngineNumberSetting("Legacy history batch size", "Compatibility setting retained for existing configs.", "historyBatchSize", 10, "Batch size");
+    addEngineNumberSetting("Incoming batch size", "Maximum pending remote rows processed per inbox batch.", "historyBatchSize", 10, "Batch size");
 
     addEngineNumberSetting("Outgoing batch interval (ms)", "Minimum time between sending Yjs updates.", "outgoingBatchMs", 50, "Outgoing interval");
 
     addEngineNumberSetting("Max open Yjs docs (LRU)", "How many files keep Yjs state in memory.", "maxOpenDocs", 5, "Max open docs");
-
-    addEngineNumberSetting(
-      "Materializer refresh debounce (ms)",
-      "Debounce materialization plan refreshes after remote update subscriptions.",
-      "materializerRefreshDebounceMs",
-      0,
-      "Materializer refresh debounce",
-    );
 
     // ----------------------------
     // Evolu Sync Key (Mnemonic)
