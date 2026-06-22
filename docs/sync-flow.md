@@ -73,6 +73,9 @@ flowchart LR
 The originating peer filters its own row from the incoming inbox. Other peers
 receive and apply it incrementally.
 
+The durable marker version is `updatedAt ?? createdAt`: inserted Evolu rows
+have no `updatedAt`, while deterministic rows gain one when changed later.
+
 ## Normal Remote Edit
 
 ```mermaid

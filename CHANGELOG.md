@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.2 — 2026-06-23
+
+### Fixed
+
+- Incremental inbox row versions now use `updatedAt ?? createdAt`. Evolu leaves
+  `updatedAt` null on inserted rows, which caused normal remote file and setting
+  updates to be silently skipped. Inbox migration v2 backfills matching
+  historical markers with the same version rule before processing new rows.
+
 ## 0.6.1 — 2026-06-22
 
 ### Changed
@@ -15,7 +24,7 @@
 
 - Replaced global query-driven materialization on every update with a durable
   pending-update inbox. Local-only processed markers keyed by synced row ID and
-  `updatedAt` detect late replication and changed deterministic rows without a
+  row version detect late replication and changed deterministic rows without a
   timestamp cursor.
 - Normal file synchronization applies only pending Yjs content updates. Delete
   boundaries may rebuild the affected path; full-vault/history reconstruction

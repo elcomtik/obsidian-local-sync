@@ -317,12 +317,12 @@ type PendingFileUpdateRow = {
   updateBase64: string;
   type: string | null;
   createdAt: string;
-  updatedAt: string;
+  sourceVersion: string;
 };
 
 type PendingSettingUpdateRow = SettingUpdateWithId & {
   createdAt: string;
-  updatedAt: string;
+  sourceVersion: string;
 };
 
 function compareUpdateOrder(
@@ -1254,15 +1254,21 @@ export class YjsEvoluHistoryEngine {
         .leftJoin("_processedFileUpdate as processed", (join: any) =>
           join
             .onRef("processed.sourceId", "=", "incoming.id")
-            .onRef("processed.sourceVersion", "=", "incoming.updatedAt"),
+            .on((eb: any) =>
+              eb(
+                "processed.sourceVersion",
+                "=",
+                eb.fn.coalesce("incoming.updatedAt", "incoming.createdAt"),
+              ),
+            ),
         )
-        .select([
+        .select((eb: any) => [
           "incoming.id as id",
           "incoming.path as path",
           "incoming.updateBase64 as updateBase64",
           "incoming.type as type",
           "incoming.createdAt as createdAt",
-          "incoming.updatedAt as updatedAt",
+          eb.fn.coalesce("incoming.updatedAt", "incoming.createdAt").as("sourceVersion"),
         ])
         .where("incoming.isDeleted", "is", null)
         .where("processed.id", "is", null)
@@ -1285,9 +1291,15 @@ export class YjsEvoluHistoryEngine {
         .leftJoin("_processedSettingUpdate as processed", (join: any) =>
           join
             .onRef("processed.sourceId", "=", "incoming.id")
-            .onRef("processed.sourceVersion", "=", "incoming.updatedAt"),
+            .on((eb: any) =>
+              eb(
+                "processed.sourceVersion",
+                "=",
+                eb.fn.coalesce("incoming.updatedAt", "incoming.createdAt"),
+              ),
+            ),
         )
-        .select([
+        .select((eb: any) => [
           "incoming.id as id",
           "incoming.path as path",
           "incoming.contentBase64 as contentBase64",
@@ -1295,7 +1307,7 @@ export class YjsEvoluHistoryEngine {
           "incoming.encoding as encoding",
           "incoming.type as type",
           "incoming.createdAt as createdAt",
-          "incoming.updatedAt as updatedAt",
+          eb.fn.coalesce("incoming.updatedAt", "incoming.createdAt").as("sourceVersion"),
         ])
         .where("incoming.isDeleted", "is", null)
         .where("processed.id", "is", null)
@@ -1313,14 +1325,14 @@ export class YjsEvoluHistoryEngine {
 
   private enqueuePendingFileRows(rows: ReadonlyArray<any>) {
     for (const row of rows) {
-      if (!row.id || !row.path || !row.updateBase64 || !row.createdAt || !row.updatedAt) continue;
+      if (!row.id || !row.path || !row.updateBase64 || !row.createdAt || !row.sourceVersion) continue;
       const pending: PendingFileUpdateRow = {
         id: row.id as string,
         path: row.path as string,
         updateBase64: row.updateBase64 as string,
         type: (row.type as string | null) ?? null,
         createdAt: row.createdAt as string,
-        updatedAt: row.updatedAt as string,
+        sourceVersion: row.sourceVersion as string,
       };
       this.pendingFileInbox.set(this.inboxKey(pending), pending);
     }
@@ -1329,7 +1341,7 @@ export class YjsEvoluHistoryEngine {
 
   private enqueuePendingSettingRows(rows: ReadonlyArray<any>) {
     for (const row of rows) {
-      if (!row.id || !row.path || !row.contentHash || !row.createdAt || !row.updatedAt) continue;
+      if (!row.id || !row.path || !row.contentHash || !row.createdAt || !row.sourceVersion) continue;
       const pending: PendingSettingUpdateRow = {
         id: row.id as string,
         path: row.path as string,
@@ -1338,15 +1350,15 @@ export class YjsEvoluHistoryEngine {
         encoding: (row.encoding as string | null) ?? null,
         type: (row.type as string | null) ?? null,
         createdAt: row.createdAt as string,
-        updatedAt: row.updatedAt as string,
+        sourceVersion: row.sourceVersion as string,
       };
       this.pendingSettingInbox.set(this.inboxKey(pending), pending);
     }
     this.kickIncrementalInboxes();
   }
 
-  private inboxKey(row: { id: string; updatedAt: string }): string {
-    return `${row.id}:${row.updatedAt}`;
+  private inboxKey(row: { id: string; sourceVersion: string }): string {
+    return `${row.id}:${row.sourceVersion}`;
   }
 
   private canProcessIncomingPath(path: string): boolean {
@@ -1434,7 +1446,8 @@ export class YjsEvoluHistoryEngine {
         .where("isDeleted", "is", null)
         .limit(1),
     );
-    if ((await this.evolu.loadQuery(stateQuery)).length > 0) return;
+    const stateRows = await this.evolu.loadQuery(stateQuery);
+    if (stateRows.some((row) => row.version === "2")) return;
 
     const fileSnapshotQuery = this.evolu.createQuery((db) =>
       db.selectFrom("_fileSnapshot").select(["id"]).limit(1),
@@ -1509,7 +1522,7 @@ export class YjsEvoluHistoryEngine {
       });
     }
 
-    await this.upsertAndWait("_inboxState", { id: stateId, version: "1" });
+    await this.upsertAndWait("_inboxState", { id: stateId, version: "2" });
     await this.persistLocalDb?.();
   }
 
@@ -1579,9 +1592,17 @@ export class YjsEvoluHistoryEngine {
     });
   }
 
-  private async markFileRowsProcessed(rows: ReadonlyArray<{ id?: unknown; updatedAt?: unknown }>) {
+  private getSourceVersion(row: { createdAt?: unknown; updatedAt?: unknown; sourceVersion?: unknown }): string | null {
+    if (typeof row.sourceVersion === "string") return row.sourceVersion;
+    if (typeof row.updatedAt === "string") return row.updatedAt;
+    return typeof row.createdAt === "string" ? row.createdAt : null;
+  }
+
+  private async markFileRowsProcessed(
+    rows: ReadonlyArray<{ id?: unknown; createdAt?: unknown; updatedAt?: unknown; sourceVersion?: unknown }>,
+  ) {
     const validRows = rows.filter(
-      (row) => typeof row.id === "string" && typeof row.updatedAt === "string",
+      (row) => typeof row.id === "string" && this.getSourceVersion(row) !== null,
     );
     for (let offset = 0; offset < validRows.length; offset += 250) {
       if (validRows.length > 1000 && offset % 2500 === 0) {
@@ -1593,7 +1614,7 @@ export class YjsEvoluHistoryEngine {
       await Promise.all(
         validRows.slice(offset, offset + 250).map((row) => {
           const sourceId = row.id as string;
-          const sourceVersion = row.updatedAt as string;
+          const sourceVersion = this.getSourceVersion(row)!;
           const id = createIdFromString<"ProcessedFileUpdate">(
             `processed-file:${sourceId}:${sourceVersion}`,
           );
@@ -1603,9 +1624,11 @@ export class YjsEvoluHistoryEngine {
     }
   }
 
-  private async markSettingRowsProcessed(rows: ReadonlyArray<{ id?: unknown; updatedAt?: unknown }>) {
+  private async markSettingRowsProcessed(
+    rows: ReadonlyArray<{ id?: unknown; createdAt?: unknown; updatedAt?: unknown; sourceVersion?: unknown }>,
+  ) {
     const validRows = rows.filter(
-      (row) => typeof row.id === "string" && typeof row.updatedAt === "string",
+      (row) => typeof row.id === "string" && this.getSourceVersion(row) !== null,
     );
     for (let offset = 0; offset < validRows.length; offset += 250) {
       if (validRows.length > 1000 && offset % 2500 === 0) {
@@ -1617,7 +1640,7 @@ export class YjsEvoluHistoryEngine {
       await Promise.all(
         validRows.slice(offset, offset + 250).map((row) => {
           const sourceId = row.id as string;
-          const sourceVersion = row.updatedAt as string;
+          const sourceVersion = this.getSourceVersion(row)!;
           const id = createIdFromString<"ProcessedSettingUpdate">(
             `processed-setting:${sourceId}:${sourceVersion}`,
           );

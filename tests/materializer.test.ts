@@ -219,7 +219,7 @@ test("incremental file inbox applies only pending content without history replay
         updateBase64: string;
         type: string | null;
         createdAt: string;
-        updatedAt: string;
+        sourceVersion: string;
       }>,
     ): Promise<boolean>;
     loadFileUpdateRowsForPath(path: string): Promise<unknown>;
@@ -235,7 +235,7 @@ test("incremental file inbox applies only pending content without history replay
       updateBase64,
       type: null,
       createdAt: "2026-06-22T10:00:00.000Z",
-      updatedAt: "2026-06-22T10:00:00.000Z",
+      sourceVersion: "2026-06-22T10:00:00.000Z",
     },
   ]);
 
@@ -275,7 +275,7 @@ test("incremental file inbox persists processed marker after snapshot", async ()
         updateBase64: string;
         type: string | null;
         createdAt: string;
-        updatedAt: string;
+        sourceVersion: string;
       }>,
     ): Promise<boolean>;
   };
@@ -296,7 +296,7 @@ test("incremental file inbox persists processed marker after snapshot", async ()
       updateBase64,
       type: null,
       createdAt: "2026-06-22T10:00:00.000Z",
-      updatedAt: "2026-06-22T10:00:00.000Z",
+      sourceVersion: "2026-06-22T10:00:00.000Z",
     },
   ]);
 
@@ -305,7 +305,7 @@ test("incremental file inbox persists processed marker after snapshot", async ()
   assert.ok(events.indexOf("processed") < events.indexOf("persist"));
 });
 
-test("processed markers distinguish newer versions of deterministic rows", async () => {
+test("processed markers use createdAt for inserts and updatedAt for later versions", async () => {
   const files = new Map<string, string>();
   const calls = { writes: [] as string[], deletes: [] as string[] };
   const engine = makeEngine(makeVault(files, calls));
@@ -318,7 +318,9 @@ test("processed markers distinguish newer versions of deterministic rows", async
         options?: { onComplete?: () => void },
       ): { ok: true };
     };
-    markFileRowsProcessed(rows: Array<{ id: string; updatedAt: string }>): Promise<void>;
+    markFileRowsProcessed(
+      rows: Array<{ id: string; createdAt: string; updatedAt?: string }>,
+    ): Promise<void>;
   };
   privateEngine.evolu.upsert = (table, row, options) => {
     if (table === "_processedFileUpdate") markerIds.push(row.id as string);
@@ -327,8 +329,12 @@ test("processed markers distinguish newer versions of deterministic rows", async
   };
 
   await privateEngine.markFileRowsProcessed([
-    { id: "stable-row", updatedAt: "2026-06-22T10:00:00.000Z" },
-    { id: "stable-row", updatedAt: "2026-06-22T11:00:00.000Z" },
+    { id: "stable-row", createdAt: "2026-06-22T10:00:00.000Z" },
+    {
+      id: "stable-row",
+      createdAt: "2026-06-22T10:00:00.000Z",
+      updatedAt: "2026-06-22T11:00:00.000Z",
+    },
   ]);
 
   assert.equal(markerIds.length, 2);

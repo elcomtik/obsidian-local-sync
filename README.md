@@ -215,9 +215,11 @@ CRDT message level, independent of the platform layer.
 
 ### 3) Durable Incremental Inbox
 Subscribed anti-join queries return only synced rows without a matching local
-processed marker. Markers use `(row id, updatedAt)`, so delayed replication and
+processed marker. Markers use `(row id, row version)`, so delayed replication and
 later versions of deterministic rows are both detected without a timestamp
-cursor. The originating device is filtered through `originDeviceId`.
+cursor. The row version is `updatedAt ?? createdAt`, because inserted Evolu
+rows have no `updatedAt`. The originating device is filtered through
+`originDeviceId`.
 
 Content updates are applied incrementally. A delete boundary can rebuild the
 affected path, while complete vault/history validation is available only from
