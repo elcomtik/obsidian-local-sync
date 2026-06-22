@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.7 — 2026-06-22
+
+### Added
+
+- **Startup scan progress visibility**:
+  startup and periodic vault scans now emit aggregate progress at info level
+  and detailed progress at debug level. The progress intervals are configurable
+  through plugin settings and daemon environment variables.
+- **Materializer refresh debounce tuning**:
+  the file/settings materialization refresh debounce is now configurable from
+  plugin settings and `LOCALSYNC_MATERIALIZER_REFRESH_DEBOUNCE_MS`.
+
 ## 0.4.6 — 2026-06-22
 
 ### Fixed

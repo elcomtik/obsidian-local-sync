@@ -42,6 +42,10 @@ deployment that must join an existing sync owner.
 | `LOCALSYNC_HISTORY_BATCH_SIZE` | `500` | Remote history rows consumed per poll. |
 | `LOCALSYNC_OUTGOING_BATCH_MS` | `500` | Local Yjs update flush debounce. |
 | `LOCALSYNC_MAX_OPEN_DOCS` | `50` | Maximum open Yjs documents. |
+| `LOCALSYNC_VAULT_SCAN_INFO_PROGRESS_EVERY_MS` | `60000` | Info-level aggregate vault scan progress interval. Set to `0` to disable. |
+| `LOCALSYNC_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS` | `10000` | Debug-level vault scan progress interval. Set to `0` to disable. |
+| `LOCALSYNC_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES` | `100` | Debug-level vault scan progress by processed tracked files. Set to `0` to disable. |
+| `LOCALSYNC_MATERIALIZER_REFRESH_DEBOUNCE_MS` | `250` | Debounce materialization plan refreshes after subscription events. |
 | `LOCALSYNC_STARTUP_SCAN` | `true` | Scan vault on startup. |
 | `LOCALSYNC_SYNC_DELETES` | `true` | Propagate local deletes and run startup offline-delete audit. |
 | `LOCALSYNC_PERIODIC_RESCAN_SECONDS` | `0` | Periodically rescan tracked vault files. Set to `0` to disable. |

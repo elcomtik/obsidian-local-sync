@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import * as Y from "yjs";
-import { YjsEvoluHistoryEngine } from "../src-core/engine";
+import {
+  DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
+  DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
+  DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
+  DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+  YjsEvoluHistoryEngine,
+} from "../src-core/engine";
 import { DEFAULT_LOCAL_SYNC_CONFIG } from "../src-core/pathPolicy";
 import type { Database } from "../src-core/schema";
 import type { VaultAdapter, VaultFile, VaultFolderListing } from "../src-core/vaultAdapter";
@@ -32,6 +38,10 @@ function makeEngine(vault: VaultAdapter, persistLocalDb?: () => Promise<void>): 
       historyBatchSize: 500,
       outgoingBatchMs: 10,
       maxOpenDocs: 10,
+      vaultScanDebugProgressEveryFiles: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
+      vaultScanDebugProgressEveryMs: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
+      vaultScanInfoProgressEveryMs: DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+      materializerRefreshDebounceMs: DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
     },
     localSyncConfig: DEFAULT_LOCAL_SYNC_CONFIG,
     logLevel: "off",

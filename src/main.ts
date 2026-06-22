@@ -16,6 +16,10 @@ import { Mnemonic } from "@evolu/common";
 import type { Evolu } from "@evolu/common";
 import type { Database } from "../src-core/schema";
 import {
+  DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
+  DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
+  DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
+  DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
   YjsEvoluHistoryEngine,
   type EngineConfig,
   type LogLevel,
@@ -53,6 +57,10 @@ type PluginSettings = {
   historyBatchSize: number;
   outgoingBatchMs: number;
   maxOpenDocs: number;
+  vaultScanDebugProgressEveryFiles: number;
+  vaultScanDebugProgressEveryMs: number;
+  vaultScanInfoProgressEveryMs: number;
+  materializerRefreshDebounceMs: number;
 
   includeExtensions: string[];
   excludeGlobs: string[];
@@ -84,6 +92,10 @@ const DEFAULT_SETTINGS: PluginSettings = {
   historyBatchSize: 500,
   outgoingBatchMs: 500,
   maxOpenDocs: 50,
+  vaultScanDebugProgressEveryFiles: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
+  vaultScanDebugProgressEveryMs: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
+  vaultScanInfoProgressEveryMs: DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+  materializerRefreshDebounceMs: DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS,
 
   includeExtensions: DEFAULT_LOCAL_SYNC_CONFIG.includeExtensions,
   excludeGlobs: DEFAULT_LOCAL_SYNC_CONFIG.excludeGlobs,
@@ -128,6 +140,10 @@ function toEngineConfig(s: PluginSettings): EngineConfig {
     historyBatchSize: s.historyBatchSize,
     outgoingBatchMs: s.outgoingBatchMs,
     maxOpenDocs: s.maxOpenDocs,
+    vaultScanDebugProgressEveryFiles: s.vaultScanDebugProgressEveryFiles,
+    vaultScanDebugProgressEveryMs: s.vaultScanDebugProgressEveryMs,
+    vaultScanInfoProgressEveryMs: s.vaultScanInfoProgressEveryMs,
+    materializerRefreshDebounceMs: s.materializerRefreshDebounceMs,
   };
 }
 
@@ -962,6 +978,66 @@ class LocalSyncSettingTab extends PluginSettingTab {
         });
       });
 
+    const addEngineNumberSetting = (
+      name: string,
+      desc: string,
+      key: keyof Pick<
+        PluginSettings,
+        | "historyPollMs"
+        | "historyBatchSize"
+        | "outgoingBatchMs"
+        | "maxOpenDocs"
+        | "vaultScanDebugProgressEveryFiles"
+        | "vaultScanDebugProgressEveryMs"
+        | "vaultScanInfoProgressEveryMs"
+        | "materializerRefreshDebounceMs"
+      >,
+      min: number,
+      noticeLabel: string,
+    ) => {
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addText((text) => {
+          text.setValue(String(this.plugin.settings[key]));
+          text.inputEl.addEventListener("change", async () => {
+            const n = Number(text.inputEl.value);
+            if (!Number.isInteger(n) || n < min) {
+              text.setValue(String(this.plugin.settings[key]));
+              new Notice(`${noticeLabel} must be at least ${min}`);
+              return;
+            }
+            this.plugin.settings[key] = Math.floor(n);
+            await this.plugin.applyEngineConfigFromSettings();
+            new Notice(`${noticeLabel} set to ${this.plugin.settings[key]}`);
+          });
+        });
+    };
+
+    addEngineNumberSetting(
+      "Info scan progress interval (ms)",
+      "Emit aggregate startup scan progress at info level. Set to 0 to disable.",
+      "vaultScanInfoProgressEveryMs",
+      0,
+      "Info scan progress interval",
+    );
+
+    addEngineNumberSetting(
+      "Debug scan progress interval (ms)",
+      "Emit detailed startup scan progress at debug level by elapsed time. Set to 0 to disable.",
+      "vaultScanDebugProgressEveryMs",
+      0,
+      "Debug scan progress interval",
+    );
+
+    addEngineNumberSetting(
+      "Debug scan progress files",
+      "Emit detailed startup scan progress at debug level every N tracked files. Set to 0 to disable.",
+      "vaultScanDebugProgressEveryFiles",
+      0,
+      "Debug scan progress files",
+    );
+
     // ----------------------------
     // Sync
     // ----------------------------
@@ -1275,77 +1351,21 @@ class LocalSyncSettingTab extends PluginSettingTab {
     // ----------------------------
     containerEl.createEl("h3", { text: "Performance" });
 
-    new Setting(containerEl)
-      .setName("History poll interval (ms)")
-      .setDesc("How often to check for remote changes.")
-      .addText((text) => {
-        text.setValue(String(this.plugin.settings.historyPollMs));
-        text.inputEl.addEventListener("change", async () => {
-          const n = Number(text.inputEl.value);
-          if (!Number.isFinite(n) || n < 100) {
-            text.setValue(String(this.plugin.settings.historyPollMs));
-            new Notice("Poll interval must be at least 100 ms");
-            return;
-          }
-          this.plugin.settings.historyPollMs = Math.floor(n);
-          await this.plugin.applyEngineConfigFromSettings();
-          new Notice(`Poll interval set to ${this.plugin.settings.historyPollMs} ms`);
-        });
-      });
+    addEngineNumberSetting("History poll interval (ms)", "How often to check for remote changes.", "historyPollMs", 100, "Poll interval");
 
-    new Setting(containerEl)
-      .setName("History batch size")
-      .setDesc("Max history rows processed per poll.")
-      .addText((text) => {
-        text.setValue(String(this.plugin.settings.historyBatchSize));
-        text.inputEl.addEventListener("change", async () => {
-          const n = Number(text.inputEl.value);
-          if (!Number.isFinite(n) || n < 10) {
-            text.setValue(String(this.plugin.settings.historyBatchSize));
-            new Notice("Batch size must be at least 10");
-            return;
-          }
-          this.plugin.settings.historyBatchSize = Math.floor(n);
-          await this.plugin.applyEngineConfigFromSettings();
-          new Notice(`Batch size set to ${this.plugin.settings.historyBatchSize}`);
-        });
-      });
+    addEngineNumberSetting("History batch size", "Max history rows processed per poll.", "historyBatchSize", 10, "Batch size");
 
-    new Setting(containerEl)
-      .setName("Outgoing batch interval (ms)")
-      .setDesc("Minimum time between sending Yjs updates.")
-      .addText((text) => {
-        text.setValue(String(this.plugin.settings.outgoingBatchMs));
-        text.inputEl.addEventListener("change", async () => {
-          const n = Number(text.inputEl.value);
-          if (!Number.isFinite(n) || n < 50) {
-            text.setValue(String(this.plugin.settings.outgoingBatchMs));
-            new Notice("Outgoing interval must be at least 50 ms");
-            return;
-          }
-          this.plugin.settings.outgoingBatchMs = Math.floor(n);
-          await this.plugin.applyEngineConfigFromSettings();
-          new Notice(`Outgoing interval set to ${this.plugin.settings.outgoingBatchMs} ms`);
-        });
-      });
+    addEngineNumberSetting("Outgoing batch interval (ms)", "Minimum time between sending Yjs updates.", "outgoingBatchMs", 50, "Outgoing interval");
 
-    new Setting(containerEl)
-      .setName("Max open Yjs docs (LRU)")
-      .setDesc("How many files keep Yjs state in memory.")
-      .addText((text) => {
-        text.setValue(String(this.plugin.settings.maxOpenDocs));
-        text.inputEl.addEventListener("change", async () => {
-          const n = Number(text.inputEl.value);
-          if (!Number.isFinite(n) || n < 5) {
-            text.setValue(String(this.plugin.settings.maxOpenDocs));
-            new Notice("Max open docs must be at least 5");
-            return;
-          }
-          this.plugin.settings.maxOpenDocs = Math.floor(n);
-          await this.plugin.applyEngineConfigFromSettings();
-          new Notice(`Max open docs set to ${this.plugin.settings.maxOpenDocs}`);
-        });
-      });
+    addEngineNumberSetting("Max open Yjs docs (LRU)", "How many files keep Yjs state in memory.", "maxOpenDocs", 5, "Max open docs");
+
+    addEngineNumberSetting(
+      "Materializer refresh debounce (ms)",
+      "Debounce materialization plan refreshes after remote update subscriptions.",
+      "materializerRefreshDebounceMs",
+      0,
+      "Materializer refresh debounce",
+    );
 
     // ----------------------------
     // Evolu Sync Key (Mnemonic)

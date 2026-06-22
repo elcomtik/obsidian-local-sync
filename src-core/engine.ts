@@ -32,7 +32,10 @@ const levelRank: Record<LogLevel, number> = {
   debug: 4,
 };
 
-const MATERIALIZER_REFRESH_DEBOUNCE_MS = 250;
+export const DEFAULT_MATERIALIZER_REFRESH_DEBOUNCE_MS = 250;
+export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES = 100;
+export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS = 10_000;
+export const DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS = 60_000;
 
 /**
  * Runtime configuration for {@link YjsEvoluHistoryEngine}.
@@ -47,6 +50,14 @@ export type EngineConfig = {
   outgoingBatchMs: number;
   /** Maximum simultaneously open Yjs docs; least-recently-used are evicted above this limit. */
   maxOpenDocs: number;
+  /** Debug scan progress heartbeat by processed tracked files. Set to 0 to disable file-count progress. */
+  vaultScanDebugProgressEveryFiles: number;
+  /** Debug scan progress heartbeat by elapsed milliseconds. Set to 0 to disable time-based debug progress. */
+  vaultScanDebugProgressEveryMs: number;
+  /** Info scan progress heartbeat by elapsed milliseconds. Set to 0 to disable info progress. */
+  vaultScanInfoProgressEveryMs: number;
+  /** Debounce window before refreshing materialization plans after subscription events. */
+  materializerRefreshDebounceMs: number;
 };
 
 export type SyncProgress =
@@ -582,10 +593,15 @@ export class YjsEvoluHistoryEngine {
       });
       let loaded = 0;
       let deferred = 0;
+      let processed = 0;
+      const scanStartedAt = Date.now();
+      let lastProgressAt = scanStartedAt;
+      let lastInfoProgressAt = scanStartedAt;
 
       for (const file of files) {
         if (!this.isActive || this.isStopped) break;
         const result = await this.reconcileVaultFile(file.path, label);
+        processed++;
 
         if (result === "deferred") {
           deferred++;
@@ -595,6 +611,43 @@ export class YjsEvoluHistoryEngine {
             await this.closeDoc(file.path);
             this.states.delete(file.path);
           }
+        }
+
+        const now = Date.now();
+        const shouldLogDebugProgress =
+          this.logLevel === "debug" &&
+          (processed === files.length ||
+            (this.config.vaultScanDebugProgressEveryFiles > 0 &&
+              processed % this.config.vaultScanDebugProgressEveryFiles === 0) ||
+            (this.config.vaultScanDebugProgressEveryMs > 0 &&
+              now - lastProgressAt >= this.config.vaultScanDebugProgressEveryMs));
+        const shouldLogInfoProgress =
+          levelRank[this.logLevel] >= levelRank.info &&
+          processed < files.length &&
+          this.config.vaultScanInfoProgressEveryMs > 0 &&
+          now - lastInfoProgressAt >= this.config.vaultScanInfoProgressEveryMs;
+
+        if (shouldLogDebugProgress) {
+          lastProgressAt = now;
+          this.logDebug(`${label}: progress`, {
+            processed,
+            trackedFiles: files.length,
+            loaded,
+            deferred,
+            elapsedMs: now - scanStartedAt,
+            path: file.path,
+          });
+        }
+
+        if (shouldLogInfoProgress) {
+          lastInfoProgressAt = now;
+          this.logInfo(`${label}: progress`, {
+            processed,
+            trackedFiles: files.length,
+            loaded,
+            deferred,
+            elapsedMs: now - scanStartedAt,
+          });
         }
       }
 
@@ -1177,7 +1230,7 @@ export class YjsEvoluHistoryEngine {
       const queuedLabel = this.fileMaterializationRefreshQueuedLabel ?? label;
       this.fileMaterializationRefreshQueuedLabel = null;
       void this.refreshFileMaterializationPlans(queuedLabel);
-    }, MATERIALIZER_REFRESH_DEBOUNCE_MS);
+    }, this.config.materializerRefreshDebounceMs);
   }
 
   private scheduleSettingMaterializationRefresh(label: string) {
@@ -1192,7 +1245,7 @@ export class YjsEvoluHistoryEngine {
       const queuedLabel = this.settingMaterializationRefreshQueuedLabel ?? label;
       this.settingMaterializationRefreshQueuedLabel = null;
       void this.refreshSettingMaterializationPlans(queuedLabel);
-    }, MATERIALIZER_REFRESH_DEBOUNCE_MS);
+    }, this.config.materializerRefreshDebounceMs);
   }
 
   private createFileUpdateMetaQuery() {
