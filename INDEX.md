@@ -27,16 +27,16 @@ Workspace PRD: [Basic Memory LocalSync](../docs/prd/basic-memory-localsync.md)
 |--------|------|-------------|
 | `ObsidianLocalSyncPlugin` | class | Plugin lifecycle (`onload` / `onunload`). Creates Evolu client and engine, registers vault `modify` and window focus/blur events. |
 | `LocalSyncSettingTab` | class | Obsidian settings UI. Renders log level, performance knobs, mnemonic reveal/copy/restore/reset. |
-| `PluginSettings` | type | `{ relayUrl, appName, deviceId, historyPollMs, historyBatchSize, outgoingBatchMs, maxOpenDocs, logLevel }` |
+| `PluginSettings` | type | `{ relayUrl, appName, deviceId, historyPollMs, historyBatchSize, outgoingBatchMs, maxOpenDocs, logLevel, localSync }` |
 | `DEFAULT_SETTINGS` | const | Default values. `deviceId` is generated once at module-load time from `Math.random()`. Persisted on first `loadSettings` call. |
-| `toEngineConfig` | fn | Maps `PluginSettings` → `EngineConfig` (the four perf fields only). |
+| `toEngineConfig` | fn | Maps runtime settings to `EngineConfig`. |
 
 ### `src/engine.ts`
 
 | Symbol | Kind | Description |
 |--------|------|-------------|
 | `YjsEvoluHistoryEngine` | class | All sync work. See method table below. |
-| `EngineConfig` | type | `{ historyPollMs, historyBatchSize, outgoingBatchMs, maxOpenDocs }` |
+| `EngineConfig` | type | Runtime performance/materializer timing configuration. |
 | `LogLevel` | type | `"off" \| "error" \| "warn" \| "info"` |
 | `FileState` | type | Per-open-file state: `{ doc, text, lastVaultText, ignoreNextVaultModify, pendingUpdates, flushTimer, lastUsedMs }` |
 | `toBase64` | fn | `Uint8Array → string` via chunked `String.fromCharCode` (8 192 B chunks) + `btoa`. |
@@ -47,23 +47,20 @@ Workspace PRD: [Basic Memory LocalSync](../docs/prd/basic-memory-localsync.md)
 
 | Method | Async | Description |
 |--------|-------|-------------|
-| `start()` | ✓ | Ensures history cursor row, starts poll timer, runs first poll. |
-| `stop()` | ✓ | Stops timer, awaits `Promise.all(closeDoc)`, clears state map. |
-| `updateConfig()` | ✓ | Hot-swaps `config`, resets poll timer, enforces LRU limit. |
+| `start()` | ✓ | Starts materializer subscriptions, quiet-cycle timer, rescan timers, and optional startup scan. |
+| `stop()` | ✓ | Stops timers/subscriptions, awaits current quiet cycle, closes docs, clears state map. |
+| `updateConfig()` | ✓ | Hot-swaps `config`, resets quiet-cycle timer, enforces LRU limit. |
 | `setLogLevel()` | – | Updates runtime log level. |
-| `setActive()` | ✓ | Resumes polling (called on window `focus` / `visibilitychange`). |
-| `setInactive()` | – | Pauses polling (window `blur`). |
+| `setActive()` | ✓ | Resumes quiet-cycle checks (called on window `focus` / `visibilitychange`). |
+| `setInactive()` | – | Pauses quiet-cycle checks (window `blur`). |
 | `onVaultFileModified()` | ✓ | Vault → Yjs path. Reads file, diffs against `lastVaultText`, transacts into `Y.Doc`. |
-| `pollHistoryOnce()` | ✓ (private) | Reads `evolu_history` since cursor, applies each row, advances cursor. Guarded by `isPolling`. |
-| `applyFileUpdateRowById()` | ✓ (private) | Fetches `fileUpdate` row by ID, calls `Y.applyUpdate`, writes vault, saves snapshot. |
+| `refreshFileMaterializationPlans()` | ✓ (private) | Reads latest `fileUpdate` rows from history and queues paths whose remote signatures changed. |
+| `runFileMaterializer()` | ✓ (private) | Applies queued remote file plans when the vault file still matches the local snapshot. |
 | `enforceLruLimit()` | ✓ (private) | Evicts least-recently-used docs until `states.size ≤ maxOpenDocs`. |
 | `closeDoc()` | ✓ (private) | Flushes pending updates, saves snapshot, destroys `Y.Doc`. |
 | `getOrLoadFileState()` | ✓ (private) | Returns cached state or bootstraps from snapshot/vault. Registers Yjs `"update"` listener. |
 | `loadLocalSnapshot()` | ✓ (private) | Queries `_fileSnapshot` by deterministic ID. |
 | `saveLocalSnapshot()` | ✓ (private) | Upserts `_fileSnapshot` with full `Y.encodeStateAsUpdate`. |
-| `ensureHistoryCursorRow()` | ✓ (private) | Upserts `_historyCursor` row on startup. |
-| `loadHistoryCursor()` | ✓ (private) | Returns `lastTimestamp` from `_historyCursor`. |
-| `saveHistoryCursor()` | ✓ (private) | Updates `lastTimestamp` in `_historyCursor`. |
 | `scheduleOutgoingFlush()` | – (private) | Arms debounce timer for outgoing update batch. |
 | `flushOutgoingUpdates()` | ✓ (private) | Merges `pendingUpdates` via `Y.mergeUpdates`, upserts `fileUpdate` row, saves snapshot. |
 | `writeYjsToVault()` | ✓ (private) | Writes `Y.Text.toString()` to vault; sets `ignoreNextVaultModify` flag. |
@@ -73,19 +70,23 @@ Workspace PRD: [Basic Memory LocalSync](../docs/prd/basic-memory-localsync.md)
 
 | Symbol | Kind | Description |
 |--------|------|-------------|
-| `Schema` | const | Evolu schema. Three tables — see table below. |
+| `Schema` | const | Evolu schema. Synced update tables plus local snapshot/materialization tables. |
 | `Database` | type | `typeof Schema` — used to type the Evolu client in `engine.ts`. |
 | `FileUpdateId` | const | Branded ID type for `fileUpdate` rows. |
 | `FileSnapshotId` | const | Branded ID type for `_fileSnapshot` rows. |
-| `HistoryCursorId` | const | Branded ID type for `_historyCursor` rows. |
+| `FileMaterializationId` | const | Branded ID type for `_fileMaterialization` rows. |
+| `SettingMaterializationId` | const | Branded ID type for `_settingMaterialization` rows. |
 
 **Evolu tables:**
 
 | Table | Synced | Schema | Notes |
 |-------|--------|--------|-------|
-| `fileUpdate` | ✓ | `id, path (≤1000 chars), updateBase64` | One row per outgoing Yjs update chunk. Rows accumulate forever (append-only log). |
+| `fileUpdate` | ✓ | `id, path (≤1000 chars), updateBase64, type` | One row per outgoing Yjs update chunk or delete marker. Rows accumulate forever. |
+| `settingUpdate` | ✓ | `id, path, contentBase64, contentHash, encoding, type` | Synced setting-file updates when settings sync is enabled. |
 | `_fileSnapshot` | ✗ | `id, path, snapshotBase64` | One row per file path. Replaced in-place (deterministic ID: `snapshot:${path}`). Full Yjs state. |
-| `_historyCursor` | ✗ | `id, lastTimestamp (nullable)` | Single row (deterministic ID: `history-cursor`). Tracks last processed `evolu_history` timestamp. |
+| `_settingSnapshot` | ✗ | `id, path, contentHash` | Local setting-file snapshot hash. |
+| `_fileMaterialization` | ✗ | `id, path, signature` | Last materialized remote file signature per path. |
+| `_settingMaterialization` | ✗ | `id, path, signature` | Last materialized remote setting signature per path. |
 
 ### `src/evoluClient.ts`
 
@@ -114,8 +115,8 @@ All settings live in Obsidian's plugin data (JSON, managed by `Plugin.loadData` 
 | `relayUrl` | `wss://free.evoluhq.com` | — | Evolu WebSocket relay URL. |
 | `appName` | `obsidian-local-sync` | — | Evolu app namespace (isolates data on shared relays). |
 | `deviceId` | random hex | — | Stable per-device identifier. Persisted on first load. |
-| `historyPollMs` | `1000` | `100` | Polling interval for remote changes (ms). |
-| `historyBatchSize` | `500` | `10` | Max `evolu_history` rows consumed per poll. |
+| `historyPollMs` | `1000` | `100` | Quiet-cycle interval for deferred seed and inventory checks (ms). |
+| `historyBatchSize` | `500` | `10` | Legacy compatibility setting. |
 | `outgoingBatchMs` | `500` | `50` | Debounce window before sending outgoing Yjs updates (ms). |
 | `maxOpenDocs` | `50` | `5` | LRU cap on simultaneously open Yjs docs. |
 | `logLevel` | `info` | — | Console verbosity: `off \| error \| warn \| info`. |
@@ -144,17 +145,17 @@ vault "modify" event
 ### Incoming (relay → vault)
 
 ```
-window.setInterval (historyPollMs)
-  └─ pollHistoryOnce()                       (skipped if isPolling or !isActive)
-       └─ loadHistoryCursor()
-       └─ evolu.loadQuery(evolu_history WHERE table="fileUpdate" AND ts > cursor)
-       └─ for each row:
-            └─ applyFileUpdateRowById(id)
-                 └─ evolu.loadQuery(fileUpdate WHERE id=?)
-                 └─ Y.applyUpdate(doc, fromBase64(updateBase64))
-                 └─ writeYjsToVault()        (sets ignoreNextVaultModify flag)
-                 └─ saveLocalSnapshot()
-       └─ saveHistoryCursor(lastTimestamp)
+Evolu subscription event
+  └─ scheduleFileMaterializationRefresh()
+       └─ refreshFileMaterializationPlans()
+            └─ load latest fileUpdate rows from evolu_history
+            └─ group rows into per-path materialization plans
+            └─ queue paths whose signatures changed
+       └─ runFileMaterializer()
+            └─ skip during startup scan until scanComplete
+            └─ skip if vault content drifted from local snapshot
+            └─ materialize remote Yjs state to vault
+            └─ save local snapshot and materialization signature
 ```
 
 ### Doc bootstrap (`getOrLoadFileState`)
@@ -177,8 +178,8 @@ path not in states map
 
 | ID key pattern | Table | Type |
 |----------------|-------|------|
-| `history-cursor` | `_historyCursor` | Deterministic (singleton) |
 | `snapshot:${path}` | `_fileSnapshot` | Deterministic (one per file, upsertable) |
+| `file-materialization:${path}` | `_fileMaterialization` | Deterministic (one per file, upsertable) |
 | `upd:${path}:${deviceId}:${Date.now()}:${Math.random()}` | `fileUpdate` | Unique (append-only) |
 
 ---
@@ -190,7 +191,7 @@ main.ts
   ├─ engine.ts          (YjsEvoluHistoryEngine)
   │    ├─ yjs           (Y.Doc, Y.Text, Y.mergeUpdates, Y.applyUpdate, Y.encodeStateAsUpdate)
   │    ├─ diff-match-patch
-  │    ├─ @evolu/common  (Evolu<Database>, createIdFromString, idBytesToId, IdBytes, TimestampBytes)
+  │    ├─ @evolu/common  (Evolu<Database>, createIdFromString, idBytesToId, IdBytes)
   │    └─ schema.ts
   ├─ evoluClient.ts     (createEvoluClient)
   │    ├─ @evolu/common  (createEvolu, createConsole, createRandom, createRandomBytes, createTime, createWebSocket, SimpleName, EvoluDeps)
@@ -205,8 +206,7 @@ sqliteDriver.ts
   └─ node:fs, node:path
 
 schema.ts
-  └─ @evolu/common            (id, NonEmptyString1000, NonEmptyString, nullOr)
-  └─ @evolu/common/local-first (TimestampBytes)
+  └─ @evolu/common            (id, NonEmptyString1000, NonEmptyString, String, nullOr)
 ```
 
 ---
@@ -214,5 +214,6 @@ schema.ts
 ## Related Documents
 
 - [README.md](README.md) — Architecture narrative, multi-device setup, design guarantees, roadmap
+- [docs/sync-flow.md](docs/sync-flow.md) — Startup and normal sync diagrams
 - [CLAUDE.md](CLAUDE.md) — Build commands, key design details, known issues tracker
 - [CHANGELOG.md](CHANGELOG.md) — Version history (current: 0.0.3)

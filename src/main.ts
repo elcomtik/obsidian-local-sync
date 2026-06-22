@@ -426,8 +426,8 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // set of existing paths and treats any snapshot path absent from that set
     // as an offline delete.  If the vault isn't ready yet, every snapshotted
     // file is falsely treated as deleted — delete rows are emitted for all
-    // files, and on the next restart the device processes its own delete rows
-    // (outgoingIds cleared) and trashes its local files too.
+    // files. Remote peers would then materialize those delete rows and trash
+    // their local files too.
     //
     // onLayoutReady fires synchronously if the workspace is already ready
     // (on plugin reload mid-session), or deferred until it is (initial boot).
@@ -1351,9 +1351,9 @@ class LocalSyncSettingTab extends PluginSettingTab {
     // ----------------------------
     containerEl.createEl("h3", { text: "Performance" });
 
-    addEngineNumberSetting("History poll interval (ms)", "How often to check for remote changes.", "historyPollMs", 100, "Poll interval");
+    addEngineNumberSetting("Quiet cycle interval (ms)", "How often to run deferred seed and inventory checks.", "historyPollMs", 100, "Quiet interval");
 
-    addEngineNumberSetting("History batch size", "Max history rows processed per poll.", "historyBatchSize", 10, "Batch size");
+    addEngineNumberSetting("Legacy history batch size", "Compatibility setting retained for existing configs.", "historyBatchSize", 10, "Batch size");
 
     addEngineNumberSetting("Outgoing batch interval (ms)", "Minimum time between sending Yjs updates.", "outgoingBatchMs", 50, "Outgoing interval");
 

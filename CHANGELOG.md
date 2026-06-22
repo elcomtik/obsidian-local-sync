@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 — 2026-06-22
+
+### Changed
+
+- Removed the stale direct `evolu_history` polling/cursor path. Remote
+  materialization now relies on the subscribed materializer flow only, which
+  matches the current runtime behavior and avoids maintaining two competing
+  incoming-sync paths.
+- Renamed the performance setting labels for the retained timer to quiet-cycle
+  terminology. The underlying setting keys remain compatible.
+- Added startup and normal-sync diagrams documenting when remote
+  materialization is intentionally gated during startup scans.
+
 ## 0.4.7 — 2026-06-22
 
 ### Added

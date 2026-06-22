@@ -1,6 +1,6 @@
 import * as Y from "yjs";
 import DiffMatchPatch from "diff-match-patch";
-import type { Evolu, IdBytes, TimestampBytes } from "@evolu/common";
+import type { Evolu, IdBytes } from "@evolu/common";
 import { createIdFromString, idBytesToId } from "@evolu/common";
 import type { Database } from "./schema";
 import type { LocalSyncConfig } from "./pathPolicy";
@@ -42,9 +42,9 @@ export const DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS = 60_000;
  * All values are hot-swappable via {@link YjsEvoluHistoryEngine.updateConfig}.
  */
 export type EngineConfig = {
-  /** Milliseconds between `evolu_history` polls for remote changes. */
+  /** Milliseconds between quiet-cycle checks for deferred seeding and inventory repair. */
   historyPollMs: number;
-  /** Maximum `evolu_history` rows consumed per poll cycle. */
+  /** Retained for compatibility with existing settings; materializers do not batch by this value. */
   historyBatchSize: number;
   /** Debounce window (ms) before flushing accumulated Yjs updates to Evolu. */
   outgoingBatchMs: number;
@@ -339,9 +339,9 @@ type SettingMaterializationPlan = {
  * ops inside a transaction, then batched and flushed as `fileUpdate` rows.
  *
  * **Incoming path** (Evolu → vault):
- * A recurring poll reads new `evolu_history` rows since the stored cursor,
- * applies each Yjs update to the in-memory doc, and writes the result back to
- * the vault file.
+ * Subscribed `fileUpdate` / `settingUpdate` queries refresh materialization
+ * plans. The materializers replay synced rows, write vault files when local
+ * snapshots still match, and store per-path materialization signatures.
  *
  * **Memory management**:
  * Open docs are bounded by {@link EngineConfig.maxOpenDocs} using LRU eviction.
@@ -367,39 +367,29 @@ export class YjsEvoluHistoryEngine {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private vaultRescanTimer: ReturnType<typeof setInterval> | null = null;
   private settingsRescanTimer: ReturnType<typeof setInterval> | null = null;
-  private isPolling = false;
   private isScanningVault = false;
   private isScanningSettings = false;
   private isStopped = false;
   private unsubscribers: Array<() => void> = [];
-  /** Resolves when the current poll cycle completes. Awaited by stop(). */
+  /** Resolves when the current quiet/materializer cycle completes. Awaited by stop(). */
   private ongoingPoll: Promise<void> = Promise.resolve();
 
   // Only process remote history when Obsidian is active
   private isActive = true;
 
   /**
-   * IDs of `fileUpdate` rows written by this engine instance during the current
-   * session.  Used by {@link pollHistoryOnce} to skip rows that we produced
-   * ourselves (self-echo suppression).  Only covers the current
-   * process lifetime; rows from previous sessions are still applied once.
-   */
-  private outgoingIds = new Set<string>();
-
-  /**
    * Paths of vault files that the startup scan identified as having no local
    * snapshot (never seeded) but that are NOT immediately seeded from vault.
    *
-   * Seeding is deferred by one poll cycle so the relay has time to deliver
-   * any existing history for these files before we create a new Yjs state.
-   * Without this, a reset & restore causes the scan to seed vault content
-   * into an empty doc, and then when the relay delivers the pre-reset history
-   * rows in the next poll, both the seeded op and the history op are applied
-   * to the doc → doubled content.
+   * Seeding is deferred by one quiet materializer cycle so the relay has time
+   * to deliver any existing synced rows for these files before we create a new
+   * Yjs state.
+   * Without this, a reset & restore could seed vault content into an empty doc
+   * and later materialize remote rows on top of it, doubling content.
    *
-   * Files are removed from this set as soon as a poll touches them (history
-   * arrived → no seeding needed).  The remaining files are seeded from vault
-   * after one full quiet poll cycle (relay has quiesced for them).
+   * Files are removed from this set as soon as materialized remote state covers
+   * them. The remaining files are seeded from vault after one full quiet cycle
+   * once materializers have no pending work.
    */
   private pendingVaultSeed = new Set<string>();
   private pendingSettingSeed = new Set<string>();
@@ -417,17 +407,15 @@ export class YjsEvoluHistoryEngine {
 
   /**
    * Set to `true` when {@link scanVaultForUnsyncedFiles} has finished
-   * populating {@link pendingVaultSeed}.  Until this is true the poll loop
+   * populating {@link pendingVaultSeed}. Until this is true the quiet cycle
    * will not attempt to drain the set (it might not be fully populated yet).
    */
   private scanComplete = false;
 
   /**
-   * Becomes `true` after the first poll cycle that runs *after* the scan is
-   * complete (`scanComplete === true`).  Seeding from {@link pendingVaultSeed}
-   * is only allowed once this is true AND the current poll returns zero rows
-   * (relay is quiet), ensuring at least one full `historyPollMs` window for
-   * relay sync before we decide a file has no remote history.
+   * Becomes `true` after the first quiet cycle that runs *after* the scan is
+   * complete (`scanComplete === true`). Seeding from {@link pendingVaultSeed}
+   * is only allowed once this is true and materializers have no queued work.
    */
   private pendingVaultSeedReady = false;
   private hasLoggedQuietSyncInventory = false;
@@ -765,8 +753,8 @@ export class YjsEvoluHistoryEngine {
    * content. If vault content drifted while the engine was stopped, the diff is
    * applied inside {@link getOrLoadFileState} and flushed normally.
    *
-   * **No snapshot:** defer seeding until after a quiet relay poll so existing
-   * remote history has a chance to arrive first.
+   * **No snapshot:** defer seeding until after a quiet materializer cycle so
+   * existing remote state has a chance to arrive first.
    */
   async reconcileVaultFile(path: string, label = "Startup scan"): Promise<ReconcileResult> {
     if (this.isStopped) return "skipped";
@@ -784,12 +772,11 @@ export class YjsEvoluHistoryEngine {
   }
 
   /**
-   * Seeds files from {@link pendingVaultSeed} that have not yet been touched by
-   * a poll cycle (i.e. the relay has not delivered any history for them).
+   * Seeds files from {@link pendingVaultSeed} that have not yet been covered by
+   * materialized remote state.
    *
-   * Called after a poll returns zero rows once {@link pendingVaultSeedReady} is
-   * true.  Files already removed from `pendingVaultSeed` by
-   * {@link pollHistoryOnce} (history arrived → no seeding needed) are
+   * Called after materializers are quiet once {@link pendingVaultSeedReady} is
+   * true. Files already removed from `pendingVaultSeed` by materialization are
    * skipped automatically by the set iteration.
   */
   private async drainPendingVaultSeed() {
@@ -859,7 +846,6 @@ export class YjsEvoluHistoryEngine {
         `startup-retransmit:${path}:${this.deviceId}`,
       );
       this.evolu.upsert("fileUpdate", { id, path, updateBase64 });
-      this.outgoingIds.add(id);
       await this.saveLocalSnapshot(path, st);
       this.logInfo("Startup scan: retransmitted", { path, bytes: updateBytes.length });
       return true;
@@ -886,7 +872,6 @@ export class YjsEvoluHistoryEngine {
       contentHash,
       encoding: encoded.encoding,
     });
-    this.outgoingIds.add(id);
     this.saveSettingSnapshot(path, contentHash);
     this.logInfo(message, {
       path,
@@ -910,7 +895,6 @@ export class YjsEvoluHistoryEngine {
       encoding: null,
       type: "delete",
     });
-    this.outgoingIds.add(id);
     this.tombstoneSettingSnapshot(path);
     this.logInfo(message, { path });
   }
@@ -1686,279 +1670,6 @@ export class YjsEvoluHistoryEngine {
     await this.scanSettingsForUnsyncedFiles("Periodic settings rescan");
   }
 
-  private pollHistoryOnce() {
-    if (this.isStopped || !this.isActive || this.isPolling) return;
-    this.isPolling = true;
-    this.ongoingPoll = (async () => {
-      try {
-        const cursor = await this.loadHistoryCursor();
-
-        // Step 1: Fetch history row IDs in timestamp order.
-        // Must use the original "==" operator for evolu_history columns
-        // (Evolu's internal convention) and keep the two-step id lookup:
-        // evolu_history.id is stored as BLOB, while synced table IDs are TEXT,
-        // so a direct JOIN would never match — we convert bytes→string first.
-        const histQ = this.evolu.createQuery((db) => {
-          let qb = db
-            .selectFrom("evolu_history")
-            .select(["id", "timestamp", "table"])
-            .where("table", "in", ["fileUpdate", "settingUpdate"] as any)
-            .where("column", "in", ["updateBase64", "contentBase64"] as any);
-
-          if (cursor != null) qb = qb.where("timestamp", ">", cursor);
-
-          return qb.orderBy("timestamp", "asc").limit(this.config.historyBatchSize);
-        });
-
-        const histRows = await this.evolu.loadQuery(histQ);
-
-        if (histRows.length === 0) {
-          this.reportSyncProgress?.({
-            status: "caught-up",
-            message: "LocalSync is caught up.",
-          });
-          // Deferred vault seeding (relay is quiet).
-          if (this.scanComplete) {
-            if (!this.pendingVaultSeedReady) {
-              this.pendingVaultSeedReady = true;
-            } else {
-              if (this.pendingSettingSeed.size > 0) {
-                await this.repairSettingsFromRemoteState("History quiet settings repair");
-              }
-              await this.drainPendingVaultSeed();
-              await this.drainPendingSettingSeed();
-            }
-            if (!this.hasLoggedQuietSyncInventory) {
-              this.hasLoggedQuietSyncInventory = true;
-              const inventory = await this.logSyncInventory("history-quiet");
-              await this.repairMissingFileUpdates(inventory.vaultPathsMissingFileUpdate);
-            }
-          }
-          return;
-        }
-
-        this.hasLoggedQuietSyncInventory = false;
-        this.logInfo("History poll fetched rows", { count: histRows.length });
-        this.reportSyncProgress?.({
-          status: "syncing",
-          message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
-          current: 0,
-          total: histRows.length,
-        });
-
-        // Step 2: Convert blob IDs to string IDs and batch-fetch synced rows.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const fileUpdateIds = histRows
-          .filter((h) => h.table === "fileUpdate")
-          .map((h) => idBytesToId(h.id as unknown as IdBytes));
-        const settingUpdateIds = histRows
-          .filter((h) => h.table === "settingUpdate")
-          .map((h) => idBytesToId(h.id as unknown as IdBytes));
-
-        const fileUpdateRows = fileUpdateIds.length === 0
-          ? []
-          : await this.loadFileUpdateContentRows(fileUpdateIds);
-        const rowMap = new Map<string, { path: string; updateBase64: string; type: string | null }>(
-          fileUpdateRows
-            .filter((r) => r.id && r.path && r.updateBase64)
-            .map((r) => [r.id as string, { path: r.path as string, updateBase64: r.updateBase64 as string, type: (r.type as string | null) ?? null }]),
-        );
-        const settingRows = await this.loadSettingUpdateRows(settingUpdateIds);
-        const settingRowMap = new Map<string, SettingUpdateRow>(
-          settingRows.map((row) => [row.id, row]),
-        );
-
-        // Step 3: Look-ahead — for each path, record the index of its LAST
-        // delete row in the batch.  Content writes are skipped only when a
-        // delete appears at a LATER index (avoids suppressing writes for files
-        // that were deleted and then re-created in the same batch).
-        const lastDeleteIdx = new Map<string, number>();
-        histRows.forEach((h, idx) => {
-          const r = rowMap.get(idBytesToId(h.id as unknown as IdBytes));
-          if (r?.type === "delete") lastDeleteIdx.set(r.path, idx);
-        });
-
-        // Step 4: Process rows in timestamp order.
-        const touchedPaths = new Set<string>();
-        let lastHandledTimestamp: TimestampBytes | null = null;
-        let stoppedAtMissingRow = false;
-        let shouldPersistAfterRemoteApply = false;
-
-        for (const [rowIdx, h] of histRows.entries()) {
-          const id = idBytesToId(h.id as unknown as IdBytes);
-          const timestamp = h.timestamp as unknown as TimestampBytes;
-          const current = rowIdx + 1;
-
-          // Skip rows we produced ourselves in this session.
-          if (this.outgoingIds.has(id)) {
-            this.logInfo("Skipped own history row", { id, table: h.table });
-            lastHandledTimestamp = timestamp;
-            this.reportSyncProgress?.({
-              status: "syncing",
-              message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
-              current,
-              total: histRows.length,
-            });
-            continue;
-          }
-
-          if (h.table === "settingUpdate") {
-            const setting = settingRowMap.get(id);
-            if (!setting) {
-              this.logWarn("History referenced missing settingUpdate row; cursor not advanced past it", { id });
-              stoppedAtMissingRow = true;
-              break;
-            }
-
-            const applied = await this.applyRemoteSettingUpdate(setting);
-            if (!applied) {
-              this.logWarn("Remote setting update failed; cursor not advanced past it", { id, path: setting.path });
-              stoppedAtMissingRow = true;
-              break;
-            }
-            touchedPaths.add(setting.path);
-            if (this.pendingSettingSeed.delete(setting.path)) {
-              this.logInfo("Deferred settings seed: remote history covered setting", { path: setting.path });
-            }
-            lastHandledTimestamp = timestamp;
-            this.reportSyncProgress?.({
-              status: "syncing",
-              message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
-              current,
-              total: histRows.length,
-            });
-            continue;
-          }
-
-          const r = rowMap.get(id);
-          if (!r) {
-            this.logWarn("History referenced missing fileUpdate row; cursor not advanced past it", { id });
-            stoppedAtMissingRow = true;
-            break;
-          }
-
-          const { path, updateBase64, type } = r;
-
-          // ── Delete row ──────────────────────────────────────────────────
-          if (type === "delete") {
-            this.destroyDoc(path);
-            this.pendingVaultSeed.delete(path);
-            this.tombstoneSnapshot(path);
-            if (await this.vault.fileExists(path)) {
-              this.pendingRemoteDeletes.add(path);
-              try {
-                await this.vault.deleteFile(path);
-                shouldPersistAfterRemoteApply = true;
-              } finally {
-                this.pendingRemoteDeletes.delete(path);
-              }
-            }
-            this.logInfo("Applied remote delete", { path });
-            touchedPaths.add(path);
-            lastHandledTimestamp = timestamp;
-            this.reportSyncProgress?.({
-              status: "syncing",
-              message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
-              current,
-              total: histRows.length,
-            });
-            continue;
-          }
-
-          // ── Content update ───────────────────────────────────────────────
-          // Skip our own startup-retransmit rows from previous sessions.
-          // outgoingIds only covers the current session; retransmit rows use a
-          // deterministic ID that persists across restarts.
-          const myRetransmitId = createIdFromString<"FileUpdate">(
-            `startup-retransmit:${path}:${this.deviceId}`,
-          );
-          if (id === myRetransmitId) {
-            this.logInfo("Skipped own startup-retransmit row", { path });
-            lastHandledTimestamp = timestamp;
-            this.reportSyncProgress?.({
-              status: "syncing",
-              message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
-              current,
-              total: histRows.length,
-            });
-            continue;
-          }
-
-          const st = await this.getOrLoadFileState(path, { seedFromVault: false });
-          this.touch(path, st);
-
-          // Pass "remote" as origin so doc.on("update") skips re-queuing this
-          // for outgoing transmission (echo-loop prevention).
-          Y.applyUpdate(st.doc, fromBase64(updateBase64), "remote");
-
-          this.logInfo("Applied remote update", {
-            path,
-            yjsTextLength: st.text.toString().length,
-            lastVaultTextLength: st.lastVaultText.length,
-          });
-
-          if ((lastDeleteIdx.get(path) ?? -1) > rowIdx) {
-            // A delete for this path appears at a later position in the batch —
-            // skip the vault write to avoid the Obsidian metadata-race (ARCH-2).
-            this.logInfo("Skipping vault write, delete follows in batch", { path });
-          } else {
-            const written = await this.writeYjsToVault(path, st);
-            if (!written) {
-              this.logWarn("Remote file update failed to write to vault; cursor not advanced past it", { id, path });
-              stoppedAtMissingRow = true;
-              break;
-            }
-            shouldPersistAfterRemoteApply = true;
-          }
-
-          touchedPaths.add(path);
-          if (this.pendingVaultSeed.delete(path)) {
-            this.logInfo("Deferred seed: remote history covered file", { path });
-          }
-          lastHandledTimestamp = timestamp;
-          this.reportSyncProgress?.({
-            status: "syncing",
-            message: "LocalSync is applying remote changes. Avoid edits until it catches up.",
-            current,
-            total: histRows.length,
-          });
-        }
-
-        // Save one snapshot per touched file rather than one per update row.
-        for (const p of touchedPaths) {
-          const st = this.states.get(p);
-          if (st) await this.saveLocalSnapshot(p, st);
-        }
-
-        if (lastHandledTimestamp != null) {
-          await this.saveHistoryCursor(lastHandledTimestamp);
-        }
-        if (shouldPersistAfterRemoteApply) {
-          await this.persistLocalDb?.();
-        }
-        if (stoppedAtMissingRow) {
-          this.reportSyncProgress?.({
-            status: "blocked",
-            message: "LocalSync paused: a remote row could not be applied. Check console before editing.",
-          });
-          return;
-        }
-
-        // Deferred vault seeding: drain only when the relay is quiet.
-        if (this.scanComplete) {
-          if (!this.pendingVaultSeedReady) {
-            this.pendingVaultSeedReady = true;
-          }
-          // (rows.length > 0, so we don't drain this cycle)
-        }
-      } catch (e) {
-        this.logError("pollHistoryOnce failed", e);
-      } finally {
-        this.isPolling = false;
-      }
-    })();
-  }
-
   // ---------- LRU ----------
 
   private touch(path: string, st: FileState) {
@@ -2023,33 +1734,6 @@ export class YjsEvoluHistoryEngine {
     }
     st.doc.destroy();
     this.states.delete(path);
-  }
-
-  // ---------- history cursor ----------
-
-  private async ensureHistoryCursorRow() {
-    const cursorId = createIdFromString<"HistoryCursor">("history-cursor");
-    // Do NOT pass lastTimestamp here — omitting it preserves any existing value.
-    // Passing `null` would be a newer CRDT write and would reset the cursor on
-    // every startup, causing the full history to be replayed each session.
-    this.evolu.upsert("_historyCursor", { id: cursorId });
-  }
-
-  private async loadHistoryCursor(): Promise<TimestampBytes | null> {
-    const cursorId = createIdFromString<"HistoryCursor">("history-cursor");
-
-    const q = this.evolu.createQuery((db) =>
-      db
-        .selectFrom("_historyCursor")
-        .select(["lastTimestamp"])
-        .where("id", "=", cursorId)
-        .where("isDeleted", "is", null)
-        .limit(1),
-    );
-
-    const rows = await this.evolu.loadQuery(q);
-    if (rows.length === 0) return null;
-    return rows[0].lastTimestamp ?? null;
   }
 
   private async logSyncInventory(
@@ -2474,11 +2158,6 @@ export class YjsEvoluHistoryEngine {
     return rows;
   }
 
-  private async saveHistoryCursor(ts: TimestampBytes) {
-    const cursorId = createIdFromString<"HistoryCursor">("history-cursor");
-    this.evolu.upsert("_historyCursor", { id: cursorId, lastTimestamp: ts });
-  }
-
   private createMaterializationSignature(parts: string[]): string {
     return hashText(parts.join("\n"));
   }
@@ -2779,7 +2458,6 @@ export class YjsEvoluHistoryEngine {
           );
 
       this.evolu.upsert("fileUpdate", { id, path, updateBase64 });
-      this.outgoingIds.add(id);
       st.pendingUpdates = [];
       st.pendingOutgoingId = null;
 
@@ -2829,7 +2507,6 @@ export class YjsEvoluHistoryEngine {
         updateBase64: this.emptyYjsUpdateBase64,
         type: "delete",
       });
-      this.outgoingIds.add(id);
       this.logInfo("Vault file deleted, propagating", { path });
     } catch (e) {
       this.logError("onVaultFileDeleted failed", { path, error: e });
@@ -2897,7 +2574,6 @@ export class YjsEvoluHistoryEngine {
         updateBase64: this.emptyYjsUpdateBase64,
         type: "delete",
       });
-      this.outgoingIds.add(delId);
 
       // Broadcast full state under the new path.
       await this.retransmitCurrentState(newPath);
@@ -2966,7 +2642,6 @@ export class YjsEvoluHistoryEngine {
           updateBase64: this.emptyYjsUpdateBase64,
           type: "delete",
         });
-        this.outgoingIds.add(id);
         audited++;
       }
 

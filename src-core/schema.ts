@@ -1,12 +1,10 @@
 
 import * as Evolu from "@evolu/common";
-import { TimestampBytes } from "@evolu/common/local-first";
 
 export const FileUpdateId = Evolu.id("FileUpdate");
 export const FileSnapshotId = Evolu.id("FileSnapshot");
 export const SettingUpdateId = Evolu.id("SettingUpdate");
 export const SettingSnapshotId = Evolu.id("SettingSnapshot");
-export const HistoryCursorId = Evolu.id("HistoryCursor");
 export const FileMaterializationId = Evolu.id("FileMaterialization");
 export const SettingMaterializationId = Evolu.id("SettingMaterialization");
 
@@ -42,11 +40,6 @@ export const Schema = {
     id: SettingSnapshotId,
     path: Evolu.NonEmptyString1000,
     contentHash: Evolu.NonEmptyString1000
-  },
-
-  _historyCursor: {
-    id: HistoryCursorId,
-    lastTimestamp: Evolu.nullOr(TimestampBytes)
   },
 
   _fileMaterialization: {
