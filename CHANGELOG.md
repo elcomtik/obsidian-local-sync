@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1 — 2026-06-23
+
+### Fixed
+
+- Remote catch-up progress now advances after each applied path while WAL
+  durability remains batched. A failed checkpoint retries from the last durable
+  progress baseline instead of inflating the visible counter.
+- Android database and WAL replacement now recognizes a rename that completed
+  even when the native bridge rejects afterward. The fallback no longer deletes
+  the newly written target and retries with an already moved temp file.
+
 ## 0.8.0 — 2026-06-23
 
 ### Changed

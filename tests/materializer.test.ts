@@ -513,6 +513,7 @@ test("incremental inbox checkpoints 50 paths with two database persists", async 
   const files = new Map<string, string>();
   const calls = { writes: [] as string[], deletes: [] as string[] };
   const events: string[] = [];
+  const progress: number[] = [];
   let savedPaths = 0;
   const journalStore: ApplyJournalStore = {
     async load() {
@@ -531,13 +532,17 @@ test("incremental inbox checkpoints 50 paths with two database persists", async 
     async () => {
       events.push("persist");
     },
-    undefined,
+    (event) => {
+      if (event.status === "syncing" && event.current !== undefined) progress.push(event.current);
+    },
     journalStore,
   );
   const privateEngine = engine as unknown as {
     scanComplete: boolean;
     fileInboxInitialized: boolean;
     settingInboxInitialized: boolean;
+    inboxProgressDiscovered: number;
+    inboxProgressTotal: number | null;
     pendingFileInbox: Map<string, {
       id: string;
       path: string;
@@ -552,6 +557,8 @@ test("incremental inbox checkpoints 50 paths with two database persists", async 
   privateEngine.scanComplete = true;
   privateEngine.fileInboxInitialized = true;
   privateEngine.settingInboxInitialized = true;
+  privateEngine.inboxProgressDiscovered = 50;
+  privateEngine.inboxProgressTotal = 50;
   for (let index = 0; index < 50; index++) {
     const row = {
       id: `row-${index}`,
@@ -576,6 +583,7 @@ test("incremental inbox checkpoints 50 paths with two database persists", async 
   assert.ok(events.indexOf("persist") < events.indexOf("journal"));
   assert.ok(events.lastIndexOf("persist") < events.indexOf("clear"));
   assert.equal(privateEngine.pendingFileInbox.size, 0);
+  assert.deepEqual(progress.slice(0, 50), Array.from({ length: 50 }, (_, index) => index + 1));
 });
 
 test("startup recovers a durable apply journal before clearing it", async () => {

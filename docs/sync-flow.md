@@ -34,6 +34,11 @@ place; startup replays it before any vault scan can classify an interrupted
 remote write as local drift. The WAL is cleared only after snapshots and
 processed markers are durably checkpointed.
 
+Visible catch-up progress advances after each applied path rather than waiting
+for the 50-path checkpoint. Its durable baseline advances only after the final
+database persist succeeds, so retrying an interrupted batch cannot inflate the
+counter.
+
 ## Startup
 
 The daemon and desktop plugin run the local vault scan by default. The mobile

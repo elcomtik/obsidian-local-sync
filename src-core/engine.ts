@@ -1552,12 +1552,12 @@ export class YjsEvoluHistoryEngine {
     return `${row.id}:${row.sourceVersion}`;
   }
 
-  private reportInboxProgress() {
+  private reportInboxProgress(current = this.inboxProgressApplied) {
     if (this.inboxProgressDiscovered === 0) return;
     this.reportSyncProgress?.({
       status: "syncing",
       message: "LocalSync is applying remote changes. Avoid editing synced notes until catch-up completes.",
-      current: this.inboxProgressApplied,
+      current,
       total: this.inboxProgressTotal ?? this.inboxProgressDiscovered,
     });
   }
@@ -1603,7 +1603,10 @@ export class YjsEvoluHistoryEngine {
           await this.applyJournalStore?.save(journal);
         }
         const applyStartedAt = Date.now();
-        if (!(await this.applyJournalEntries(journal.entries))) {
+        const durableApplied = this.inboxProgressApplied;
+        if (!(await this.applyJournalEntries(journal.entries, (appliedRows) => {
+          this.reportInboxProgress(durableApplied + appliedRows);
+        }))) {
           this.reportInboxBlocked();
           break;
         }
@@ -1667,12 +1670,18 @@ export class YjsEvoluHistoryEngine {
     return entries.length > 0 ? { version: 1, entries } : null;
   }
 
-  private async applyJournalEntries(entries: ApplyJournalEntry[]): Promise<boolean> {
+  private async applyJournalEntries(
+    entries: ApplyJournalEntry[],
+    reportProgress?: (appliedRows: number) => void,
+  ): Promise<boolean> {
+    let appliedRows = 0;
     for (const entry of entries) {
       const applied = entry.kind === "file"
         ? await this.processPendingFilePath(entry.path, entry.rows)
         : await this.processPendingSettingPath(entry.path, entry.rows);
       if (!applied) return false;
+      appliedRows += entry.rows.length;
+      reportProgress?.(appliedRows);
     }
     return true;
   }

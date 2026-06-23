@@ -35,6 +35,7 @@ import {
 } from "../src-core/pathPolicy";
 import { formatLogLine } from "../src-core/logFormat";
 import { ObsidianVaultAdapter } from "./obsidianVaultAdapter";
+import { replaceAdapterFileFromTemp } from "./adapterAtomicFile";
 
 /**
  * Stop promise from the most recently unloaded plugin instance.
@@ -479,19 +480,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
         await cleanupStaleAdapterTempFiles(adapter, dbPath);
         try {
           await adapter.writeBinary(tempPath, exactArrayBuffer(data));
-          try {
-            await adapter.rename(tempPath, dbPath);
-          } catch (renameError) {
-            // Some mobile adapters do not replace existing files on rename.
-            // Fall back to remove+rename; less atomic, but still avoids leaving a
-            // partially-written target when replacement rename is supported.
-            try {
-              if (await adapter.exists(dbPath)) await adapter.remove(dbPath);
-              await adapter.rename(tempPath, dbPath);
-            } catch (fallbackError) {
-              throw fallbackError instanceof Error ? fallbackError : renameError;
-            }
-          }
+          await replaceAdapterFileFromTemp(adapter, tempPath, dbPath);
         } catch (error) {
           try {
             if (await adapter.exists(tempPath)) await adapter.remove(tempPath);
@@ -521,16 +510,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
         await cleanupStaleAdapterTempFiles(adapter, journalPath);
         try {
           await adapter.write(tempPath, JSON.stringify(journal));
-          try {
-            await adapter.rename(tempPath, journalPath);
-          } catch (renameError) {
-            try {
-              if (await adapter.exists(journalPath)) await adapter.remove(journalPath);
-              await adapter.rename(tempPath, journalPath);
-            } catch (fallbackError) {
-              throw fallbackError instanceof Error ? fallbackError : renameError;
-            }
-          }
+          await replaceAdapterFileFromTemp(adapter, tempPath, journalPath);
         } catch (error) {
           try {
             if (await adapter.exists(tempPath)) await adapter.remove(tempPath);
