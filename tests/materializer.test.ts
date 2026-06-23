@@ -228,6 +228,29 @@ test("startup scan reports progress through completion", async () => {
   assert.equal(syncing.at(-1)?.total, 6);
 });
 
+test("manual vault scan audits deletes and reports progress", async () => {
+  const files = new Map([["notes/local.md", "text"]]);
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const progress: SyncProgress[] = [];
+  const engine = makeEngine(makeVault(files, calls), undefined, (event) => progress.push(event));
+  const privateEngine = engine as unknown as {
+    auditSnapshotsForOfflineDeletes(label: string): Promise<void>;
+  };
+  const labels: string[] = [];
+  privateEngine.auditSnapshotsForOfflineDeletes = async (label) => {
+    labels.push(label);
+  };
+
+  await engine.runVaultScanNow();
+
+  assert.deepEqual(labels, ["Manual vault scan"]);
+  assert.equal(progress.find((event) => event.status === "syncing")?.message, "LocalSync is checking local files.");
+  assert.deepEqual(progress.at(-1), {
+    status: "caught-up",
+    message: "LocalSync local vault scan complete.",
+  });
+});
+
 test("incremental inbox reports discovered and applied remote rows", async () => {
   const path = "remote-progress.md";
   const files = new Map<string, string>();
@@ -354,6 +377,72 @@ test("incremental file inbox applies only pending content without history replay
   assert.equal(files.get(path), "remote content");
   assert.deepEqual(calls.writes, [path]);
   assert.equal(persists, 1);
+});
+
+test("interrupted remote file application resumes without an outgoing echo", async () => {
+  const path = "mobile-resume.md";
+  const oldState = makeYjsTextDoc("old");
+  const snapshotBase64 = Buffer.from(Y.encodeStateAsUpdate(oldState.doc)).toString("base64");
+  const beforeRemote = Y.encodeStateVector(oldState.doc);
+  oldState.doc.transact(() => {
+    oldState.text.delete(0, oldState.text.length);
+    oldState.text.insert(0, "remote");
+  });
+  const updateBase64 = Buffer.from(Y.encodeStateAsUpdate(oldState.doc, beforeRemote)).toString("base64");
+  oldState.doc.destroy();
+
+  const files = new Map([[path, "remote"]]);
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const outgoing: Record<string, unknown>[] = [];
+  let persists = 0;
+  const engine = makeEngine(makeVault(files, calls), async () => {
+    persists++;
+  });
+  const privateEngine = engine as unknown as {
+    states: Map<string, { doc: Y.Doc }>;
+    evolu: {
+      upsert(
+        table: string,
+        row: Record<string, unknown>,
+        options?: { onComplete?: () => void },
+      ): { ok: true };
+    };
+    loadLocalSnapshot(path: string): Promise<string | null>;
+    processPendingFilePath(
+      path: string,
+      rows: Array<{
+        id: string;
+        path: string;
+        updateBase64: string;
+        type: string | null;
+        createdAt: string;
+        sourceVersion: string;
+      }>,
+    ): Promise<boolean>;
+  };
+  privateEngine.loadLocalSnapshot = async () => snapshotBase64;
+  privateEngine.evolu.upsert = (table, row, options) => {
+    if (table === "fileUpdate") outgoing.push(row);
+    options?.onComplete?.();
+    return { ok: true };
+  };
+
+  const applied = await privateEngine.processPendingFilePath(path, [
+    {
+      id: "remote-interrupted",
+      path,
+      updateBase64,
+      type: null,
+      createdAt: "2026-06-23T10:00:00.000Z",
+      sourceVersion: "2026-06-23T10:00:00.000Z",
+    },
+  ]);
+
+  assert.equal(applied, true);
+  assert.deepEqual(outgoing, []);
+  assert.equal(files.get(path), "remote");
+  assert.equal(persists, 1);
+  privateEngine.states.get(path)?.doc.destroy();
 });
 
 test("incremental file inbox persists processed marker after snapshot", async () => {

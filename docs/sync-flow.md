@@ -29,6 +29,12 @@ leaves the row pending, so it is retried. Applying a Yjs update again is safe.
 
 ## Startup
 
+The daemon and desktop plugin run the local vault scan by default. The mobile
+plugin disables it by default so startup can begin incremental synchronization
+without reading every local file. Mobile users can enable it or run **Local
+vault scan** from Maintenance when files may have changed outside Obsidian or
+while LocalSync was stopped.
+
 ```mermaid
 flowchart TD
   A[Start engine] --> B[Initialize inbox schema]
@@ -59,12 +65,22 @@ own local reconciliation completes; they do not wait for the entire vault.
 The startup scan detects edits made while LocalSync was stopped. It does not
 perform a global remote-history validation.
 
+When the scan is disabled, inbox processing and path-scoped interrupted-write
+recovery start immediately. Normal edits made through Obsidian are still
+captured by vault events. Local edits, deletes, and renames that bypass those
+events require a manual or periodic vault scan.
+
 Obsidian reports scan progress as checked files over total tracked files.
 Incremental materialization counts the complete pending file and setting
 anti-joins only when either 500-row query page is full. Smaller catch-ups use
 the returned page lengths directly, avoiding a full-history count during normal
 sync. Materialization then reports applied rows over that backlog; large local
 marker migrations report separately.
+
+If the app is suspended after writing a remote result to the vault but before
+persisting its snapshot and processed marker, resume recomputes that pending
+result from the durable snapshot. A matching vault file is finalized without
+creating an outgoing update; genuine local drift still follows the merge path.
 
 ## Normal Local Edit
 

@@ -613,7 +613,7 @@ export class YjsEvoluHistoryEngine {
         skippedByExtension: Object.fromEntries(skippedByExtension),
         skippedByRule: Object.fromEntries(skippedByRule),
       });
-      const reportUiProgress = label === "Startup scan";
+      const reportUiProgress = label === "Startup scan" || label === "Manual vault scan";
       if (reportUiProgress) {
         this.reportSyncProgress?.({
           status: "syncing",
@@ -711,6 +711,12 @@ export class YjsEvoluHistoryEngine {
       this.scanComplete = true;
       this.startupUnscannedPaths.clear();
       this.kickIncrementalInboxes();
+      if (label === "Manual vault scan") {
+        this.reportSyncProgress?.({
+          status: "caught-up",
+          message: "LocalSync local vault scan complete.",
+        });
+      }
     } catch (e) {
       this.logError(`${label}: scanVaultForUnsyncedFiles failed`, e);
       this.scanComplete = true; // allow drain even if scan errored
@@ -1068,6 +1074,15 @@ export class YjsEvoluHistoryEngine {
       () => undefined,
     );
     return run;
+  }
+
+  /** Detect local changes made while the engine was stopped or bypassed vault events. */
+  async runVaultScanNow(label = "Manual vault scan"): Promise<void> {
+    if (this.isStopped) return;
+    if (this.localSyncConfig.syncDeletes) {
+      await this.auditSnapshotsForOfflineDeletes(label);
+    }
+    await this.scanVaultForUnsyncedFiles(label);
   }
 
   private createEmptyMaterializationStats(): MaterializationRepairStats {
@@ -1880,16 +1895,64 @@ export class YjsEvoluHistoryEngine {
     return closed;
   }
 
+  private async buildPendingFileContentState(
+    path: string,
+    rows: PendingFileUpdateRow[],
+  ): Promise<{ doc: Y.Doc; text: Y.Text } | null> {
+    const latestDelete = await this.loadLatestFileDelete(path);
+    const applicable = latestDelete
+      ? rows.filter((row) => compareUpdateOrder(row, latestDelete) > 0)
+      : rows;
+    if (applicable.length === 0) return null;
+
+    const doc = new Y.Doc();
+    const text = doc.getText("content");
+    const snapshot = await this.loadLocalSnapshot(path);
+    if (snapshot) Y.applyUpdate(doc, fromBase64(snapshot));
+    for (const row of applicable) {
+      Y.applyUpdate(doc, fromBase64(row.updateBase64), "remote");
+    }
+    return { doc, text };
+  }
+
+  private async recoverInterruptedFileApplication(
+    path: string,
+    rows: PendingFileUpdateRow[],
+  ): Promise<{ doc: Y.Doc; text: Y.Text } | null> {
+    if (this.states.has(path)) return null;
+    const current = await this.vault.readText(path);
+    const snapshotText = await this.loadLocalSnapshotText(path);
+    if (current === null || current === snapshotText) return null;
+
+    const pendingState = await this.buildPendingFileContentState(path, rows);
+    if (pendingState && pendingState.text.toString() === current) {
+      this.logInfo("Recovered interrupted remote file application", {
+        path,
+        updates: rows.length,
+      });
+      return pendingState;
+    }
+    pendingState?.doc.destroy();
+    return null;
+  }
+
   private async processPendingFilePath(path: string, rows: PendingFileUpdateRow[]): Promise<boolean> {
     if (!isTrackedVaultPath(path, this.localSyncConfig)) {
       await this.markFileRowsProcessed(rows);
       await this.persistLocalDb?.();
       return true;
     }
-    if (!(await this.reconcileLocalFileBeforeIncoming(path))) return false;
 
     try {
-      if (rows.some((row) => row.type === "delete")) {
+      const hasDelete = rows.some((row) => row.type === "delete");
+      const recovered = hasDelete
+        ? null
+        : await this.recoverInterruptedFileApplication(path, rows);
+      if (recovered) {
+        await this.writeIncrementalFileState(path, recovered.doc, recovered.text);
+      } else if (!(await this.reconcileLocalFileBeforeIncoming(path))) {
+        return false;
+      } else if (hasDelete) {
         const allRows = await this.loadFileUpdateRowsForPath(path);
         const materialized = this.materializeFileRows(allRows);
         if (materialized === null) {
@@ -1908,20 +1971,9 @@ export class YjsEvoluHistoryEngine {
           await this.writeIncrementalFileState(path, materialized.doc, materialized.text);
         }
       } else {
-        const latestDelete = await this.loadLatestFileDelete(path);
-        const applicable = latestDelete
-          ? rows.filter((row) => compareUpdateOrder(row, latestDelete) > 0)
-          : rows;
-
-        if (applicable.length > 0) {
-          const doc = new Y.Doc();
-          const text = doc.getText("content");
-          const snapshot = await this.loadLocalSnapshot(path);
-          if (snapshot) Y.applyUpdate(doc, fromBase64(snapshot));
-          for (const row of applicable) {
-            Y.applyUpdate(doc, fromBase64(row.updateBase64), "remote");
-          }
-          await this.writeIncrementalFileState(path, doc, text);
+        const pendingState = await this.buildPendingFileContentState(path, rows);
+        if (pendingState) {
+          await this.writeIncrementalFileState(path, pendingState.doc, pendingState.text);
         }
       }
 
@@ -2010,10 +2062,13 @@ export class YjsEvoluHistoryEngine {
       const current = await this.vault.readText(path);
       const snapshot = await this.loadSettingSnapshot(path);
       const currentHash = current === null ? null : hashText(current);
-      if (current !== null && snapshot?.contentHash !== currentHash) {
+      const latest = await this.loadLatestSettingUpdateForPath(path);
+      if (current !== null && latest && latest.contentHash === currentHash) {
+        this.logInfo("Recovered interrupted remote setting application", { path });
+        await this.applyRemoteSettingUpdate(latest);
+      } else if (current !== null && snapshot?.contentHash !== currentHash) {
         await this.advertiseSettingContent(path, current, currentHash ?? hashText(current));
       } else {
-        const latest = await this.loadLatestSettingUpdateForPath(path);
         if (latest) await this.applyRemoteSettingUpdate(latest);
       }
       await this.markSettingRowsProcessed(rows);

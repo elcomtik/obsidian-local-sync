@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0 — 2026-06-23
+
+### Fixed
+
+- Interrupted remote applications are now idempotently recoverable across the
+  vault/sql.js persistence boundary. If a resumed file or setting already
+  matches its pending remote result, LocalSync finalizes the snapshot and
+  processed marker without misclassifying the content as local drift or
+  emitting an outgoing echo.
+
+### Changed
+
+- Mobile peers now disable the full startup vault scan by default. Incremental
+  remote updates and targeted interrupted-write recovery still start
+  immediately. A manual local vault scan remains available in Maintenance for
+  detecting edits, deletes, or renames made while LocalSync was stopped or
+  outside Obsidian; desktop and daemon startup behavior is unchanged.
+
 ## 0.6.4 — 2026-06-23
 
 ### Fixed

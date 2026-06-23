@@ -2,6 +2,7 @@
 import {
   App,
   Notice,
+  Platform,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -74,6 +75,7 @@ type PluginSettings = {
   syncCommunityPluginSettings: boolean;
   syncInstalledCommunityPluginFiles: boolean;
   startupScan: boolean;
+  mobileStartupScanDefaultApplied: boolean;
   syncDeletes: boolean;
   periodicRescanSeconds: number;
   settingsRescanSeconds: number;
@@ -108,6 +110,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
   syncCommunityPluginSettings: true,
   syncInstalledCommunityPluginFiles: false,
   startupScan: DEFAULT_LOCAL_SYNC_CONFIG.startupScan,
+  mobileStartupScanDefaultApplied: false,
   syncDeletes: DEFAULT_LOCAL_SYNC_CONFIG.syncDeletes,
   periodicRescanSeconds: DEFAULT_LOCAL_SYNC_CONFIG.periodicRescanSeconds,
   settingsRescanSeconds: DEFAULT_LOCAL_SYNC_CONFIG.settingsRescanSeconds,
@@ -669,6 +672,11 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       delete (this.settings as { syncInstalledCommunityPlugins?: boolean }).syncInstalledCommunityPlugins;
       migrated = true;
     }
+    if (!saved?.mobileStartupScanDefaultApplied) {
+      if (Platform.isMobile) this.settings.startupScan = false;
+      this.settings.mobileStartupScanDefaultApplied = true;
+      migrated = true;
+    }
     this.settings.includeExtensions = normalizeExtensions(this.settings.includeExtensions);
     this.settings.excludeGlobs = normalizeRules(this.settings.excludeGlobs).filter((rule) => {
       const keep = !OBSOLETE_VAULT_EXCLUDE_GLOBS.has(rule);
@@ -715,6 +723,13 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       throw new Error("LocalSync engine is not running");
     }
     return this.engine.runMaterializationRepairNow();
+  }
+
+  async runVaultScanNow(): Promise<void> {
+    if (!this.engine) {
+      throw new Error("LocalSync engine is not running");
+    }
+    await this.engine.runVaultScanNow();
   }
 
   /**
@@ -1038,25 +1053,6 @@ class LocalSyncSettingTab extends PluginSettingTab {
     // ----------------------------
     containerEl.createEl("h3", { text: "Sync" });
 
-    markWide(new Setting(containerEl))
-      .setName("Relay URL")
-      .setDesc("WebSocket relay endpoint. Changes take effect after reloading Obsidian.")
-      .addText((text) => {
-        text.inputEl.addClass("localsync-wide-input");
-        text
-          .setPlaceholder("wss://free.evoluhq.com")
-          .setValue(this.plugin.settings.relayUrl)
-          .onChange(async (value) => {
-            const trimmed = value.trim();
-            if (!trimmed.startsWith("wss://") && !trimmed.startsWith("ws://")) {
-              new Notice("Relay URL must start with wss:// or ws://");
-              return;
-            }
-            this.plugin.settings.relayUrl = trimmed;
-            await this.plugin.saveSettings();
-          });
-      });
-
     containerEl.createEl("h3", { text: "Vault sync" });
 
     const setExtensionEnabled = async (extension: string, enabled: boolean) => {
@@ -1119,7 +1115,11 @@ class LocalSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Startup scan")
-      .setDesc("Scan tracked vault files when LocalSync starts.")
+      .setDesc(
+        Platform.isMobile
+          ? "Detect changes made while LocalSync was stopped. Disabled by default on mobile; external file changes may be missed until a manual or periodic scan."
+          : "Detect changes made while LocalSync was stopped by scanning tracked vault files at startup.",
+      )
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.startupScan);
         toggle.onChange(async (value) => {
@@ -1162,6 +1162,26 @@ class LocalSyncSettingTab extends PluginSettingTab {
       });
 
     containerEl.createEl("h3", { text: "Maintenance" });
+
+    new Setting(containerEl)
+      .setName("Local vault scan")
+      .setDesc("Check tracked files now for changes made while LocalSync was stopped or outside Obsidian.")
+      .addButton((btn) => {
+        btn.setButtonText("Scan now").onClick(async () => {
+          btn.setDisabled(true);
+          btn.setButtonText("Scanning...");
+          try {
+            await this.plugin.runVaultScanNow();
+            new Notice("LocalSync vault scan complete");
+          } catch (error) {
+            logError("Manual vault scan failed", error);
+            new Notice("LocalSync vault scan failed. Check console.");
+          } finally {
+            btn.setButtonText("Scan now");
+            btn.setDisabled(false);
+          }
+        });
+      });
 
     new Setting(containerEl)
       .setName("Materialization repair")
@@ -1358,6 +1378,25 @@ class LocalSyncSettingTab extends PluginSettingTab {
     // Evolu Sync Key (Mnemonic)
     // ----------------------------
     containerEl.createEl("h3", { text: "Sync Key (Mnemonic)" });
+
+    markWide(new Setting(containerEl))
+      .setName("Relay URL")
+      .setDesc("WebSocket relay endpoint. Changes take effect after reloading Obsidian.")
+      .addText((text) => {
+        text.inputEl.addClass("localsync-wide-input");
+        text
+          .setPlaceholder("wss://free.evoluhq.com")
+          .setValue(this.plugin.settings.relayUrl)
+          .onChange(async (value) => {
+            const trimmed = value.trim();
+            if (!trimmed.startsWith("wss://") && !trimmed.startsWith("ws://")) {
+              new Notice("Relay URL must start with wss:// or ws://");
+              return;
+            }
+            this.plugin.settings.relayUrl = trimmed;
+            await this.plugin.saveSettings();
+          });
+      });
 
     // -- Reveal / copy --
     const revealSetting = new Setting(containerEl)
