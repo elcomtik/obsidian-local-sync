@@ -20,7 +20,9 @@ import {
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+  DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS,
   YjsEvoluHistoryEngine,
+  type ApplyJournalStore,
   type EngineConfig,
   type LogLevel,
   type MaterializationRepairResult,
@@ -55,6 +57,7 @@ type PluginSettings = {
 
   historyPollMs: number;
   historyBatchSize: number;
+  inboxCheckpointBatchPaths: number;
   outgoingBatchMs: number;
   maxOpenDocs: number;
   vaultScanDebugProgressEveryFiles: number;
@@ -90,6 +93,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
 
   historyPollMs: 1000,
   historyBatchSize: 500,
+  inboxCheckpointBatchPaths: DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS,
   outgoingBatchMs: 500,
   maxOpenDocs: 50,
   vaultScanDebugProgressEveryFiles: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
@@ -138,6 +142,7 @@ function toEngineConfig(s: PluginSettings): EngineConfig {
   return {
     historyPollMs: s.historyPollMs,
     historyBatchSize: s.historyBatchSize,
+    inboxCheckpointBatchPaths: s.inboxCheckpointBatchPaths,
     outgoingBatchMs: s.outgoingBatchMs,
     maxOpenDocs: s.maxOpenDocs,
     vaultScanDebugProgressEveryFiles: s.vaultScanDebugProgressEveryFiles,
@@ -503,6 +508,44 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     };
   }
 
+  private buildApplyJournalStore(appName: string): ApplyJournalStore {
+    const journalPath = `${this.app.vault.configDir}/plugins/${this.manifest.id}/${appName}.apply.wal`;
+    const adapter = this.app.vault.adapter;
+    return {
+      load: async () => {
+        if (!(await adapter.exists(journalPath))) return null;
+        return JSON.parse(await adapter.read(journalPath));
+      },
+      save: async (journal) => {
+        const tempPath = `${journalPath}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+        await cleanupStaleAdapterTempFiles(adapter, journalPath);
+        try {
+          await adapter.write(tempPath, JSON.stringify(journal));
+          try {
+            await adapter.rename(tempPath, journalPath);
+          } catch (renameError) {
+            try {
+              if (await adapter.exists(journalPath)) await adapter.remove(journalPath);
+              await adapter.rename(tempPath, journalPath);
+            } catch (fallbackError) {
+              throw fallbackError instanceof Error ? fallbackError : renameError;
+            }
+          }
+        } catch (error) {
+          try {
+            if (await adapter.exists(tempPath)) await adapter.remove(tempPath);
+          } catch {
+            // Best effort cleanup only.
+          }
+          throw error;
+        }
+      },
+      clear: async () => {
+        if (await adapter.exists(journalPath)) await adapter.remove(journalPath);
+      },
+    };
+  }
+
   private async startEngine() {
     // ----------------------------
     // Create Evolu client
@@ -556,6 +599,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       logLevel: this.settings.logLevel,
       reportSyncProgress: (progress) => this.handleSyncProgress(progress),
       persistLocalDb: this.persistEvoluDb,
+      applyJournalStore: this.buildApplyJournalStore(this.settings.appName),
     });
 
     await this.engine.start();
@@ -745,6 +789,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
    */
   async prepareForOwnerChange() {
     await this.engine?.stop(false);
+    await this.buildApplyJournalStore(this.settings.appName).clear();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
 
@@ -787,6 +832,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
       logLevel: this.settings.logLevel,
       reportSyncProgress: (progress) => this.handleSyncProgress(progress),
       persistLocalDb: this.persistEvoluDb,
+      applyJournalStore: this.buildApplyJournalStore(this.settings.appName),
     });
     await this.engine.start();
   }
@@ -863,6 +909,7 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
 
     reportProgress?.({ message: "Deleting local database..." });
     const io = this.buildIO(this.settings.appName);
+    await this.buildApplyJournalStore(this.settings.appName).clear();
     await io.deleteFile?.();
 
     reportProgress?.({ message: "Creating fresh local database..." });
@@ -996,6 +1043,7 @@ class LocalSyncSettingTab extends PluginSettingTab {
         PluginSettings,
         | "historyPollMs"
         | "historyBatchSize"
+        | "inboxCheckpointBatchPaths"
         | "outgoingBatchMs"
         | "maxOpenDocs"
         | "vaultScanDebugProgressEveryFiles"
@@ -1369,6 +1417,8 @@ class LocalSyncSettingTab extends PluginSettingTab {
     addEngineNumberSetting("Quiet cycle interval (ms)", "How often to run deferred seed and inventory checks.", "historyPollMs", 100, "Quiet interval");
 
     addEngineNumberSetting("Incoming batch size", "Maximum pending remote rows processed per inbox batch.", "historyBatchSize", 10, "Batch size");
+
+    addEngineNumberSetting("Checkpoint batch paths", "Maximum changed paths persisted in one crash-recoverable inbox checkpoint.", "inboxCheckpointBatchPaths", 1, "Checkpoint batch paths");
 
     addEngineNumberSetting("Outgoing batch interval (ms)", "Minimum time between sending Yjs updates.", "outgoingBatchMs", 50, "Outgoing interval");
 

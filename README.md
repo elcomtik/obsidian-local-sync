@@ -51,6 +51,9 @@ npm run build
 The Node.js daemon build watches a vault directory outside Obsidian and is
 intended for container/Kubernetes deployment. See [docs/daemon.md](docs/daemon.md).
 
+Mobile catch-up performance options and their durability constraints are
+tracked in [docs/mobile-performance.md](docs/mobile-performance.md).
+
 ### Install into a vault
 
 Copy the `dist/` folder to:

@@ -40,6 +40,7 @@ deployment that must join an existing sync owner.
 | `LOCALSYNC_SETTINGS_EXCLUDE_GLOBS` | workspace state and LocalSync plugin dir | Comma or newline separated settings exclude rules. Later rules win; prefix a rule with `!` to re-include. |
 | `LOCALSYNC_HISTORY_POLL_MS` | `1000` | Quiet-cycle and failed-inbox retry interval. |
 | `LOCALSYNC_HISTORY_BATCH_SIZE` | `500` | Maximum pending incoming rows per subscribed inbox query. |
+| `LOCALSYNC_INBOX_CHECKPOINT_BATCH_PATHS` | `50` | Maximum changed paths committed by one crash-recoverable database checkpoint. |
 | `LOCALSYNC_OUTGOING_BATCH_MS` | `500` | Local Yjs update flush debounce. |
 | `LOCALSYNC_MAX_OPEN_DOCS` | `50` | Maximum open Yjs documents. |
 | `LOCALSYNC_VAULT_SCAN_INFO_PROGRESS_EVERY_MS` | `60000` | Info-level aggregate vault scan progress interval. Set to `0` to disable. |

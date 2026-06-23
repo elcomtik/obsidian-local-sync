@@ -131,6 +131,7 @@ export function createPersistentSqlJsDriver(
         await persistToDisk(data, true);
       } catch (e) {
         console.error(logFormatter("ERROR", "Failed to save database", e));
+        throw e;
       }
     }
 

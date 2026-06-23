@@ -6,6 +6,7 @@ import {
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+  type ApplyJournalStore,
   type SyncProgress,
   YjsEvoluHistoryEngine,
 } from "../src-core/engine";
@@ -24,6 +25,7 @@ function makeEngine(
   vault: VaultAdapter,
   persistLocalDb?: () => Promise<void>,
   reportSyncProgress?: (progress: SyncProgress) => void,
+  applyJournalStore?: ApplyJournalStore,
 ): YjsEvoluHistoryEngine {
   return new YjsEvoluHistoryEngine({
     vault,
@@ -43,6 +45,7 @@ function makeEngine(
     config: {
       historyPollMs: 1000,
       historyBatchSize: 500,
+      inboxCheckpointBatchPaths: 50,
       outgoingBatchMs: 10,
       maxOpenDocs: 10,
       vaultScanDebugProgressEveryFiles: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
@@ -53,6 +56,7 @@ function makeEngine(
     logLevel: "off",
     persistLocalDb,
     reportSyncProgress,
+    applyJournalStore,
   });
 }
 
@@ -376,7 +380,7 @@ test("incremental file inbox applies only pending content without history replay
   assert.equal(applied, true);
   assert.equal(files.get(path), "remote content");
   assert.deepEqual(calls.writes, [path]);
-  assert.equal(persists, 1);
+  assert.equal(persists, 0);
 });
 
 test("interrupted remote file application resumes without an outgoing echo", async () => {
@@ -441,11 +445,11 @@ test("interrupted remote file application resumes without an outgoing echo", asy
   assert.equal(applied, true);
   assert.deepEqual(outgoing, []);
   assert.equal(files.get(path), "remote");
-  assert.equal(persists, 1);
+  assert.equal(persists, 0);
   privateEngine.states.get(path)?.doc.destroy();
 });
 
-test("incremental file inbox persists processed marker after snapshot", async () => {
+test("incremental file path stages processed marker after snapshot", async () => {
   const path = "ordered.md";
   const files = new Map<string, string>();
   const calls = { writes: [] as string[], deletes: [] as string[] };
@@ -502,7 +506,181 @@ test("incremental file inbox persists processed marker after snapshot", async ()
 
   assert.ok(events.indexOf("vault") < events.indexOf("snapshot"));
   assert.ok(events.indexOf("snapshot") < events.indexOf("processed"));
-  assert.ok(events.indexOf("processed") < events.indexOf("persist"));
+  assert.equal(events.includes("persist"), false);
+});
+
+test("incremental inbox checkpoints 50 paths with two database persists", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const events: string[] = [];
+  let savedPaths = 0;
+  const journalStore: ApplyJournalStore = {
+    async load() {
+      return null;
+    },
+    async save(journal) {
+      savedPaths = journal.entries.length;
+      events.push("journal");
+    },
+    async clear() {
+      events.push("clear");
+    },
+  };
+  const engine = makeEngine(
+    makeVault(files, calls),
+    async () => {
+      events.push("persist");
+    },
+    undefined,
+    journalStore,
+  );
+  const privateEngine = engine as unknown as {
+    scanComplete: boolean;
+    fileInboxInitialized: boolean;
+    settingInboxInitialized: boolean;
+    pendingFileInbox: Map<string, {
+      id: string;
+      path: string;
+      updateBase64: string;
+      type: string | null;
+      createdAt: string;
+      sourceVersion: string;
+    }>;
+    processPendingFilePath(path: string, rows: unknown[]): Promise<boolean>;
+    runIncrementalInbox(): Promise<void>;
+  };
+  privateEngine.scanComplete = true;
+  privateEngine.fileInboxInitialized = true;
+  privateEngine.settingInboxInitialized = true;
+  for (let index = 0; index < 50; index++) {
+    const row = {
+      id: `row-${index}`,
+      path: `notes/${index}.md`,
+      updateBase64: "update",
+      type: null,
+      createdAt: "2026-06-23T10:00:00.000Z",
+      sourceVersion: "2026-06-23T10:00:00.000Z",
+    };
+    privateEngine.pendingFileInbox.set(`${row.id}:${row.sourceVersion}`, row);
+  }
+  privateEngine.processPendingFilePath = async () => {
+    events.push("apply");
+    return true;
+  };
+
+  await privateEngine.runIncrementalInbox();
+
+  assert.equal(savedPaths, 50);
+  assert.equal(events.filter((event) => event === "persist").length, 2);
+  assert.equal(events.filter((event) => event === "apply").length, 50);
+  assert.ok(events.indexOf("persist") < events.indexOf("journal"));
+  assert.ok(events.lastIndexOf("persist") < events.indexOf("clear"));
+  assert.equal(privateEngine.pendingFileInbox.size, 0);
+});
+
+test("startup recovers a durable apply journal before clearing it", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const events: string[] = [];
+  const journal = {
+    version: 1 as const,
+    entries: [{
+      kind: "file" as const,
+      path: "recovery.md",
+      rows: [{
+        id: "recovery-row",
+        path: "recovery.md",
+        updateBase64: "update",
+        type: null,
+        createdAt: "2026-06-23T10:00:00.000Z",
+        sourceVersion: "2026-06-23T10:00:00.000Z",
+      }],
+    }],
+  };
+  const engine = makeEngine(
+    makeVault(files, calls),
+    async () => {
+      events.push("persist");
+    },
+    undefined,
+    {
+      async load() {
+        return journal;
+      },
+      async save() {
+        throw new Error("recovery must not replace the existing journal");
+      },
+      async clear() {
+        events.push("clear");
+      },
+    },
+  );
+  const privateEngine = engine as unknown as {
+    processPendingFilePath(path: string, rows: unknown[]): Promise<boolean>;
+    recoverApplyJournal(): Promise<void>;
+  };
+  privateEngine.processPendingFilePath = async () => {
+    events.push("apply");
+    return true;
+  };
+
+  await privateEngine.recoverApplyJournal();
+
+  assert.deepEqual(events, ["apply", "persist", "clear"]);
+});
+
+test("failed final checkpoint keeps journal and pending rows", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  let persists = 0;
+  let clears = 0;
+  const engine = makeEngine(
+    makeVault(files, calls),
+    async () => {
+      persists++;
+      if (persists === 2) throw new Error("disk full");
+    },
+    undefined,
+    {
+      async load() {
+        return null;
+      },
+      async save() {},
+      async clear() {
+        clears++;
+      },
+    },
+  );
+  const privateEngine = engine as unknown as {
+    scanComplete: boolean;
+    pendingFileInbox: Map<string, {
+      id: string;
+      path: string;
+      updateBase64: string;
+      type: string | null;
+      createdAt: string;
+      sourceVersion: string;
+    }>;
+    processPendingFilePath(path: string, rows: unknown[]): Promise<boolean>;
+    runIncrementalInbox(): Promise<void>;
+  };
+  privateEngine.scanComplete = true;
+  const row = {
+    id: "pending-after-failure",
+    path: "pending.md",
+    updateBase64: "update",
+    type: null,
+    createdAt: "2026-06-23T10:00:00.000Z",
+    sourceVersion: "2026-06-23T10:00:00.000Z",
+  };
+  privateEngine.pendingFileInbox.set(`${row.id}:${row.sourceVersion}`, row);
+  privateEngine.processPendingFilePath = async () => true;
+
+  await privateEngine.runIncrementalInbox();
+
+  assert.equal(persists, 2);
+  assert.equal(clears, 0);
+  assert.equal(privateEngine.pendingFileInbox.size, 1);
 });
 
 test("processed markers use createdAt for inserts and updatedAt for later versions", async () => {

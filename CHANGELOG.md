@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.0 — 2026-06-23
+
+### Changed
+
+- Incoming file and settings materialization now uses a durable apply WAL
+  and checkpoints sql.js once per batch of changed paths instead of once per
+  path. The default checkpoint batch contains 50 paths and is configurable in
+  the plugin or with `LOCALSYNC_INBOX_CHECKPOINT_BATCH_PATHS` in the daemon.
+  An interrupted batch is recovered before startup scanning begins. The WAL is
+  stored beside the LocalSync database with the `.apply.wal` suffix.
+- Visible remote catch-up progress now warns against editing synced notes until
+  catch-up completes, pending optimistic concurrency protection for the final
+  read-to-write window.
+
 ## 0.7.0 — 2026-06-23
 
 ### Fixed

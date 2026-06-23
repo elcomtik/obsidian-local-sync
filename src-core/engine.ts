@@ -35,6 +35,13 @@ const levelRank: Record<LogLevel, number> = {
 export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES = 100;
 export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS = 10_000;
 export const DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS = 60_000;
+export const DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS = 50;
+
+export type ApplyJournalStore = {
+  load: () => Promise<ApplyJournal | null>;
+  save: (journal: ApplyJournal) => Promise<void>;
+  clear: () => Promise<void>;
+};
 
 /**
  * Runtime configuration for {@link YjsEvoluHistoryEngine}.
@@ -45,6 +52,8 @@ export type EngineConfig = {
   historyPollMs: number;
   /** Maximum pending incoming rows exposed by each subscribed inbox query. */
   historyBatchSize: number;
+  /** Maximum changed paths committed by one durable inbox checkpoint. */
+  inboxCheckpointBatchPaths: number;
   /** Debounce window (ms) before flushing accumulated Yjs updates to Evolu. */
   outgoingBatchMs: number;
   /** Maximum simultaneously open Yjs docs; least-recently-used are evicted above this limit. */
@@ -326,6 +335,15 @@ type PendingSettingUpdateRow = SettingUpdateWithId & {
   sourceVersion: string;
 };
 
+type ApplyJournalEntry =
+  | { kind: "file"; path: string; rows: PendingFileUpdateRow[] }
+  | { kind: "setting"; path: string; rows: PendingSettingUpdateRow[] };
+
+export type ApplyJournal = {
+  version: 1;
+  entries: ApplyJournalEntry[];
+};
+
 function compareUpdateOrder(
   left: { createdAt: string; id: string },
   right: { createdAt: string; id: string },
@@ -381,6 +399,7 @@ export class YjsEvoluHistoryEngine {
   private formatLogLine: LogFormatter = formatLogLine;
   private reportSyncProgress?: SyncProgressReporter;
   private persistLocalDb?: () => Promise<void>;
+  private applyJournalStore?: ApplyJournalStore;
 
   private states = new Map<string, FileState>();
 
@@ -447,8 +466,7 @@ export class YjsEvoluHistoryEngine {
   private inboxProgressTotal: number | null = null;
   private inboxProgressTotalPromise: Promise<void> | null = null;
   private inboxQuietTicks = 0;
-  private fileInboxRunning = false;
-  private settingInboxRunning = false;
+  private inboxRunning = false;
   private fileInboxInitialized = false;
   private settingInboxInitialized = false;
   private fileInboxPageSaturated = false;
@@ -485,6 +503,7 @@ export class YjsEvoluHistoryEngine {
     logFormatter?: LogFormatter;
     reportSyncProgress?: SyncProgressReporter;
     persistLocalDb?: () => Promise<void>;
+    applyJournalStore?: ApplyJournalStore;
   }) {
     this.vault = args.vault;
     this.evolu = args.evolu;
@@ -495,6 +514,7 @@ export class YjsEvoluHistoryEngine {
     this.formatLogLine = args.logFormatter ?? formatLogLine;
     this.reportSyncProgress = args.reportSyncProgress;
     this.persistLocalDb = args.persistLocalDb;
+    this.applyJournalStore = args.applyJournalStore;
   }
 
   // ---------- logging helpers ----------
@@ -531,6 +551,7 @@ export class YjsEvoluHistoryEngine {
     try {
       this.isStopped = false;
       await this.initializeIncrementalInbox();
+      await this.recoverApplyJournal();
       this.startInboxSubscriptions();
       this.startPollingTimer();
       this.startRescanTimer();
@@ -1535,7 +1556,7 @@ export class YjsEvoluHistoryEngine {
     if (this.inboxProgressDiscovered === 0) return;
     this.reportSyncProgress?.({
       status: "syncing",
-      message: "LocalSync is applying remote changes.",
+      message: "LocalSync is applying remote changes. Avoid editing synced notes until catch-up completes.",
       current: this.inboxProgressApplied,
       total: this.inboxProgressTotal ?? this.inboxProgressDiscovered,
     });
@@ -1555,34 +1576,53 @@ export class YjsEvoluHistoryEngine {
 
   private kickIncrementalInboxes() {
     if (this.isStopped || !this.isActive) return;
-    void this.runFileInbox();
-    void this.runSettingInbox();
+    void this.runIncrementalInbox();
   }
 
-  private async runFileInbox() {
-    if (this.fileInboxRunning || this.isStopped || !this.isActive) return;
-    const firstEligible = Array.from(this.pendingFileInbox.values()).find((row) =>
-      this.canProcessIncomingPath(row.path),
-    );
-    if (!firstEligible) return;
+  private async runIncrementalInbox() {
+    if (this.inboxRunning || this.isStopped || !this.isActive) return;
+    if (!this.createNextApplyJournal()) return;
 
-    this.fileInboxRunning = true;
+    this.inboxRunning = true;
     const run = this.ongoingPoll.then(async () => {
       await this.ensureInboxProgressTotal();
       while (!this.isStopped && this.isActive) {
-        const first = Array.from(this.pendingFileInbox.values()).find((row) =>
-          this.canProcessIncomingPath(row.path),
-        );
-        if (!first) break;
-        const rows = Array.from(this.pendingFileInbox.values())
-          .filter((row) => row.path === first.path)
-          .sort(compareUpdateOrder);
-        if (!(await this.processPendingFilePath(first.path, rows))) {
+        const existingJournal = await this.applyJournalStore?.load();
+        const journal = existingJournal ?? this.createNextApplyJournal();
+        if (!journal) break;
+        const checkpointStartedAt = Date.now();
+        const rowCount = journal.entries.reduce((sum, entry) => sum + entry.rows.length, 0);
+        let incomingPersistMs = 0;
+
+        if (!existingJournal) {
+          // The journal references rows in sql.js, so checkpoint their arrival
+          // before any vault write can make recovery necessary.
+          const incomingPersistStartedAt = Date.now();
+          await this.persistLocalDb?.();
+          incomingPersistMs = Date.now() - incomingPersistStartedAt;
+          await this.applyJournalStore?.save(journal);
+        }
+        const applyStartedAt = Date.now();
+        if (!(await this.applyJournalEntries(journal.entries))) {
           this.reportInboxBlocked();
           break;
         }
-        for (const row of rows) this.pendingFileInbox.delete(this.inboxKey(row));
-        this.inboxProgressApplied += rows.length;
+        const applyMs = Date.now() - applyStartedAt;
+
+        const checkpointPersistStartedAt = Date.now();
+        await this.persistLocalDb?.();
+        const checkpointPersistMs = Date.now() - checkpointPersistStartedAt;
+        await this.applyJournalStore?.clear();
+        this.completeApplyJournal(journal);
+        this.logInfo("Incremental inbox checkpoint committed", {
+          paths: journal.entries.length,
+          rows: rowCount,
+          recovered: existingJournal !== null && existingJournal !== undefined,
+          incomingPersistMs,
+          applyMs,
+          checkpointPersistMs,
+          elapsedMs: Date.now() - checkpointStartedAt,
+        });
         this.reportInboxProgress();
       }
     });
@@ -1590,51 +1630,83 @@ export class YjsEvoluHistoryEngine {
     try {
       await run;
     } catch (error) {
-      this.logError("Incremental file inbox failed", error);
+      this.logError("Incremental inbox failed", error);
       this.reportInboxBlocked();
     } finally {
-      this.fileInboxRunning = false;
+      this.inboxRunning = false;
       void this.handleHistoryQuietTick();
     }
   }
 
-  private async runSettingInbox() {
-    if (this.settingInboxRunning || this.isStopped || !this.isActive) return;
-    const firstEligible = Array.from(this.pendingSettingInbox.values()).find((row) =>
-      this.canProcessIncomingPath(row.path),
-    );
-    if (!firstEligible) return;
+  private createNextApplyJournal(): ApplyJournal | null {
+    const entries: ApplyJournalEntry[] = [];
+    const limit = Math.max(1, this.config.inboxCheckpointBatchPaths);
 
-    this.settingInboxRunning = true;
-    const run = this.ongoingPoll.then(async () => {
-      await this.ensureInboxProgressTotal();
-      while (!this.isStopped && this.isActive) {
-        const first = Array.from(this.pendingSettingInbox.values()).find((row) =>
-          this.canProcessIncomingPath(row.path),
-        );
-        if (!first) break;
-        const rows = Array.from(this.pendingSettingInbox.values())
-          .filter((row) => row.path === first.path)
+    const addPaths = <T extends PendingFileUpdateRow | PendingSettingUpdateRow>(
+      kind: "file" | "setting",
+      inbox: Map<string, T>,
+    ) => {
+      const paths = new Set<string>();
+      for (const row of inbox.values()) {
+        if (entries.length >= limit) break;
+        if (!this.canProcessIncomingPath(row.path) || paths.has(row.path)) continue;
+        paths.add(row.path);
+        const rows = Array.from(inbox.values())
+          .filter((candidate) => candidate.path === row.path)
           .sort(compareUpdateOrder);
-        if (!(await this.processPendingSettingPath(first.path, rows))) {
-          this.reportInboxBlocked();
-          break;
+        if (kind === "file") {
+          entries.push({ kind, path: row.path, rows: rows as PendingFileUpdateRow[] });
+        } else {
+          entries.push({ kind, path: row.path, rows: rows as PendingSettingUpdateRow[] });
         }
-        for (const row of rows) this.pendingSettingInbox.delete(this.inboxKey(row));
-        this.inboxProgressApplied += rows.length;
-        this.reportInboxProgress();
       }
-    });
-    this.ongoingPoll = run.then(() => undefined, () => undefined);
-    try {
-      await run;
-    } catch (error) {
-      this.logError("Incremental setting inbox failed", error);
-      this.reportInboxBlocked();
-    } finally {
-      this.settingInboxRunning = false;
-      void this.handleHistoryQuietTick();
+    };
+
+    addPaths("file", this.pendingFileInbox);
+    if (entries.length < limit) addPaths("setting", this.pendingSettingInbox);
+    return entries.length > 0 ? { version: 1, entries } : null;
+  }
+
+  private async applyJournalEntries(entries: ApplyJournalEntry[]): Promise<boolean> {
+    for (const entry of entries) {
+      const applied = entry.kind === "file"
+        ? await this.processPendingFilePath(entry.path, entry.rows)
+        : await this.processPendingSettingPath(entry.path, entry.rows);
+      if (!applied) return false;
     }
+    return true;
+  }
+
+  private completeApplyJournal(journal: ApplyJournal) {
+    let appliedRows = 0;
+    for (const entry of journal.entries) {
+      const inbox = entry.kind === "file" ? this.pendingFileInbox : this.pendingSettingInbox;
+      for (const row of entry.rows) {
+        inbox.delete(this.inboxKey(row));
+        appliedRows++;
+      }
+    }
+    this.inboxProgressApplied += appliedRows;
+  }
+
+  private async recoverApplyJournal(): Promise<void> {
+    const journal = await this.applyJournalStore?.load();
+    if (!journal) return;
+    if (journal.version !== 1 || !Array.isArray(journal.entries)) {
+      throw new Error("Unsupported LocalSync apply journal");
+    }
+
+    this.logInfo("Recovering interrupted inbox checkpoint", {
+      paths: journal.entries.length,
+    });
+    if (!(await this.applyJournalEntries(journal.entries))) {
+      throw new Error("Interrupted inbox checkpoint could not be recovered");
+    }
+    await this.persistLocalDb?.();
+    await this.applyJournalStore?.clear();
+    this.logInfo("Interrupted inbox checkpoint recovered", {
+      paths: journal.entries.length,
+    });
   }
 
   private async initializeIncrementalInbox() {
@@ -1939,7 +2011,6 @@ export class YjsEvoluHistoryEngine {
   private async processPendingFilePath(path: string, rows: PendingFileUpdateRow[]): Promise<boolean> {
     if (!isTrackedVaultPath(path, this.localSyncConfig)) {
       await this.markFileRowsProcessed(rows);
-      await this.persistLocalDb?.();
       return true;
     }
 
@@ -1978,7 +2049,6 @@ export class YjsEvoluHistoryEngine {
       }
 
       await this.markFileRowsProcessed(rows);
-      await this.persistLocalDb?.();
       this.pendingVaultSeed.delete(path);
       this.logInfo("Incremental file updates applied", { path, updates: rows.length });
       return true;
@@ -2054,7 +2124,6 @@ export class YjsEvoluHistoryEngine {
   private async processPendingSettingPath(path: string, rows: PendingSettingUpdateRow[]): Promise<boolean> {
     if (!this.localSyncConfig.syncObsidianSettings || !isTrackedSettingPath(path, this.localSyncConfig)) {
       await this.markSettingRowsProcessed(rows);
-      await this.persistLocalDb?.();
       return true;
     }
 
@@ -2072,7 +2141,6 @@ export class YjsEvoluHistoryEngine {
         if (latest) await this.applyRemoteSettingUpdate(latest);
       }
       await this.markSettingRowsProcessed(rows);
-      await this.persistLocalDb?.();
       this.pendingSettingSeed.delete(path);
       this.logInfo("Incremental setting updates applied", { path, updates: rows.length });
       return true;
@@ -2340,8 +2408,7 @@ export class YjsEvoluHistoryEngine {
     if (this.isStopped || !this.isActive) return;
     if (!this.fileInboxInitialized || !this.settingInboxInitialized) return;
     if (
-      this.fileInboxRunning ||
-      this.settingInboxRunning ||
+      this.inboxRunning ||
       this.fileMaterializerRunning ||
       this.settingMaterializerRunning ||
       this.pendingFileInbox.size > 0 ||

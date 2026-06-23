@@ -6,7 +6,9 @@ import {
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+  DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS,
   YjsEvoluHistoryEngine,
+  type ApplyJournalStore,
   type EngineConfig,
   type LogLevel,
 } from "../src-core/engine";
@@ -51,6 +53,10 @@ const DAEMON_DEFAULT_EXCLUDE_GLOBS = [
 const engineConfig: EngineConfig = {
   historyPollMs: readPositiveInt("LOCALSYNC_HISTORY_POLL_MS", 1000),
   historyBatchSize: readPositiveInt("LOCALSYNC_HISTORY_BATCH_SIZE", 500),
+  inboxCheckpointBatchPaths: readPositiveInt(
+    "LOCALSYNC_INBOX_CHECKPOINT_BATCH_PATHS",
+    DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS,
+  ),
   outgoingBatchMs: readPositiveInt("LOCALSYNC_OUTGOING_BATCH_MS", 500),
   maxOpenDocs: readPositiveInt("LOCALSYNC_MAX_OPEN_DOCS", 50),
   vaultScanDebugProgressEveryFiles: readNonNegativeInt(
@@ -116,6 +122,27 @@ const io: PlatformIO = {
     await writeFileAtomic(dbPath, data);
   },
 };
+const applyJournalPath = `${dbPath}.apply.wal`;
+const applyJournalStore: ApplyJournalStore = {
+  async load() {
+    try {
+      return JSON.parse(await fs.readFile(applyJournalPath, "utf8"));
+    } catch (error) {
+      if (isMissingFile(error)) return null;
+      throw error;
+    }
+  },
+  async save(journal) {
+    await writeFileAtomic(applyJournalPath, JSON.stringify(journal));
+  },
+  async clear() {
+    try {
+      await fs.unlink(applyJournalPath);
+    } catch (error) {
+      if (!isMissingFile(error)) throw error;
+    }
+  },
+};
 
 let { evolu, closeDb, persistDb } = createEvoluClient(appName, relayUrl, io, {
   logFormatter,
@@ -133,6 +160,7 @@ if (mnemonic) {
     : null;
   if (currentOwner?.mnemonic !== mnemonic) {
     logInfo("Restoring daemon owner from LOCALSYNC_MNEMONIC");
+    await applyJournalStore.clear();
     await evolu.restoreAppOwner(Mnemonic.orThrow(mnemonic), { reload: false });
     await closeDb();
     ({ evolu, closeDb, persistDb } = createEvoluClient(appName, relayUrl, io, {
@@ -166,6 +194,7 @@ const engine = new YjsEvoluHistoryEngine({
   logLevel,
   logFormatter,
   persistLocalDb: persistDb,
+  applyJournalStore,
 });
 
 await engine.start();

@@ -18,14 +18,21 @@ flowchart LR
   B -- no --> D{Processed marker exists for id and version?}
   D -- yes --> E[No work]
   D -- no --> F[Pending inbox result]
-  F --> G[Apply affected path]
-  G --> H[Save snapshot]
-  H --> I[Write processed marker]
-  I --> J[Persist local database]
+  F --> G[Select up to 50 changed paths]
+  G --> H[Persist incoming rows]
+  H --> I[Write durable apply WAL]
+  I --> J[Apply affected paths]
+  J --> K[Save snapshots and processed markers]
+  K --> L[Persist local database once]
+  L --> M[Clear apply journal]
 ```
 
-The marker is written after vault and snapshot work. A crash before that point
-leaves the row pending, so it is retried. Applying a Yjs update again is safe.
+The marker is written after vault and snapshot work. Incoming rows are durable
+before the bounded apply WAL is created, and the WAL carries the selected
+pending row data needed for deterministic replay. A crash leaves the WAL in
+place; startup replays it before any vault scan can classify an interrupted
+remote write as local drift. The WAL is cleared only after snapshots and
+processed markers are durably checkpointed.
 
 ## Startup
 
@@ -38,7 +45,10 @@ while LocalSync was stopped.
 ```mermaid
 flowchart TD
   A[Start engine] --> B[Initialize inbox schema]
-  B --> C{Existing peer upgrading?}
+  B --> B2{Apply WAL exists?}
+  B2 -- yes --> B3[Recover and checkpoint interrupted batch]
+  B2 -- no --> C{Existing peer upgrading?}
+  B3 --> C
   C -- yes --> D[Baseline visible rows as processed once]
   C -- no --> E[Leave replicated rows pending]
   D --> F[Subscribe to pending-only queries]
@@ -78,9 +88,18 @@ sync. Materialization then reports applied rows over that backlog; large local
 marker migrations report separately.
 
 If the app is suspended after writing a remote result to the vault but before
-persisting its snapshot and processed marker, resume recomputes that pending
-result from the durable snapshot. A matching vault file is finalized without
-creating an outgoing update; genuine local drift still follows the merge path.
+persisting its snapshot and processed marker, the apply WAL identifies the
+interrupted batch. Resume recomputes each pending result from the durable
+snapshot. A matching vault file is finalized without creating an outgoing
+update; genuine local drift still follows the merge path.
+
+The apply WAL protects the vault/database durability boundary. It does not lock
+notes against live editing. LocalSync reconciles edits observed before applying
+a path and captures edits observed afterward, but an edit racing the final
+read-to-write window still requires separate optimistic concurrency handling.
+Visible remote catch-up progress therefore asks the user to avoid editing synced
+notes until catch-up completes. This is a temporary mitigation, not a substitute
+for closing the write race.
 
 ## Normal Local Edit
 
