@@ -6,6 +6,7 @@ import {
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+  type SyncProgress,
   YjsEvoluHistoryEngine,
 } from "../src-core/engine";
 import { DEFAULT_LOCAL_SYNC_CONFIG } from "../src-core/pathPolicy";
@@ -19,7 +20,11 @@ function makeYjsTextDoc(content: string): { doc: Y.Doc; text: Y.Text } {
   return { doc, text };
 }
 
-function makeEngine(vault: VaultAdapter, persistLocalDb?: () => Promise<void>): YjsEvoluHistoryEngine {
+function makeEngine(
+  vault: VaultAdapter,
+  persistLocalDb?: () => Promise<void>,
+  reportSyncProgress?: (progress: SyncProgress) => void,
+): YjsEvoluHistoryEngine {
   return new YjsEvoluHistoryEngine({
     vault,
     evolu: {
@@ -47,6 +52,7 @@ function makeEngine(vault: VaultAdapter, persistLocalDb?: () => Promise<void>): 
     localSyncConfig: DEFAULT_LOCAL_SYNC_CONFIG,
     logLevel: "off",
     persistLocalDb,
+    reportSyncProgress,
   });
 }
 
@@ -196,6 +202,111 @@ test("incremental inbox gates only unscanned startup paths", async () => {
   assert.equal(privateEngine.canProcessIncomingPath("existing.md"), true);
   privateEngine.scanComplete = true;
   assert.equal(privateEngine.canProcessIncomingPath("any.md"), true);
+});
+
+test("startup scan reports progress through completion", async () => {
+  const files = new Map(Array.from({ length: 6 }, (_, index) => [`notes/${index}.md`, "text"]));
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const progress: SyncProgress[] = [];
+  const engine = makeEngine(makeVault(files, calls), undefined, (event) => progress.push(event));
+  const privateEngine = engine as unknown as {
+    scanVaultForUnsyncedFiles(label: string): Promise<void>;
+  };
+
+  await privateEngine.scanVaultForUnsyncedFiles("Startup scan");
+
+  const syncing = progress.filter(
+    (event): event is Extract<SyncProgress, { status: "syncing" }> => event.status === "syncing",
+  );
+  assert.deepEqual(syncing[0], {
+    status: "syncing",
+    message: "LocalSync is checking local files.",
+    current: 0,
+    total: 6,
+  });
+  assert.equal(syncing.at(-1)?.current, 6);
+  assert.equal(syncing.at(-1)?.total, 6);
+});
+
+test("incremental inbox reports discovered and applied remote rows", async () => {
+  const path = "remote-progress.md";
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const progress: SyncProgress[] = [];
+  const engine = makeEngine(makeVault(files, calls), undefined, (event) => progress.push(event));
+  const remote = makeYjsTextDoc("remote content");
+  const updateBase64 = Buffer.from(Y.encodeStateAsUpdate(remote.doc)).toString("base64");
+  remote.doc.destroy();
+  const privateEngine = engine as unknown as {
+    scanComplete: boolean;
+    startupPathsReady: boolean;
+    fileInboxInitialized: boolean;
+    settingInboxInitialized: boolean;
+    fileInboxPageSaturated: boolean;
+    loadPendingInboxCount(): Promise<number>;
+    enqueuePendingFileRows(rows: ReadonlyArray<Record<string, unknown>>): void;
+    handleHistoryQuietTick(): Promise<void>;
+  };
+  privateEngine.scanComplete = true;
+  privateEngine.startupPathsReady = true;
+  privateEngine.fileInboxInitialized = true;
+  privateEngine.settingInboxInitialized = true;
+  privateEngine.fileInboxPageSaturated = true;
+  privateEngine.loadPendingInboxCount = async () => 1200;
+
+  privateEngine.enqueuePendingFileRows(
+    Array.from({ length: 6 }, (_, index) => ({
+      id: `remote-${index}`,
+      path,
+      updateBase64,
+      type: null,
+      createdAt: `2026-06-23T00:00:0${index}.000Z`,
+      sourceVersion: `2026-06-23T00:00:0${index}.000Z`,
+    })),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await privateEngine.handleHistoryQuietTick();
+  await privateEngine.handleHistoryQuietTick();
+
+  assert.ok(
+    progress.some(
+      (event) => event.status === "syncing" && event.current === 0 && event.total === 1200,
+    ),
+  );
+  assert.ok(
+    progress.some(
+      (event) => event.status === "syncing" && event.current === 6 && event.total === 1200,
+    ),
+  );
+  assert.equal(progress.at(-1)?.status, "caught-up");
+});
+
+test("small inbox catch-ups use page lengths without a full count query", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const engine = makeEngine(makeVault(files, calls));
+  const privateEngine = engine as unknown as {
+    fileInboxInitialized: boolean;
+    settingInboxInitialized: boolean;
+    fileInboxPageSaturated: boolean;
+    settingInboxPageSaturated: boolean;
+    inboxProgressDiscovered: number;
+    inboxProgressTotal: number | null;
+    loadPendingInboxCount(): Promise<number>;
+    ensureInboxProgressTotal(): Promise<void>;
+  };
+  privateEngine.fileInboxInitialized = true;
+  privateEngine.settingInboxInitialized = true;
+  privateEngine.fileInboxPageSaturated = false;
+  privateEngine.settingInboxPageSaturated = false;
+  privateEngine.inboxProgressDiscovered = 7;
+  privateEngine.loadPendingInboxCount = async () => {
+    throw new Error("small catch-ups must not count full history");
+  };
+
+  await privateEngine.ensureInboxProgressTotal();
+
+  assert.equal(privateEngine.inboxProgressTotal, 7);
 });
 
 test("incremental file inbox applies only pending content without history replay", async () => {

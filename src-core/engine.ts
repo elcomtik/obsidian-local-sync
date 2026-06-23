@@ -441,10 +441,18 @@ export class YjsEvoluHistoryEngine {
 
   private pendingFileInbox = new Map<string, PendingFileUpdateRow>();
   private pendingSettingInbox = new Map<string, PendingSettingUpdateRow>();
+  private inboxProgressKeys = new Set<string>();
+  private inboxProgressDiscovered = 0;
+  private inboxProgressApplied = 0;
+  private inboxProgressTotal: number | null = null;
+  private inboxProgressTotalPromise: Promise<void> | null = null;
+  private inboxQuietTicks = 0;
   private fileInboxRunning = false;
   private settingInboxRunning = false;
   private fileInboxInitialized = false;
   private settingInboxInitialized = false;
+  private fileInboxPageSaturated = false;
+  private settingInboxPageSaturated = false;
   private startupPathsReady = false;
   private startupUnscannedPaths = new Set<string>();
 
@@ -605,6 +613,15 @@ export class YjsEvoluHistoryEngine {
         skippedByExtension: Object.fromEntries(skippedByExtension),
         skippedByRule: Object.fromEntries(skippedByRule),
       });
+      const reportUiProgress = label === "Startup scan";
+      if (reportUiProgress) {
+        this.reportSyncProgress?.({
+          status: "syncing",
+          message: "LocalSync is checking local files.",
+          current: 0,
+          total: files.length,
+        });
+      }
       let loaded = 0;
       let unchanged = 0;
       let deferred = 0;
@@ -612,6 +629,7 @@ export class YjsEvoluHistoryEngine {
       const scanStartedAt = Date.now();
       let lastProgressAt = scanStartedAt;
       let lastInfoProgressAt = scanStartedAt;
+      let lastUiProgressAt = scanStartedAt;
 
       for (const file of files) {
         if (!this.isActive || this.isStopped) break;
@@ -635,6 +653,15 @@ export class YjsEvoluHistoryEngine {
         }
 
         const now = Date.now();
+        if (reportUiProgress && (processed === files.length || now - lastUiProgressAt >= 250)) {
+          lastUiProgressAt = now;
+          this.reportSyncProgress?.({
+            status: "syncing",
+            message: "LocalSync is checking local files.",
+            current: processed,
+            total: files.length,
+          });
+        }
         const shouldLogDebugProgress =
           this.logLevel === "debug" &&
           (processed === files.length ||
@@ -1209,11 +1236,15 @@ export class YjsEvoluHistoryEngine {
 
     const consumeFileRows = (rows: ReadonlyArray<any>) => {
       this.fileInboxInitialized = true;
+      this.fileInboxPageSaturated = rows.length >= this.config.historyBatchSize;
       this.enqueuePendingFileRows(rows);
+      void this.ensureInboxProgressTotal();
     };
     const consumeSettingRows = (rows: ReadonlyArray<any>) => {
       this.settingInboxInitialized = true;
+      this.settingInboxPageSaturated = rows.length >= this.config.historyBatchSize;
       this.enqueuePendingSettingRows(rows);
+      void this.ensureInboxProgressTotal();
     };
 
     this.unsubscribers.push(
@@ -1324,7 +1355,101 @@ export class YjsEvoluHistoryEngine {
     );
   }
 
+  private createPendingFileUpdateCountQuery() {
+    return this.evolu.createQuery((db) =>
+      (db as any)
+        .selectFrom("fileUpdate as incoming")
+        .leftJoin("_processedFileUpdate as processed", (join: any) =>
+          join
+            .onRef("processed.sourceId", "=", "incoming.id")
+            .on((eb: any) =>
+              eb(
+                "processed.sourceVersion",
+                "=",
+                eb.fn.coalesce("incoming.updatedAt", "incoming.createdAt"),
+              ),
+            ),
+        )
+        .select((eb: any) => eb.fn.countAll().as("count"))
+        .where("incoming.isDeleted", "is", null)
+        .where("processed.id", "is", null)
+        .where((eb: any) =>
+          eb.or([
+            eb("incoming.originDeviceId", "is", null),
+            eb("incoming.originDeviceId", "!=", this.deviceId),
+          ]),
+        ),
+    );
+  }
+
+  private createPendingSettingUpdateCountQuery() {
+    return this.evolu.createQuery((db) =>
+      (db as any)
+        .selectFrom("settingUpdate as incoming")
+        .leftJoin("_processedSettingUpdate as processed", (join: any) =>
+          join
+            .onRef("processed.sourceId", "=", "incoming.id")
+            .on((eb: any) =>
+              eb(
+                "processed.sourceVersion",
+                "=",
+                eb.fn.coalesce("incoming.updatedAt", "incoming.createdAt"),
+              ),
+            ),
+        )
+        .select((eb: any) => eb.fn.countAll().as("count"))
+        .where("incoming.isDeleted", "is", null)
+        .where("processed.id", "is", null)
+        .where((eb: any) =>
+          eb.or([
+            eb("incoming.originDeviceId", "is", null),
+            eb("incoming.originDeviceId", "!=", this.deviceId),
+          ]),
+        ),
+    );
+  }
+
+  private async loadPendingInboxCount(): Promise<number> {
+    const fileCountQuery = this.createPendingFileUpdateCountQuery();
+    const settingCountQuery = this.createPendingSettingUpdateCountQuery();
+    const [fileRows, settingRows] = await Promise.all([
+      this.evolu.loadQuery(fileCountQuery),
+      this.localSyncConfig.syncObsidianSettings
+        ? this.evolu.loadQuery(settingCountQuery)
+        : Promise.resolve([]),
+    ]);
+    const fileCount = Number((fileRows[0] as { count?: unknown } | undefined)?.count ?? 0);
+    const settingCount = Number((settingRows[0] as { count?: unknown } | undefined)?.count ?? 0);
+    return fileCount + settingCount;
+  }
+
+  private async ensureInboxProgressTotal(): Promise<void> {
+    if (this.inboxProgressTotal !== null) return;
+    if (!this.fileInboxInitialized || !this.settingInboxInitialized) return;
+    if (!this.fileInboxPageSaturated && !this.settingInboxPageSaturated) {
+      this.inboxProgressTotal = this.inboxProgressDiscovered;
+      this.reportInboxProgress();
+      return;
+    }
+    if (!this.inboxProgressTotalPromise) {
+      this.inboxProgressTotalPromise = this.loadPendingInboxCount()
+        .then((count) => {
+          this.inboxProgressTotal = Math.max(count, this.inboxProgressDiscovered);
+          this.reportInboxProgress();
+        })
+        .catch((error) => {
+          this.logWarn("Pending inbox count failed", error);
+          this.inboxProgressTotal = this.inboxProgressDiscovered;
+        })
+        .finally(() => {
+          this.inboxProgressTotalPromise = null;
+        });
+    }
+    await this.inboxProgressTotalPromise;
+  }
+
   private enqueuePendingFileRows(rows: ReadonlyArray<any>) {
+    let discovered = false;
     for (const row of rows) {
       if (!row.id || !row.path || !row.updateBase64 || !row.createdAt || !row.sourceVersion) continue;
       const pending: PendingFileUpdateRow = {
@@ -1335,12 +1460,27 @@ export class YjsEvoluHistoryEngine {
         createdAt: row.createdAt as string,
         sourceVersion: row.sourceVersion as string,
       };
-      this.pendingFileInbox.set(this.inboxKey(pending), pending);
+      const key = this.inboxKey(pending);
+      if (!this.inboxProgressKeys.has(`file:${key}`)) {
+        this.inboxProgressKeys.add(`file:${key}`);
+        this.inboxProgressDiscovered++;
+        if (this.inboxProgressTotal !== null) {
+          this.inboxProgressTotal = Math.max(this.inboxProgressTotal, this.inboxProgressDiscovered);
+        }
+        discovered = true;
+      }
+      this.pendingFileInbox.set(key, pending);
+    }
+    if (discovered) {
+      this.inboxQuietTicks = 0;
+      this.reportInboxProgress();
+      void this.ensureInboxProgressTotal();
     }
     this.kickIncrementalInboxes();
   }
 
   private enqueuePendingSettingRows(rows: ReadonlyArray<any>) {
+    let discovered = false;
     for (const row of rows) {
       if (!row.id || !row.path || !row.contentHash || !row.createdAt || !row.sourceVersion) continue;
       const pending: PendingSettingUpdateRow = {
@@ -1353,13 +1493,44 @@ export class YjsEvoluHistoryEngine {
         createdAt: row.createdAt as string,
         sourceVersion: row.sourceVersion as string,
       };
-      this.pendingSettingInbox.set(this.inboxKey(pending), pending);
+      const key = this.inboxKey(pending);
+      if (!this.inboxProgressKeys.has(`setting:${key}`)) {
+        this.inboxProgressKeys.add(`setting:${key}`);
+        this.inboxProgressDiscovered++;
+        if (this.inboxProgressTotal !== null) {
+          this.inboxProgressTotal = Math.max(this.inboxProgressTotal, this.inboxProgressDiscovered);
+        }
+        discovered = true;
+      }
+      this.pendingSettingInbox.set(key, pending);
+    }
+    if (discovered) {
+      this.inboxQuietTicks = 0;
+      this.reportInboxProgress();
+      void this.ensureInboxProgressTotal();
     }
     this.kickIncrementalInboxes();
   }
 
   private inboxKey(row: { id: string; sourceVersion: string }): string {
     return `${row.id}:${row.sourceVersion}`;
+  }
+
+  private reportInboxProgress() {
+    if (this.inboxProgressDiscovered === 0) return;
+    this.reportSyncProgress?.({
+      status: "syncing",
+      message: "LocalSync is applying remote changes.",
+      current: this.inboxProgressApplied,
+      total: this.inboxProgressTotal ?? this.inboxProgressDiscovered,
+    });
+  }
+
+  private reportInboxBlocked() {
+    this.reportSyncProgress?.({
+      status: "blocked",
+      message: "LocalSync paused: a remote update could not be applied. Check the console.",
+    });
   }
 
   private canProcessIncomingPath(path: string): boolean {
@@ -1382,6 +1553,7 @@ export class YjsEvoluHistoryEngine {
 
     this.fileInboxRunning = true;
     const run = this.ongoingPoll.then(async () => {
+      await this.ensureInboxProgressTotal();
       while (!this.isStopped && this.isActive) {
         const first = Array.from(this.pendingFileInbox.values()).find((row) =>
           this.canProcessIncomingPath(row.path),
@@ -1390,8 +1562,13 @@ export class YjsEvoluHistoryEngine {
         const rows = Array.from(this.pendingFileInbox.values())
           .filter((row) => row.path === first.path)
           .sort(compareUpdateOrder);
-        if (!(await this.processPendingFilePath(first.path, rows))) break;
+        if (!(await this.processPendingFilePath(first.path, rows))) {
+          this.reportInboxBlocked();
+          break;
+        }
         for (const row of rows) this.pendingFileInbox.delete(this.inboxKey(row));
+        this.inboxProgressApplied += rows.length;
+        this.reportInboxProgress();
       }
     });
     this.ongoingPoll = run.then(() => undefined, () => undefined);
@@ -1399,6 +1576,7 @@ export class YjsEvoluHistoryEngine {
       await run;
     } catch (error) {
       this.logError("Incremental file inbox failed", error);
+      this.reportInboxBlocked();
     } finally {
       this.fileInboxRunning = false;
       void this.handleHistoryQuietTick();
@@ -1414,6 +1592,7 @@ export class YjsEvoluHistoryEngine {
 
     this.settingInboxRunning = true;
     const run = this.ongoingPoll.then(async () => {
+      await this.ensureInboxProgressTotal();
       while (!this.isStopped && this.isActive) {
         const first = Array.from(this.pendingSettingInbox.values()).find((row) =>
           this.canProcessIncomingPath(row.path),
@@ -1422,8 +1601,13 @@ export class YjsEvoluHistoryEngine {
         const rows = Array.from(this.pendingSettingInbox.values())
           .filter((row) => row.path === first.path)
           .sort(compareUpdateOrder);
-        if (!(await this.processPendingSettingPath(first.path, rows))) break;
+        if (!(await this.processPendingSettingPath(first.path, rows))) {
+          this.reportInboxBlocked();
+          break;
+        }
         for (const row of rows) this.pendingSettingInbox.delete(this.inboxKey(row));
+        this.inboxProgressApplied += rows.length;
+        this.reportInboxProgress();
       }
     });
     this.ongoingPoll = run.then(() => undefined, () => undefined);
@@ -1431,6 +1615,7 @@ export class YjsEvoluHistoryEngine {
       await run;
     } catch (error) {
       this.logError("Incremental setting inbox failed", error);
+      this.reportInboxBlocked();
     } finally {
       this.settingInboxRunning = false;
       void this.handleHistoryQuietTick();
@@ -1513,8 +1698,31 @@ export class YjsEvoluHistoryEngine {
         settingRows as ReadonlyArray<any>,
         settingSignatures as ReadonlyArray<any>,
       );
-      await this.markFileRowsProcessed(trustedFileRows);
-      await this.markSettingRowsProcessed(trustedSettingRows);
+      const migrationTotal = trustedFileRows.length + trustedSettingRows.length;
+      if (migrationTotal > 0) {
+        this.reportSyncProgress?.({
+          status: "syncing",
+          message: "LocalSync is preparing local sync state.",
+          current: 0,
+          total: migrationTotal,
+        });
+      }
+      await this.markFileRowsProcessed(trustedFileRows, (current) => {
+        this.reportSyncProgress?.({
+          status: "syncing",
+          message: "LocalSync is preparing local sync state.",
+          current,
+          total: migrationTotal,
+        });
+      });
+      await this.markSettingRowsProcessed(trustedSettingRows, (current) => {
+        this.reportSyncProgress?.({
+          status: "syncing",
+          message: "LocalSync is preparing local sync state.",
+          current: trustedFileRows.length + current,
+          total: migrationTotal,
+        });
+      });
       this.logInfo("Incremental inbox migration: imported materialization checkpoints", {
         trustedFileRows: trustedFileRows.length,
         pendingFileRows: fileRows.length - trustedFileRows.length,
@@ -1601,6 +1809,7 @@ export class YjsEvoluHistoryEngine {
 
   private async markFileRowsProcessed(
     rows: ReadonlyArray<{ id?: unknown; createdAt?: unknown; updatedAt?: unknown; sourceVersion?: unknown }>,
+    reportProgress?: (current: number) => void,
   ) {
     const validRows = rows.filter(
       (row) => typeof row.id === "string" && this.getSourceVersion(row) !== null,
@@ -1622,11 +1831,13 @@ export class YjsEvoluHistoryEngine {
           return this.upsertAndWait("_processedFileUpdate", { id, sourceId, sourceVersion });
         }),
       );
+      reportProgress?.(Math.min(offset + 250, validRows.length));
     }
   }
 
   private async markSettingRowsProcessed(
     rows: ReadonlyArray<{ id?: unknown; createdAt?: unknown; updatedAt?: unknown; sourceVersion?: unknown }>,
+    reportProgress?: (current: number) => void,
   ) {
     const validRows = rows.filter(
       (row) => typeof row.id === "string" && this.getSourceVersion(row) !== null,
@@ -1648,6 +1859,7 @@ export class YjsEvoluHistoryEngine {
           return this.upsertAndWait("_processedSettingUpdate", { id, sourceId, sourceVersion });
         }),
       );
+      reportProgress?.(Math.min(offset + 250, validRows.length));
     }
   }
 
@@ -2080,6 +2292,13 @@ export class YjsEvoluHistoryEngine {
       this.pendingFileInbox.size > 0 ||
       this.pendingSettingInbox.size > 0
     ) {
+      this.inboxQuietTicks = 0;
+      return;
+    }
+
+    if (!this.scanComplete) return;
+    if (this.inboxProgressDiscovered > 0 && this.inboxQuietTicks === 0) {
+      this.inboxQuietTicks = 1;
       return;
     }
 
@@ -2087,8 +2306,14 @@ export class YjsEvoluHistoryEngine {
       status: "caught-up",
       message: "LocalSync is caught up.",
     });
-
-    if (!this.scanComplete) return;
+    this.inboxProgressKeys.clear();
+    this.inboxProgressDiscovered = 0;
+    this.inboxProgressApplied = 0;
+    this.inboxProgressTotal = null;
+    this.inboxProgressTotalPromise = null;
+    this.inboxQuietTicks = 0;
+    this.fileInboxPageSaturated = false;
+    this.settingInboxPageSaturated = false;
 
     if (!this.pendingVaultSeedReady) {
       this.pendingVaultSeedReady = true;

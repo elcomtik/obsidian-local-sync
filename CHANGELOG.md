@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.4 — 2026-06-23
+
+### Fixed
+
+- Restored Obsidian startup progress notices for local scans, inbox migration,
+  and incremental remote materialization. A pending anti-join count provides
+  the complete catch-up backlog only when a 500-row page is saturated; smaller
+  catch-ups use the already-loaded page lengths without scanning all history.
+  Progress is cumulative and throttled, and an active scan cannot be
+  overwritten by a premature caught-up status.
+
 ## 0.6.3 — 2026-06-23
 
 ### Fixed

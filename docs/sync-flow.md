@@ -59,6 +59,13 @@ own local reconciliation completes; they do not wait for the entire vault.
 The startup scan detects edits made while LocalSync was stopped. It does not
 perform a global remote-history validation.
 
+Obsidian reports scan progress as checked files over total tracked files.
+Incremental materialization counts the complete pending file and setting
+anti-joins only when either 500-row query page is full. Smaller catch-ups use
+the returned page lengths directly, avoiding a full-history count during normal
+sync. Materialization then reports applied rows over that backlog; large local
+marker migrations report separately.
+
 ## Normal Local Edit
 
 ```mermaid
