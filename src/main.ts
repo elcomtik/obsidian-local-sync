@@ -36,6 +36,7 @@ import {
 import { formatLogLine } from "../src-core/logFormat";
 import { ObsidianVaultAdapter } from "./obsidianVaultAdapter";
 import { replaceAdapterFileFromTemp } from "./adapterAtomicFile";
+import { createDeviceId, createReplacementDeviceId } from "./deviceId";
 
 /**
  * Stop promise from the most recently unloaded plugin instance.
@@ -90,7 +91,7 @@ type PluginSettings = {
 const DEFAULT_SETTINGS: PluginSettings = {
   relayUrl: "wss://free.evoluhq.com",
   appName: "obsidian-local-sync",
-  deviceId: `device-${Math.random().toString(16).slice(2)}`,
+  deviceId: createDeviceId(),
 
   historyPollMs: 1000,
   historyBatchSize: 500,
@@ -891,6 +892,15 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     const io = this.buildIO(this.settings.appName);
     await this.buildApplyJournalStore(this.settings.appName).clear();
     await io.deleteFile?.();
+
+    // A fresh local database must also use a fresh peer identity. The inbox
+    // intentionally ignores rows originating from this deviceId to prevent
+    // live self-echoes. Reusing the old ID after a destructive reset would
+    // therefore hide every remote history row originally authored by this
+    // device, leaving a rebuilt vault with only other peers' files.
+    reportProgress?.({ message: "Rotating local peer identity..." });
+    this.settings.deviceId = createReplacementDeviceId(this.settings.deviceId);
+    await this.saveSettings();
 
     reportProgress?.({ message: "Creating fresh local database..." });
     const { evolu, closeDb, persistDb } = createEvoluClient(

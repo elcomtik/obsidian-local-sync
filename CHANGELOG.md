@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.2 — 2026-06-24
+
+### Fixed
+
+- Resetting local sync state or restoring a mnemonic now rotates the local
+  peer ID before sync restarts. A rebuilt peer can therefore replay history it
+  authored before the reset instead of filtering those rows as live self-echoes.
+
 ## 0.8.1 — 2026-06-23
 
 ### Fixed
