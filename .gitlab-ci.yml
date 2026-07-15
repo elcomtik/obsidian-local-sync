@@ -87,6 +87,13 @@ docker-build:
     - unit-test
     - typecheck
     - smoke-daemon
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+
+docker-push-latest:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
 
 # ─── Publish to Package Registry (tags only) ─────────────────────────────────
 

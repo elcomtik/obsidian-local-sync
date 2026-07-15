@@ -1,0 +1,54 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "schedule:weekly"],
+  "labels": ["dependencies"],
+  "semanticCommits": "enabled",
+  "automerge": false,
+  "prConcurrentLimit": 3,
+  "branchConcurrentLimit": 3,
+  "prHourlyLimit": 1,
+  "minimumReleaseAge": "3 days",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Require dashboard approval for major updates",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Group patch updates",
+      "matchUpdateTypes": ["patch"],
+      "groupName": "patch updates"
+    },
+    {
+      "description": "Group minor updates",
+      "matchUpdateTypes": ["minor"],
+      "groupName": "minor updates"
+    },
+    {
+      "description": "Group GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "Group type stubs",
+      "groupName": "type stubs",
+      "matchPackageNames": ["/^@types\\//"]
+    },
+    {
+      "description": "Security updates - high priority",
+      "matchCategories": ["security"],
+      "labels": ["security", "dependencies"],
+      "minimumReleaseAge": "0 days",
+      "prPriority": 10
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "labels": ["security"],
+    "enabled": true,
+    "automerge": false
+  }
+}
