@@ -22,8 +22,8 @@
 # CI_JOB_TOKEN, CI_API_V4_URL, CI_PROJECT_ID, and CI_COMMIT_TAG automatically.
 
 include:
-  - { project: elcomtik/ci-templates, file: docker/build-2stage.yml, ref: v0.4.3 }
-  - { project: elcomtik/ci-templates, file: docker/publish.yml, ref: v0.4.3 }
+  - { project: elcomtik/ci-templates, file: docker/build-2stage.yml, ref: v0.8.3 }
+  - { project: elcomtik/ci-templates, file: docker/publish.yml, ref: v0.8.3 }
 
 stages:
   - test
@@ -36,21 +36,21 @@ stages:
 
 unit-test:
   stage: test
-  image: node:22-alpine
+  image: node:24-alpine
   script:
     - npm ci
     - npm test
 
 typecheck:
   stage: test
-  image: node:22-alpine
+  image: node:24-alpine
   script:
     - npm ci
     - npx tsc --noEmit
 
 smoke-daemon:
   stage: test
-  image: node:22-alpine
+  image: node:24-alpine
   script:
     - npm ci
     - npm run smoke:daemon
@@ -59,7 +59,7 @@ smoke-daemon:
 
 build:
   stage: build
-  image: node:22-alpine
+  image: node:24-alpine
   needs:
     - unit-test
     - typecheck
@@ -99,7 +99,7 @@ docker-push-latest:
 
 publish:
   stage: publish
-  image: node:22-alpine
+  image: node:24-alpine
   needs: [build]   # download build artifacts; don't wait for unrelated jobs
   rules:
     - if: $CI_COMMIT_TAG =~ /^v/

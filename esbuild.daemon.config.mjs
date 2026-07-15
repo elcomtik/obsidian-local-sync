@@ -12,7 +12,7 @@ const ctx = await esbuild.context({
   bundle: true,
   format: "esm",
   platform: "node",
-  target: "node22",
+  target: "node24",
   outfile: path.join(outdir, "main.js"),
   sourcemap: true,
   banner: {
