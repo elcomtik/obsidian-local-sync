@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.3 — 2026-07-15
+
+### Changed
+
+- Updated the build and release toolchain to Node.js 24, TypeScript 7,
+  esbuild 0.28, Obsidian API 1.13, GitLab CI templates 0.8, and current
+  GitHub Actions majors.
+- Refreshed runtime dependencies and lockfile maintenance updates for
+  `sql.js`, `yjs`, and type stubs.
+
+### Fixed
+
+- Updated the transitive `kysely` dependency used by Evolu to a patched
+  version so `npm audit` reports no vulnerabilities.
+
 ## 0.8.2 — 2026-06-24
 
 ### Fixed
