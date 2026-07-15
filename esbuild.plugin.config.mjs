@@ -55,7 +55,7 @@ const ctx = await esbuild.context({
     //    `typeof` guard ensures we never override it there.
     // 2. Preserve Obsidian's Yjs singleton flag so the plugin's bundled Yjs
     //    doesn't collide with the host app's Yjs instance.
-    js: 'if(typeof process==="undefined"){globalThis.process={env:{},platform:"linux",version:"v22",nextTick:function(fn){setTimeout(fn,0);}};} var __yjsFlag = globalThis["__ $YJS$ __"]; delete globalThis["__ $YJS$ __"];',
+    js: 'if(typeof process==="undefined"){globalThis.process={env:{},platform:"linux",version:"v24",nextTick:function(fn){setTimeout(fn,0);}};} var __yjsFlag = globalThis["__ $YJS$ __"]; delete globalThis["__ $YJS$ __"];',
   },
   footer: {
     js: 'if (__yjsFlag !== undefined) globalThis["__ $YJS$ __"] = __yjsFlag;',

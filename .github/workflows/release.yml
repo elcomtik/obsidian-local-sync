@@ -30,11 +30,11 @@ jobs:
   unit-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci
@@ -43,11 +43,11 @@ jobs:
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci
@@ -56,11 +56,11 @@ jobs:
   smoke-daemon:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci
@@ -75,21 +75,21 @@ jobs:
       - smoke-daemon
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: npm   # speeds up subsequent runs by restoring node_modules cache
 
       - run: npm ci
       - run: npm run build:plugin
       - run: npm run build:daemon
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: plugin-dist
-          # upload-artifact@v4 strips the common dist/ prefix when all paths share it,
+          # upload-artifact strips the common dist/ prefix when all paths share it,
           # so downstream jobs receive main.js, main.js.map, manifest.json at root.
           path: |
             dist/main.js
@@ -97,7 +97,7 @@ jobs:
             dist/manifest.json
           retention-days: 7
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: daemon-dist
           path: |
@@ -115,12 +115,12 @@ jobs:
       contents: write   # required to create a GitHub Release and upload assets
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: plugin-dist
           path: plugin-dist
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: daemon-dist
           path: daemon-dist
@@ -137,7 +137,7 @@ jobs:
             daemon-dist/main.js.map
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             obsidian-local-sync-${{ github.ref_name }}.zip
