@@ -6,7 +6,9 @@ import {
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+  DEFAULT_VAULT_RESCAN_WATCHDOG_MS,
   type ApplyJournalStore,
+  type FatalEngineErrorHandler,
   type SyncProgress,
   YjsEvoluHistoryEngine,
 } from "../src-core/engine";
@@ -26,6 +28,7 @@ function makeEngine(
   persistLocalDb?: () => Promise<void>,
   reportSyncProgress?: (progress: SyncProgress) => void,
   applyJournalStore?: ApplyJournalStore,
+  onFatalError?: FatalEngineErrorHandler,
 ): YjsEvoluHistoryEngine {
   return new YjsEvoluHistoryEngine({
     vault,
@@ -51,12 +54,14 @@ function makeEngine(
       vaultScanDebugProgressEveryFiles: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
       vaultScanDebugProgressEveryMs: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
       vaultScanInfoProgressEveryMs: DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+      vaultRescanWatchdogMs: DEFAULT_VAULT_RESCAN_WATCHDOG_MS,
     },
     localSyncConfig: DEFAULT_LOCAL_SYNC_CONFIG,
     logLevel: "off",
     persistLocalDb,
     reportSyncProgress,
     applyJournalStore,
+    onFatalError,
   });
 }
 
@@ -253,6 +258,37 @@ test("manual vault scan audits deletes and reports progress", async () => {
     status: "caught-up",
     message: "LocalSync local vault scan complete.",
   });
+});
+
+test("periodic vault rescan watchdog reports fatal error when audit hangs", async () => {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  let fatalContext: unknown = null;
+  const fatal = new Promise<Error>((resolve) => {
+    const engine = makeEngine(makeVault(files, calls), undefined, undefined, undefined, (error, context) => {
+      fatalContext = context;
+      resolve(error);
+    });
+    const privateEngine = engine as unknown as {
+      config: {
+        vaultRescanWatchdogMs: number;
+      };
+      auditSnapshotsForOfflineDeletes(label: string): Promise<void>;
+      runPeriodicVaultRescanWithWatchdog(): Promise<void>;
+    };
+    privateEngine.config.vaultRescanWatchdogMs = 10;
+    privateEngine.auditSnapshotsForOfflineDeletes = async () => new Promise<void>(() => {});
+
+    void privateEngine.runPeriodicVaultRescanWithWatchdog();
+  });
+
+  const error = await fatal;
+  const context = fatalContext as { label: string; elapsedMs: number; watchdogMs: number };
+
+  assert.match(error.message, /watchdog timeout/);
+  assert.equal(context.label, "Periodic vault rescan");
+  assert.equal(context.watchdogMs, 10);
+  assert.ok(context.elapsedMs >= 10);
 });
 
 test("incremental inbox reports discovered and applied remote rows", async () => {

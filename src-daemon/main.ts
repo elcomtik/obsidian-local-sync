@@ -6,6 +6,7 @@ import {
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+  DEFAULT_VAULT_RESCAN_WATCHDOG_MS,
   DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS,
   YjsEvoluHistoryEngine,
   type ApplyJournalStore,
@@ -71,6 +72,11 @@ const engineConfig: EngineConfig = {
     "LOCALSYNC_VAULT_SCAN_INFO_PROGRESS_EVERY_MS",
     DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
   ),
+  vaultRescanWatchdogMs:
+    readNonNegativeInt(
+      "LOCALSYNC_PERIODIC_RESCAN_WATCHDOG_SECONDS",
+      Math.floor(DEFAULT_VAULT_RESCAN_WATCHDOG_MS / 1000),
+    ) * 1000,
 };
 const localSyncConfig: LocalSyncConfig = {
   ...DEFAULT_LOCAL_SYNC_CONFIG,
@@ -195,6 +201,13 @@ const engine = new YjsEvoluHistoryEngine({
   logFormatter,
   persistLocalDb: persistDb,
   applyJournalStore,
+  onFatalError: (error, context) => {
+    logError("Fatal engine error; exiting daemon for supervisor restart", {
+      message: error.message,
+      context,
+    });
+    process.exit(1);
+  },
 });
 
 await engine.start();

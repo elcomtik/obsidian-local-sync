@@ -36,6 +36,7 @@ export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES = 100;
 export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS = 10_000;
 export const DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS = 60_000;
 export const DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS = 50;
+export const DEFAULT_VAULT_RESCAN_WATCHDOG_MS = 15 * 60_000;
 
 export type ApplyJournalStore = {
   load: () => Promise<ApplyJournal | null>;
@@ -64,7 +65,11 @@ export type EngineConfig = {
   vaultScanDebugProgressEveryMs: number;
   /** Info scan progress heartbeat by elapsed milliseconds. Set to 0 to disable info progress. */
   vaultScanInfoProgressEveryMs: number;
+  /** Fail the daemon if one periodic vault rescan runs longer than this. Set to 0 to disable. */
+  vaultRescanWatchdogMs: number;
 };
+
+export type FatalEngineErrorHandler = (error: Error, context: unknown) => void;
 
 export type SyncProgress =
   | {
@@ -400,6 +405,7 @@ export class YjsEvoluHistoryEngine {
   private reportSyncProgress?: SyncProgressReporter;
   private persistLocalDb?: () => Promise<void>;
   private applyJournalStore?: ApplyJournalStore;
+  private onFatalError?: FatalEngineErrorHandler;
 
   private states = new Map<string, FileState>();
 
@@ -408,6 +414,11 @@ export class YjsEvoluHistoryEngine {
   private settingsRescanTimer: ReturnType<typeof setInterval> | null = null;
   private isScanningVault = false;
   private isScanningSettings = false;
+  private periodicVaultRescan: {
+    startedAt: number;
+    promise: Promise<void>;
+    label: string;
+  } | null = null;
   private isStopped = false;
   private unsubscribers: Array<() => void> = [];
   /** Resolves when current inbox/manual-repair work completes. Awaited by stop(). */
@@ -504,6 +515,7 @@ export class YjsEvoluHistoryEngine {
     reportSyncProgress?: SyncProgressReporter;
     persistLocalDb?: () => Promise<void>;
     applyJournalStore?: ApplyJournalStore;
+    onFatalError?: FatalEngineErrorHandler;
   }) {
     this.vault = args.vault;
     this.evolu = args.evolu;
@@ -515,6 +527,7 @@ export class YjsEvoluHistoryEngine {
     this.reportSyncProgress = args.reportSyncProgress;
     this.persistLocalDb = args.persistLocalDb;
     this.applyJournalStore = args.applyJournalStore;
+    this.onFatalError = args.onFatalError;
   }
 
   // ---------- logging helpers ----------
@@ -2460,7 +2473,7 @@ export class YjsEvoluHistoryEngine {
     const vaultIntervalSeconds = this.localSyncConfig.periodicRescanSeconds;
     if (Number.isFinite(vaultIntervalSeconds) && vaultIntervalSeconds > 0) {
       this.vaultRescanTimer = setInterval(() => {
-        if (this.isActive) void this.runPeriodicVaultRescan();
+        if (this.isActive) void this.runPeriodicVaultRescanWithWatchdog();
       }, vaultIntervalSeconds * 1000);
       this.logInfo("Periodic vault rescan enabled", { intervalSeconds: vaultIntervalSeconds });
     }
@@ -2485,13 +2498,53 @@ export class YjsEvoluHistoryEngine {
     this.settingsRescanTimer = null;
   }
 
-  private async runPeriodicVaultRescan() {
+  private async runPeriodicVaultRescanWithWatchdog() {
+    if (!this.isActive || this.isStopped) return;
+    if (this.periodicVaultRescan) {
+      this.logInfo("Periodic vault rescan: already running, skipping tick", {
+        elapsedMs: Date.now() - this.periodicVaultRescan.startedAt,
+      });
+      return;
+    }
+
+    const startedAt = Date.now();
+    const watchdogMs = this.config.vaultRescanWatchdogMs;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    let timedOut = false;
+    const promise = this.runPeriodicVaultRescan(startedAt).finally(() => {
+      if (watchdog) clearTimeout(watchdog);
+      if (this.periodicVaultRescan?.promise === promise) {
+        this.periodicVaultRescan = null;
+      }
+      if (!timedOut) {
+        this.logInfo("Periodic vault rescan: finished", { elapsedMs: Date.now() - startedAt });
+      }
+    });
+
+    this.periodicVaultRescan = { startedAt, promise, label: "Periodic vault rescan" };
+
+    if (Number.isFinite(watchdogMs) && watchdogMs > 0) {
+      watchdog = setTimeout(() => {
+        if (this.isStopped) return;
+        timedOut = true;
+        const elapsedMs = Date.now() - startedAt;
+        const error = new Error(`Periodic vault rescan exceeded watchdog timeout (${watchdogMs}ms)`);
+        this.logError("Periodic vault rescan watchdog fired", { elapsedMs, watchdogMs });
+        this.onFatalError?.(error, { label: "Periodic vault rescan", elapsedMs, watchdogMs });
+      }, watchdogMs);
+    }
+
+    await promise;
+  }
+
+  private async runPeriodicVaultRescan(startedAt = Date.now()) {
     if (!this.isActive) return;
     this.logInfo("Periodic vault rescan: tick");
     if (this.localSyncConfig.syncDeletes) {
       await this.auditSnapshotsForOfflineDeletes("Periodic vault rescan");
     }
     await this.scanVaultForUnsyncedFiles("Periodic vault rescan");
+    this.logDebug("Periodic vault rescan: complete", { elapsedMs: Date.now() - startedAt });
   }
 
   private async runPeriodicSettingsRescan() {
@@ -3162,6 +3215,8 @@ export class YjsEvoluHistoryEngine {
     if (this.isStopped) return;
     if (!this.localSyncConfig.syncDeletes) return;
 
+    const startedAt = Date.now();
+    this.logInfo(`${label}: offline delete audit begin`);
     try {
       const q = this.evolu.createQuery((db) =>
         db
@@ -3170,17 +3225,37 @@ export class YjsEvoluHistoryEngine {
           .where("isDeleted", "is", null),
       );
       const rows = await this.evolu.loadQuery(q);
-      if (rows.length === 0) return;
+      this.logInfo(`${label}: offline delete audit loaded snapshots`, {
+        snapshots: rows.length,
+        elapsedMs: Date.now() - startedAt,
+      });
+      if (rows.length === 0) {
+        this.logInfo(`${label}: offline delete audit done`, {
+          snapshots: 0,
+          offlineDeletes: 0,
+          elapsedMs: Date.now() - startedAt,
+        });
+        return;
+      }
 
+      const listedFiles = await this.vault.listFiles();
       const vaultPaths = new Set(
-        (await this.vault.listFiles())
+        listedFiles
           .filter((f) => isTrackedVaultFile(f, this.localSyncConfig))
           .map((f) => f.path),
       );
+      this.logInfo(`${label}: offline delete audit loaded vault paths`, {
+        adapterFiles: listedFiles.length,
+        trackedFiles: vaultPaths.size,
+        elapsedMs: Date.now() - startedAt,
+      });
 
       let audited = 0;
+      let inspected = 0;
+      let lastProgressAt = startedAt;
       for (const row of rows) {
         if (this.isStopped) return;
+        inspected++;
         const path = row.path;
         if (!path) continue;
         // Skip already-tombstoned snapshots.
@@ -3204,11 +3279,28 @@ export class YjsEvoluHistoryEngine {
           originDeviceId: this.deviceId,
         });
         audited++;
+
+        const now = Date.now();
+        if (
+          this.config.vaultScanInfoProgressEveryMs > 0 &&
+          now - lastProgressAt >= this.config.vaultScanInfoProgressEveryMs
+        ) {
+          lastProgressAt = now;
+          this.logInfo(`${label}: offline delete audit progress`, {
+            inspected,
+            snapshots: rows.length,
+            offlineDeletes: audited,
+            elapsedMs: now - startedAt,
+          });
+        }
       }
 
-      if (audited > 0) {
-        this.logInfo(`${label}: offline delete audit done`, { offlineDeletes: audited });
-      }
+      this.logInfo(`${label}: offline delete audit done`, {
+        inspected,
+        snapshots: rows.length,
+        offlineDeletes: audited,
+        elapsedMs: Date.now() - startedAt,
+      });
     } catch (e) {
       this.logError(`${label}: auditSnapshotsForOfflineDeletes failed`, e);
     }

@@ -179,6 +179,11 @@ files, settings sync has its own rescan interval. Enabling settings sync from
 the plugin UI sets settings rescan to 30 seconds when it was disabled; vault
 content rescan remains separate.
 
+The standalone daemon also has a periodic vault rescan watchdog. When
+`LOCALSYNC_PERIODIC_RESCAN_SECONDS` is enabled, a rescan that runs longer than
+`LOCALSYNC_PERIODIC_RESCAN_WATCHDOG_SECONDS` (default `900`) logs a fatal engine
+error and exits non-zero so Kubernetes or another supervisor can restart it.
+
 The Obsidian plugin has no vault-content exclude presets by default. Obsidian's
 adapter does not expose normal dotfile internals such as `.git`, and `.obsidian`
 settings are handled by the dedicated settings-sync policy. The standalone

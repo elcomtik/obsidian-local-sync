@@ -49,6 +49,7 @@ deployment that must join an existing sync owner.
 | `LOCALSYNC_STARTUP_SCAN` | `true` | Scan vault on startup. |
 | `LOCALSYNC_SYNC_DELETES` | `true` | Propagate local deletes and run startup offline-delete audit. |
 | `LOCALSYNC_PERIODIC_RESCAN_SECONDS` | `0` | Periodically rescan tracked vault files. Set to `0` to disable. |
+| `LOCALSYNC_PERIODIC_RESCAN_WATCHDOG_SECONDS` | `900` | Exit non-zero if one periodic vault rescan exceeds this duration. Set to `0` to disable. |
 | `LOCALSYNC_SETTINGS_RESCAN_SECONDS` | `0` | Periodically rescan `.obsidian` settings files. Set to `0` to disable. |
 | `LOCALSYNC_USE_POLLING` | `false` | Force chokidar polling. Useful on some network/PVC mounts. |
 | `LOCALSYNC_POLL_INTERVAL_MS` | `1000` | Chokidar polling interval when polling is enabled. |
@@ -59,6 +60,12 @@ snapshots are checked for offline drift, files with no local snapshot are
 deferred until the incoming inbox is quiet, and offline-delete auditing runs when
 `LOCALSYNC_SYNC_DELETES=true`. This is useful for vaults that may be changed by
 tools outside the file watcher.
+
+When periodic rescans are enabled, `LOCALSYNC_PERIODIC_RESCAN_WATCHDOG_SECONDS`
+protects daemon deployments from silent stalls in the rescan path. If a single
+periodic vault rescan exceeds the watchdog duration, the daemon logs a fatal
+engine error and exits with status `1` so Kubernetes or another supervisor can
+restart it.
 
 `LOCALSYNC_SETTINGS_RESCAN_SECONDS` is separate because `.obsidian` settings are
 not part of the normal vault-file watch/listing model. Use it when settings

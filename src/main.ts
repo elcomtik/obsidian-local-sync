@@ -20,6 +20,7 @@ import {
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
   DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS,
   DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS,
+  DEFAULT_VAULT_RESCAN_WATCHDOG_MS,
   DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS,
   YjsEvoluHistoryEngine,
   type ApplyJournalStore,
@@ -150,6 +151,7 @@ function toEngineConfig(s: PluginSettings): EngineConfig {
     vaultScanDebugProgressEveryFiles: s.vaultScanDebugProgressEveryFiles,
     vaultScanDebugProgressEveryMs: s.vaultScanDebugProgressEveryMs,
     vaultScanInfoProgressEveryMs: s.vaultScanInfoProgressEveryMs,
+    vaultRescanWatchdogMs: DEFAULT_VAULT_RESCAN_WATCHDOG_MS,
   };
 }
 

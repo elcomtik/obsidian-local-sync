@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.4 — 2026-09-16
+
+### Changed
+
+- Added info-level breadcrumbs around periodic vault offline-delete audits so
+  stuck rescans show whether they froze loading snapshots, listing vault paths,
+  or iterating snapshot rows.
+- Added a daemon watchdog for periodic vault rescans. When enabled rescans hang
+  past `LOCALSYNC_PERIODIC_RESCAN_WATCHDOG_SECONDS`, the daemon exits non-zero
+  so Kubernetes can restart it.
+
 ## 0.8.3 — 2026-07-15
 
 ### Changed
