@@ -848,12 +848,13 @@ export class YjsEvoluHistoryEngine {
   }
 
   /**
-   * Reconciles one vault file during startup without treating it as a fresh
+   * Reconciles one vault file during a scan without treating it as a fresh
    * modify event.
    *
    * **Existing snapshot:** load the Yjs doc and compare its text with vault
    * content. If vault content drifted while the engine was stopped, the diff is
    * applied inside {@link getOrLoadFileState} and flushed normally.
+   * Cached documents are reconciled against their last observed vault text.
    *
    * **No snapshot:** defer seeding until after a quiet inbox cycle so
    * existing remote state has a chance to arrive first.
@@ -861,6 +862,20 @@ export class YjsEvoluHistoryEngine {
   async reconcileVaultFile(path: string, label = "Startup scan"): Promise<ReconcileResult> {
     if (this.isStopped) return "skipped";
     if (!isTrackedVaultPath(path, this.localSyncConfig)) return "skipped";
+
+    const existing = this.states.get(path);
+    if (existing) {
+      const vaultText = await this.vault.readText(path);
+      if (vaultText === null) return "skipped";
+      if (vaultText === existing.lastVaultText) return "unchanged";
+
+      this.logInfo(`${label}: cached vault file drifted, applying catch-up diff`, { path });
+      this.fileMaterializationBlockedSignatures.delete(path);
+      existing.ignoreNextVaultModify = false;
+      this.touch(path, existing);
+      await this.applyVaultTextChange(path, existing, vaultText);
+      return "loaded";
+    }
 
     const snapshot = await this.loadLocalSnapshotRecord(path);
     if (snapshot === null) {
@@ -1224,33 +1239,10 @@ export class YjsEvoluHistoryEngine {
 
       if (st.ignoreNextVaultModify) {
         st.ignoreNextVaultModify = false;
-        st.lastVaultText = newVaultText;
-        return;
+        if (newVaultText === st.lastVaultText) return;
       }
 
-      let patchResults: boolean[] = [];
-      st.doc.transact(() => {
-        patchResults = applyRebasedTextChangeToYText(st.text, st.lastVaultText, newVaultText).patchResults;
-      });
-
-      if (patchResults.some((ok) => !ok)) {
-        this.logWarn("Vault file changed: local patch did not apply cleanly", {
-          path,
-          patchResults,
-        });
-      }
-
-      const mergedText = st.text.toString();
-      if (mergedText !== newVaultText) {
-        this.logInfo("Vault file changed: writing rebased content back to vault", {
-          path,
-          vaultLen: newVaultText.length,
-          mergedLen: mergedText.length,
-        });
-        st.ignoreNextVaultModify = true;
-        await this.vault.writeText(path, mergedText);
-      }
-      st.lastVaultText = mergedText;
+      await this.applyVaultTextChange(path, st, newVaultText);
       if (!hadSnapshot && newVaultText.length === 0 && st.pendingUpdates.length === 0) {
         this.logInfo("Vault file changed: advertising empty new file", { path });
         await this.retransmitCurrentState(path);
@@ -1259,6 +1251,29 @@ export class YjsEvoluHistoryEngine {
     } catch (e) {
       this.logError("onVaultFileChanged failed", { path, error: e });
     }
+  }
+
+  private async applyVaultTextChange(path: string, st: FileState, newVaultText: string) {
+    let patchResults: boolean[] = [];
+    st.doc.transact(() => {
+      patchResults = applyRebasedTextChangeToYText(st.text, st.lastVaultText, newVaultText).patchResults;
+    });
+
+    if (patchResults.some((ok) => !ok)) {
+      this.logWarn("Vault file changed: local patch did not apply cleanly", { path, patchResults });
+    }
+
+    const mergedText = st.text.toString();
+    if (mergedText !== newVaultText) {
+      this.logInfo("Vault file changed: writing rebased content back to vault", {
+        path,
+        vaultLen: newVaultText.length,
+        mergedLen: mergedText.length,
+      });
+      st.ignoreNextVaultModify = true;
+      await this.vault.writeText(path, mergedText);
+    }
+    st.lastVaultText = mergedText;
   }
 
   // ---------- inbox subscriptions and quiet timer ----------

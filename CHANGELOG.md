@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.5 — 2026-10-14
+
+### Fixed
+
+- Periodic and manual vault scans now reconcile external edits into cached
+  Yjs documents, so missed watcher events no longer require a restart to sync.
+- Watcher echo suppression now checks the observed file content before
+  skipping an event, preserving real edits after a missed remote-write echo.
+
 ## 0.8.4 — 2026-09-16
 
 ### Changed
