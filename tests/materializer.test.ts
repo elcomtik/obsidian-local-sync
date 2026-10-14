@@ -821,6 +821,93 @@ test("saved file snapshots include the materialized content hash", async () => {
   assert.equal((savedRow?.contentHash as string).length, 16);
 });
 
+for (const scenario of [
+  { name: "external edit", base: "before", remote: "before", vault: "after", merged: "after" },
+  { name: "emptied file", base: "before", remote: "before", vault: "", merged: "" },
+  {
+    name: "concurrent remote edit",
+    base: "Title\nBody\n",
+    remote: "Remote title\nBody\n",
+    vault: "Title\nEdited body\n",
+    merged: "Remote title\nEdited body\n",
+  },
+]) {
+  test(`periodic rescan reconciles cached document after ${scenario.name}`, async () => {
+    const path = "notes/networking.md";
+    const files = new Map([[path, scenario.vault]]);
+    const calls = { writes: [] as string[], deletes: [] as string[] };
+    const engine = makeEngine(makeVault(files, calls));
+    const outgoing: Record<string, unknown>[] = [];
+    const openDoc = makeYjsTextDoc(scenario.remote);
+    const privateEngine = engine as unknown as {
+      states: Map<string, { text: Y.Text; lastVaultText: string; pendingUpdates: Uint8Array[] }>;
+      createFileStateFromDoc(path: string, doc: Y.Doc, text: Y.Text, lastVaultText: string, ignore: boolean): {
+        text: Y.Text;
+        lastVaultText: string;
+        pendingUpdates: Uint8Array[];
+      };
+      loadLocalSnapshotRecord(path: string): Promise<{ snapshotBase64: string; contentHash: string }>;
+      evolu: { upsert(table: string, row: Record<string, unknown>): void };
+      closeDoc(path: string): Promise<boolean>;
+    };
+    privateEngine.loadLocalSnapshotRecord = async () => ({
+      snapshotBase64: Buffer.from(Y.encodeStateAsUpdate(openDoc.doc)).toString("base64"),
+      contentHash: "stale-snapshot-hash",
+    });
+    privateEngine.evolu.upsert = (table, row) => {
+      if (table === "fileUpdate") outgoing.push(row);
+    };
+    // A missed remote-write watcher event must not suppress the external edit.
+    const state = privateEngine.createFileStateFromDoc(path, openDoc.doc, openDoc.text, scenario.base, true);
+    privateEngine.states.set(path, state);
+    try {
+      assert.equal(await engine.reconcileVaultFile(path, "Periodic vault rescan"), "loaded");
+      assert.equal(state.text.toString(), scenario.merged);
+      assert.equal(files.get(path), scenario.merged);
+      assert.equal(state.lastVaultText, scenario.merged);
+      assert.equal(state.pendingUpdates.length, 1);
+
+      assert.equal(await engine.reconcileVaultFile(path, "Periodic vault rescan"), "unchanged");
+      await engine.onVaultFileChanged(path);
+      assert.equal(state.pendingUpdates.length, 1, "rescan and watcher must not duplicate the edit");
+      await privateEngine.closeDoc(path);
+      assert.equal(outgoing.length, 1);
+      assert.equal(outgoing[0].path, path);
+      assert.equal(outgoing[0].originDeviceId, "test-device");
+    } finally {
+      await privateEngine.closeDoc(path);
+    }
+  });
+}
+
+test("watcher preserves a real edit after a missed remote-write echo", async () => {
+  const path = "notes/networking.md";
+  const files = new Map([[path, "remote content plus local edit"]]);
+  const engine = makeEngine(makeVault(files, { writes: [], deletes: [] }));
+  const openDoc = makeYjsTextDoc("remote content");
+  const privateEngine = engine as unknown as {
+    states: Map<string, { text: Y.Text; pendingUpdates: Uint8Array[] }>;
+    createFileStateFromDoc(path: string, doc: Y.Doc, text: Y.Text, lastVaultText: string, ignore: boolean): {
+      text: Y.Text;
+      pendingUpdates: Uint8Array[];
+    };
+    loadLocalSnapshot(path: string): Promise<string | null>;
+    closeDoc(path: string): Promise<boolean>;
+  };
+  privateEngine.loadLocalSnapshot = async () => "existing-snapshot";
+  const state = privateEngine.createFileStateFromDoc(path, openDoc.doc, openDoc.text, "remote content", true);
+  privateEngine.states.set(path, state);
+  try {
+    await engine.onVaultFileChanged(path);
+    assert.equal(state.text.toString(), files.get(path));
+    assert.equal(state.pendingUpdates.length, 1);
+    await engine.onVaultFileChanged(path);
+    assert.equal(state.pendingUpdates.length, 1);
+  } finally {
+    await privateEngine.closeDoc(path);
+  }
+});
+
 test("startup catch-up emits deterministic updates for repeated same drift", async () => {
   const path = "addressbook/Andrej Slebodnik.md";
   const snapshotDoc = makeYjsTextDoc("old");
