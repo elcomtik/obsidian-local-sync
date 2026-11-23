@@ -272,6 +272,8 @@ When over limit:
 
 ## 📊 PRD
 
+Migration planning: [Evolu 8 plugin and daemon PRD](../docs/prd/obsidian-local-sync-evolu-8-migration.md) and [shared rollout](../docs/prd/evolu-8-migration-program.md).
+
 ### Goal
 Single-user multi-device sync for large Obsidian vaults using CRDT incremental updates.
 
