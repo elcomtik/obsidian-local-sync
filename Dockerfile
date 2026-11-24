@@ -15,6 +15,9 @@ RUN npm prune --omit=dev
 
 FROM node:24-alpine
 
+# Only the builder needs npm; remove its unused runtime dependency tree.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
 WORKDIR /app
 ENV NODE_ENV=production
 

@@ -302,3 +302,17 @@ database is persisted, and shuts the process down cleanly.
 
 The daemon uses the same path policy model as the plugin. One daemon process is
 intended to manage one vault.
+
+## Runtime image security
+
+The runtime starts Node directly. npm remains available in the builder for
+installation/build/prune and is removed, with npm/npx links, from the final
+daemon image. This removes six HIGH findings in bundled brace-expansion and
+undici copies. Application dependencies and Android/plugin behavior are
+unchanged; this is separate from the deferred Android ADB investigation.
+
+Validation: the cleaned image builds, has no HIGH/CRITICAL Trivy findings, and
+passes the existing daemon smoke test inside the final image with networking
+disabled and disposable test files. After merge, release the app, publish the
+updated basic-memory-stack chart and prepare its Ansible pin MR. Production
+deployment remains a manual action.
