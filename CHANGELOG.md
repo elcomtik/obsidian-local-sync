@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.6 — 2026-11-24
+
+### Security
+
+- Remove unused npm/npx and their bundled dependencies from the final daemon
+  image, clearing six HIGH findings. Builders retain npm.
+- The final image scan has zero HIGH/CRITICAL findings; the offline daemon
+  smoke test passes. Plugin/Android code and sync protocol are unchanged.
+
 ## 0.8.5 — 2026-10-14
 
 ### Fixed
