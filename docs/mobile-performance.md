@@ -161,7 +161,7 @@ short/duplicate appends, delayed acknowledgement, journal interruption/replay,
 setting failures, deletes, source-version changes, snapshot acknowledgement,
 100-path batches, defaults migration, progress rendering and ETA lifecycle.
 
-Final local validation: **112 tests passed**, TypeScript checking passed, plugin
+Final local validation: **115 tests passed**, TypeScript checking passed, plugin
 build passed, and daemon build/offline smoke passed. Code, tests, stylesheet and
 documentation diffs were reviewed together before committing. The phone still
 runs the earlier local performance/ETA build; the final lifecycle and defaults
@@ -187,11 +187,51 @@ both plugin IO and the driver. This is a separate unresolved recovery concern,
 not a proven explanation for the original phone owner mismatch. Investigate it
 explicitly rather than claiming the performance changes fix that incident.
 
+## 200-path cap follow-up
+
+A live configuration-only trial raised the cap to 200, holding LRU 50, inbox page
+500 and the installed build fixed. The app remained visible. The cap is already
+queue-adaptive in a simple sense: it takes up to the available eligible paths
+immediately, without waiting for a batch to fill. Update rows and distinct paths
+must not be conflated.
+
+| Actual paths / rows | Incoming save | Apply | Final save | Total |
+| --- | --- | --- | --- | --- |
+| 107 / 500 | 1 ms | 77.394 s | 27.117 s | 104.732 s |
+| 178 / 500 | 2 ms | 144.878 s | 31.844 s | 176.883 s |
+
+Combined throughput was about 60.7 paths/minute. Two neighboring 100-path batches
+(95.089 and 102.041 seconds) combined to about 60.9 paths/minute. Inputs differ,
+so this is not a controlled equivalence test; it establishes no additional speed
+benefit. Neither journal filled the 200 cap. The 500-row inbox pages and repeated
+updates for the same notes limited the distinct-path batches. The live cap was
+restored to 100; the release default remains 100.
+
+Tests now explicitly cover both 100- and 200-path success, failure on the last
+path and replay without outgoing echoes. A separate seven-path test verifies
+that the 200 cap never waits for more work. Larger remote checkpoints preserve
+the incoming-save/journal/final-save ordering; their main recovery tradeoff is
+more replay work, not a longer autosave interval for local edits. Actual device
+process-kill recovery on the final candidate is still an acceptance-test gap.
+
+A bounded 200 ms event-loop heartbeat during the trial ran for 180.447 seconds:
+570 ticks, p95 excess delay 499.6 ms, maximum 1,858.8 ms, and 29 excess delays
+over 500 ms. These measure scheduling stalls, not input-to-paint latency, and
+there is no matching 100-path heartbeat baseline. They do show that improved
+throughput has not removed noticeable UI stalls. The sampler stopped itself and
+its temporary state was removed. Final counters retained the expected owner,
+no Evolu error and zero current-phone-origin updates; restore was still ongoing.
+
+A full 12,000-update / 2,500-note fresh restore is provisionally budgeted at
+**30–60 minutes**, extrapolated from varying observed path/message rates. It is
+not a measured start-to-finish result for the final build. Revisited paths and
+changing work mix matter. Keeping the app open should allow browsing restored
+notes; reducing main-thread stalls is a separate acceptance goal from total time.
+
 ## Untried options
 
 | Option | Expected benefit / reason to defer |
 | --- | --- |
-| 200-path checkpoints | Amortize saves further; larger replay/memory scope. Compare on identical inputs. |
 | 512 KiB vs 256 KiB chunks | Fewer bridge calls vs more encoder allocation; no controlled sweep yet. |
 | LRU 100/200 vs 50 | May help revisits; mostly postpones eviction during sequential restore. No device trial. |
 | Inbox page 1,000 vs 500 | More path coalescing vs larger query payloads/stalls; not yet measured. |
@@ -209,7 +249,8 @@ Its largest allocations were canonical Evolu history and file-update payloads;
 removing them is not a safe cache-cleaning optimization. Raising LRU limits alone
 also does not remove full-image persistence.
 
-For the next performance experiment, prefer a controlled **100 vs 200 paths**
-comparison using the same synthetic input snapshot, fixed 256 KiB chunks and LRU
-50. First close the compatibility/recovery gaps above; there is no need to delay
-this release for every remaining optimization.
+The LRU trial remains queued. A repeat 100-vs-200 experiment would need identical
+input snapshots and a page containing enough distinct paths to exercise the cap.
+Prioritize attribution of the observed main-thread stalls and the outstanding
+compatibility/recovery checks; there is no need to delay this release for every
+remaining optimization.

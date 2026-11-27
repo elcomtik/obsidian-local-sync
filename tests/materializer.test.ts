@@ -1005,29 +1005,43 @@ test("large journal marker groups remain bounded to 250 upserts per mutation chu
   } finally { h.destroy(); }
 });
 
-test("100-path checkpoint keeps the same two durability barriers and one journal", async () => {
-  const h = makeJournalBatchFixture(100);
-  h.e.config.inboxCheckpointBatchPaths = 100;
+for (const paths of [100, 200]) {
+  test(`${paths}-path checkpoint keeps the same two durability barriers and one journal`, async () => {
+    const h = makeJournalBatchFixture(paths);
+    h.e.config.inboxCheckpointBatchPaths = paths;
+    try {
+      await h.e.runIncrementalInbox();
+      assert.equal(h.files.size, paths); assert.equal(h.markers.size, paths);
+      assert.equal(h.persists, 2); assert.equal(h.clears, 1);
+      const snapshotWrites = h.mutationBatches.flat().filter((table) => table === "_fileSnapshot").length;
+      assert.equal(snapshotWrites, paths, "eviction must not resave acknowledged unchanged snapshots");
+      assert.deepEqual(h.outgoing, []);
+    } finally { h.destroy(); }
+  });
+
+  test(`${paths}-path interrupted checkpoint retries with no skipped rows or outgoing echoes`, async () => {
+    const h = makeJournalBatchFixture(paths);
+    h.e.config.inboxCheckpointBatchPaths = paths;
+    try {
+      h.failWrite(`batch/${paths - 1}.md`); await h.e.runIncrementalInbox();
+      assert.equal(h.files.size, paths - 1); assert.equal(h.markers.size, 0);
+      assert.equal(h.journal.entries.length, paths); assert.equal(h.clears, 0);
+      h.failWrite(""); await h.e.runIncrementalInbox();
+      assert.equal(h.files.size, paths); assert.equal(h.markers.size, paths);
+      assert.equal(h.clears, 1); assert.deepEqual(h.outgoing, []);
+    } finally { h.destroy(); }
+  });
+}
+
+test("200-path cap applies a small queue immediately without waiting to fill the batch", async () => {
+  const h = makeJournalBatchFixture(7);
+  h.e.config.inboxCheckpointBatchPaths = 200;
   try {
     await h.e.runIncrementalInbox();
-    assert.equal(h.files.size, 100); assert.equal(h.markers.size, 100);
+    assert.equal(h.files.size, 7); assert.equal(h.markers.size, 7);
     assert.equal(h.persists, 2); assert.equal(h.clears, 1);
-    const snapshotWrites = h.mutationBatches.flat().filter((table) => table === "_fileSnapshot").length;
-    assert.equal(snapshotWrites, 100, "eviction must not resave acknowledged unchanged snapshots");
+    assert.equal(h.e.pendingFileInbox.size, 0);
     assert.deepEqual(h.outgoing, []);
-  } finally { h.destroy(); }
-});
-
-test("100-path interrupted checkpoint retries with no skipped rows or outgoing echoes", async () => {
-  const h = makeJournalBatchFixture(100);
-  h.e.config.inboxCheckpointBatchPaths = 100;
-  try {
-    h.failWrite("batch/99.md"); await h.e.runIncrementalInbox();
-    assert.equal(h.files.size, 99); assert.equal(h.markers.size, 0);
-    assert.equal(h.journal.entries.length, 100); assert.equal(h.clears, 0);
-    h.failWrite(""); await h.e.runIncrementalInbox();
-    assert.equal(h.files.size, 100); assert.equal(h.markers.size, 100);
-    assert.equal(h.clears, 1); assert.deepEqual(h.outgoing, []);
   } finally { h.destroy(); }
 });
 
