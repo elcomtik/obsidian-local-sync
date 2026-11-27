@@ -1261,6 +1261,23 @@ test("failed full counts hide ETA and a later refresh can recover without changi
   } finally { h.destroy(); }
 });
 
+test("a retired pending-count result cannot overwrite the current generation's total", async () => {
+  const h = makeSubscribedJournalFixture(1);
+  let resolve!: (count: number) => void;
+  try {
+    h.e.fileInboxInitialized = h.e.settingInboxInitialized = true;
+    h.e.fileInboxPageSaturated = true;
+    h.e.loadPendingInboxCount = () => new Promise<number>((done) => { resolve = done; });
+    const retired = h.e.ensureInboxProgressTotal(true);
+    h.e.detachInboxSubscriptions();
+    resolve(999); await retired;
+    assert.equal(h.e.inboxProgressTotal, 1);
+    h.e.loadPendingInboxCount = async () => 10;
+    await h.e.ensureInboxProgressTotal(true);
+    assert.equal(h.e.inboxProgressTotal, 10);
+  } finally { h.destroy(); }
+});
+
 for (const paths of [100, 200]) {
   test(`${paths}-path checkpoint keeps the same two durability barriers and one journal`, async () => {
     const h = makeJournalBatchFixture(paths);

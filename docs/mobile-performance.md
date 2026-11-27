@@ -1,7 +1,7 @@
 # Mobile Catch-up Performance
 
 Status: unreleased Evolu 7 optimizations, measured on Android on 2026-11-27.
-Proposed release: 0.9.0. Actual desktop Obsidian acceptance testing remains open.
+Proposed release: 0.9.0. Desktop Obsidian 1.15.1 acceptance and real-owner restore checks passed.
 
 ## Where the time went
 
@@ -105,7 +105,8 @@ can change the estimate; it is not a completion guarantee.
 Focus loss and document visibility no longer pause a loaded engine. Sync continues
 while the host permits execution; visibility controls ETA sampling. Android/iOS can
 still suspend or terminate Obsidian. This is not a native background service.
-The lifecycle change is unit tested but has not yet been installed on the phone.
+The lifecycle change is installed and foreground tested on Android and desktop.
+OS suspension and forced termination remain separate recovery test cases.
 The approved compact stylesheet is now persisted on the phone as well as applied
 live; earlier live-only previews were lost when Obsidian restarted.
 
@@ -161,11 +162,10 @@ short/duplicate appends, delayed acknowledgement, journal interruption/replay,
 setting failures, deletes, source-version changes, snapshot acknowledgement,
 100-path batches, defaults migration, progress rendering and ETA lifecycle.
 
-Final local validation: **115 tests passed**, TypeScript checking passed, plugin
+Final local validation: **130 tests passed**, TypeScript checking passed, plugin
 build passed, and daemon build/offline smoke passed. Code, tests, stylesheet and
-documentation diffs were reviewed together before committing. The phone still
-runs the earlier local performance/ETA build; the final lifecycle and defaults
-migration changes are covered locally but await host acceptance testing.
+documentation diffs were reviewed together before committing. The final lifecycle/defaults/count-refresh candidate has been installed and tested
+on the phone and in actual desktop Obsidian; see the completed trials below.
 
 Privately copied committed phone images passed SQLite `integrity_check`, retained
 the restored owner and contained no updates authored by the current phone peer.
@@ -173,15 +173,13 @@ Those earlier checks did not prove complete vault convergence. The restore later
 finished; path and sampled-content checks are recorded below.
 No canonical history was deleted and no healthy workstation/archive DB was reset.
 
-Before release, run one focused acceptance round on the final candidate:
-
-- Real desktop Obsidian with isolated synthetic vaults/owner: restore, edit both
-  directions, delete, unfocus/refocus, reload and reopen. Shared unit tests and
-  daemon smoke tests do not substitute for the actual Electron host.
-- Android: install the final lifecycle/defaults build, verify persisted styling,
-  briefly switch apps, then interrupt/relaunch during a checkpoint and verify
-  recovery, owner identity and absence of outgoing echoes.
-- Check normal small-update latency after catch-up and preserve custom settings.
+Acceptance completed: Android fresh owner reset, real relay catch-up, graceful
+checkpoint/flush and restart during restore, preserved identity/progress, defaults
+migration, full path comparison and random content checks. Desktop acceptance used
+an isolated profile with synthetic updates/local edits/deletes and persistence
+across an app restart, followed by a fresh real-owner restore from the production
+relay. The healthy workstation vault was not modified. Hard process-kill recovery,
+iOS and native background execution were not exercised in this round.
 
 The existing read-error handling can treat a failed DB read as a missing DB in
 both plugin IO and the driver. This is a separate unresolved recovery concern,
@@ -279,7 +277,7 @@ exclude concurrent edits; none changed. No note contents were printed or saved
 in the report. This is strong sample evidence, not an exhaustive content audit.
 The private report retains the random seed, sampled paths and hashes.
 
-### Boundary reload candidate (installed, awaiting phone reset trial)
+### Boundary reload implementation
 
 The installed local test build detaches only the pending file/settings inbox subscriptions
 while applying a journal and performing its persistence barriers. Relay delivery,
@@ -312,10 +310,8 @@ queues and `caught-up` with no Evolu error. The defaults migration recorded its
 one-time marker and retained checkpoint 100, LRU 50 and inbox page 500. No reset
 was triggered during installation; package/manifest remain unreleased 0.8.6.
 
-The next phone restore should retain checkpoint cap 100, LRU 50 and inbox page
-500. Compare checkpoint phase times and event-loop stalls against the recorded
-baseline, then repeat path/content validation after catch-up. Publish no speedup
-claim until that trial completes.
+The completed timed restore retained checkpoint cap 100, LRU 50 and inbox page
+500. Its results and limits are recorded below.
 
 ## Untried options
 
@@ -339,9 +335,9 @@ removing them is not a safe cache-cleaning optimization. Raising LRU limits alon
 also does not remove full-image persistence.
 
 A repeat 100-vs-200 checkpoint experiment would need identical input snapshots
-and a page containing enough distinct paths to exercise the cap. Prioritize the
-redundant query-refresh candidate and outstanding compatibility/recovery checks;
-there is no need to delay this release for every remaining optimization.
+and a page containing enough distinct paths to exercise the cap. The redundant
+query-refresh change is now implemented and measured. Larger checkpoints on the
+optimized build and the chunk-size sweep remain follow-up experiments.
 
 ### Total-refresh correction during the timed reset
 
@@ -371,4 +367,89 @@ and verified private backup. Bundle SHA-256:
 The phone resumed with unchanged owner/peer and 1,721 Markdown notes. Its total
 correctly showed **7,687 remaining**, complementing **5,012 saved** before the
 restart (12,699 overall). Limits stayed 100/50/500; ETA samples restarted. Final
-wall time and content verification remain pending.
+wall time and content verification are recorded below.
+
+## Completed timed restore and release acceptance
+
+The Android run began at the user's reported **22:23 Europe/Bratislava** on
+2026-11-27. The exact caught-up callback was **23:10:15.594**, or **47 min 16 s**
+from that nominal start. The first replay checkpoint began at 22:26:24.518, so
+reset/deletion/initialization accounted for about 3 min 25 s. Replay wall time was
+43 min 51 s, including an approximately 1 min 14 s upgrade pause. Start time was
+reported to the minute; the extra second precision is not start-time certainty.
+
+This was a mixed-build run: the user authorized installing the count-refresh fix
+while retaining progress. It is a measured end-to-end duration, not a controlled
+before/after full-restore benchmark. No equivalent untouched old-build full run
+was timed. Extrapolating the original 273–438-second 50-path checkpoints over the
+observed 4,858 path applications gives roughly 7–12 hours, but inputs, batching,
+DB growth and UI conditions differ; that range is not a measured old duration.
+
+The run committed **49 checkpoints, 4,858 path applications and 12,705 updates**
+(file and settings updates). Six additional file updates arrived during catch-up.
+The private static-history grouping model predicted 49 checkpoints and 4,858 path
+applications; its older input lacked eight subsequently observed updates.
+Repeated visits explain why 2,357 final notes require more than 2,357 path writes.
+
+For 46 full 100-path checkpoints excluding the initial relay/startup batch,
+median elapsed time was **49.56 s**, range **32.88–83.66 s**. Earlier 100-path
+samples were roughly 74–110 s. Work mix differs, so this supports the observed
+improvement without a universal ratio claim. Across all checkpoints, application
+totalled 979 s, final database saves 1,505 s, and incoming saves 34 s. Most later
+incoming saves were clean/no-op; new arrivals legitimately required another save.
+
+### Responsiveness and CPU evidence
+
+| Same 200 ms heartbeat, three-minute windows | Earlier build | Boundary reload + corrected total |
+| --- | ---: | ---: |
+| p95 excess scheduling delay | 499.6 ms | 27.8 ms |
+| Maximum excess delay | 1,858.8 ms | 970.6 ms |
+| Delays over 500 ms | 29 | 3 |
+
+These are scheduling delays, not touch-to-paint latency, and the windows process
+different notes. They support markedly better usual responsiveness while retaining
+occasional near-one-second stalls. A CPU-profiled window had a 2.26-second maximum;
+the separate no-profiler result above avoids attributing that entirely to sync.
+
+The corrected-build 57.4-second CPU sample was 54.1% idle/waiting, 19.8% binary
+bridge, 8.4% explicit query execution, 3.0% GC and 0.3% Yjs. No mutation-driven
+inbox-refresh hotspot appeared, versus approximately 52–61% in earlier profiles.
+The paired 60-second phase sample spent 47 seconds saving and 13 applying.
+These are sampled windows, not a complete CPU budget for the 47-minute restore.
+
+### ETA accuracy
+
+The early broken-total estimate said about 17 minutes at 22:30:31, when almost
+40 minutes actually remained. After the fix, the first estimate said about
+18 minutes at 22:53:53; actual remaining time was 16 min 23 s. For the first
+captured estimate after each of 19 subsequent saved checkpoints, median absolute
+finish-time error was 60 seconds; maximum was 4 min 14 s. Sampling was every
+20 seconds. At 23:09:18, the raw estimate was 58 seconds and actual remaining time
+was about 58 seconds. Work mix still changes the estimate; it is deliberately
+approximate and includes saving time.
+
+### Data and desktop verification
+
+Android finished with 2,357 Markdown notes, identical paths to the workstation,
+**118/118 randomly selected byte hashes matching**, a valid SQLite integrity
+check, unchanged owner/peer, no Evolu error and zero phone-origin file updates.
+The random seed and hashes are retained privately; no note contents were printed.
+
+Actual desktop Obsidian 1.15.1 was tested in a separate profile and vault. A
+120-note synthetic scenario verified remote application, an actual local vault
+edit, remote update/delete, durable persistence and app restart. A separate empty
+acceptance vault then restored the real owner through the configured relay, with
+settings sync disabled. Replay was observed from about 23:22:53 to 23:23:30
+(roughly 40 seconds; the user's exact button-click time was not captured). It
+finished with 2,357 Markdown notes, identical paths, **118/118 fresh random hashes
+matching**, no Evolu error and zero file updates authored by that desktop peer.
+The production workstation vault and its plugin were left untouched.
+
+The desktop/mobile gap is consistent with whole-image persistence through the
+mobile native bridge remaining the main bottleneck. This release improves the
+current adapter; it does not make storage incremental or guarantee background
+execution. Revisit 200-path checkpoints on this optimized build, then bounded
+chunk-size tuning. Evolu 8/incremental storage remain separate work.
+
+Release packaging now includes `styles.css` in GitLab and GitHub artifacts/ZIPs,
+with four-file installation instructions, so the approved notice layout ships.
