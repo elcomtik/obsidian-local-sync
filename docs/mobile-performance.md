@@ -169,7 +169,8 @@ migration changes are covered locally but await host acceptance testing.
 
 Privately copied committed phone images passed SQLite `integrity_check`, retained
 the restored owner and contained no updates authored by the current phone peer.
-Those checks do not prove complete vault convergence. The restore remains ongoing.
+Those earlier checks did not prove complete vault convergence. The restore later
+finished; path and sampled-content checks are recorded below.
 No canonical history was deleted and no healthy workstation/archive DB was reset.
 
 Before release, run one focused acceptance round on the final candidate:
@@ -228,12 +229,71 @@ not a measured start-to-finish result for the final build. Revisited paths and
 changing work mix matter. Keeping the app open should allow browsing restored
 notes; reducing main-thread stalls is a separate acceptance goal from total time.
 
+## Final catch-up, LRU trial and content verification
+
+Catch-up completed on 2026-11-27 at approximately 22:04 Europe/Bratislava. The
+engine subsequently reported `caught-up`, empty pending inboxes, no Evolu error,
+the expected owner and zero file updates authored by this phone's current peer.
+This restore changed builds/settings along the way; its overall wall time must
+not be presented as a fresh-restore benchmark of the final candidate.
+
+A bounded live trial raised only the document LRU from 50 to 100, keeping the
+checkpoint cap at 100 and inbox page at 500. It reached 100 retained documents.
+In the 29-second baseline window, 17 evictions took 30.1 ms inclusive, versus
+9.536 seconds in 34 snapshot-save calls (including deduplicated close calls).
+During the subsequent LRU-100 window, 30 close calls took 31.3 ms inclusive,
+while 110 snapshot-save calls took 46.160 seconds. Calls overlap/nest and work
+mix differs; these totals are not additive or a controlled throughput comparison.
+The final checkpoint also spans the setting change. No isolated throughput gain
+was established. Eviction is already cheap after unchanged-snapshot suppression,
+so a larger cache is not the strongest remaining lever. The timer restored the
+old limit, wrappers were removed and the retained cache was trimmed back to 50.
+
+CPU profiles mapped with the installed phone source map showed query-refresh
+stacks at 61.0% in a 26.2-second baseline window and 51.6% in a 25.3-second
+LRU-100 window. Yjs was 0.3%/0.2%, GC 1.0% in both, and binary bridging 4.8%
+in both. The different phases prevent interpreting those shares as a controlled
+LRU improvement. SQLite/query work remains the dominant sampled activity.
+
+Inspection of Evolu's mutation handler confirms that local snapshot mutations
+reload subscribed queries, including the pending inbox queries that do not read
+snapshots. A workstation benchmark on a private completed-DB copy used the same
+sql.js asm.js engine. The saved image passed `integrity_check = ok`.
+
+| Query scenario | Full inbox median | Metadata-only median |
+| --- | ---: | ---: |
+| Fully caught up, zero rows returned | 39.18 ms | 36.61 ms |
+| Last 500 updates made pending in the in-memory copy only | 83.84 ms | 79.96 ms |
+
+Each median uses ten measured runs after two warmups. The query plan uses the
+new ordered index and processed-row covering index. Removing payload columns
+alone provides little improvement in this late-history case: the anti-join still
+traverses processed history. These are workstation timings, not phone timings.
+The saved DB and the live phone were not modified by the benchmark.
+
+After the phone reported caught up, a read-only comparison against the workstation
+vault found **2,357 Markdown paths on each**, with no missing or extra paths.
+A fresh random sample of **118 notes (5.0%)** matched byte-for-byte using SHA-256.
+The workstation files were hashed before and after each comparison batch to
+exclude concurrent edits; none changed. No note contents were printed or saved
+in the report. This is strong sample evidence, not an exhaustive content audit.
+The private report retains the random seed, sampled paths and hashes.
+
+Recommended next candidate: reduce redundant inbox-query reloads during a journal
+application, then reload at the checkpoint boundary. Relay delivery and canonical
+persistence must remain active. If implemented by temporarily unsubscribing inbox
+queries, explicitly test new source versions/deletes arriving during the interval,
+late query responses, subscription restoration after every error path, startup
+journal replay and absence of skipped work/echoes. This is a proposal, not part of
+the current build. Complete those tests before using another real-vault restore
+to measure it; a reset is unnecessary merely to repeat the current diagnosis.
+
 ## Untried options
 
 | Option | Expected benefit / reason to defer |
 | --- | --- |
 | 512 KiB vs 256 KiB chunks | Fewer bridge calls vs more encoder allocation; no controlled sweep yet. |
-| LRU 100/200 vs 50 | May help revisits; mostly postpones eviction during sequential restore. No device trial. |
+| LRU 200 vs 50 | LRU 100 was tried without an isolated gain; eviction is already cheap. 200 remains untested. |
 | Inbox page 1,000 vs 500 | More path coalescing vs larger query payloads/stalls; not yet measured. |
 | Cross-page path coalescing | Fewer repeated writes to hot files; needs delete/version-boundary tests. |
 | Metadata-only inbox subscriptions | Avoid repeatedly loading large payloads; requires race-safe payload lookup. |
@@ -249,8 +309,7 @@ Its largest allocations were canonical Evolu history and file-update payloads;
 removing them is not a safe cache-cleaning optimization. Raising LRU limits alone
 also does not remove full-image persistence.
 
-The LRU trial remains queued. A repeat 100-vs-200 experiment would need identical
-input snapshots and a page containing enough distinct paths to exercise the cap.
-Prioritize attribution of the observed main-thread stalls and the outstanding
-compatibility/recovery checks; there is no need to delay this release for every
-remaining optimization.
+A repeat 100-vs-200 checkpoint experiment would need identical input snapshots
+and a page containing enough distinct paths to exercise the cap. Prioritize the
+redundant query-refresh candidate and outstanding compatibility/recovery checks;
+there is no need to delay this release for every remaining optimization.
