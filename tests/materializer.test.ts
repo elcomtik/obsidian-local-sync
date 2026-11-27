@@ -619,7 +619,8 @@ test("incremental inbox checkpoints 50 paths with two database persists", async 
   assert.ok(events.indexOf("persist") < events.indexOf("journal"));
   assert.ok(events.lastIndexOf("persist") < events.indexOf("clear"));
   assert.equal(privateEngine.pendingFileInbox.size, 0);
-  assert.deepEqual(progress.slice(0, 50), Array.from({ length: 50 }, (_, index) => index + 1));
+  assert.deepEqual([...new Set(progress)], Array.from({ length: 51 }, (_, index) => index));
+  assert.ok(progress.every((value, index) => index === 0 || value >= progress[index - 1]));
 });
 
 test("startup recovers a durable apply journal before clearing it", async () => {
@@ -761,6 +762,418 @@ test("processed markers use createdAt for inserts and updatedAt for later versio
 
   assert.equal(markerIds.length, 2);
   assert.notEqual(markerIds[0], markerIds[1]);
+});
+
+function makeJournalBatchFixture(count = 3) {
+  const files = new Map<string, string>();
+  const calls = { writes: [] as string[], deletes: [] as string[] };
+  const vault = makeVault(files, calls);
+  const snapshots = new Map<string, string>();
+  const markers = new Map<string, Record<string, unknown>>();
+  const outgoing: unknown[] = [];
+  const mutationBatches: string[][] = [];
+  let journal: any = null;
+  let persists = 0, clears = 0;
+  let failWrite = "", failMarker = false, failFinalPersist = false;
+  const originalWrite = vault.writeText;
+  vault.writeText = async (path, content) => {
+    if (path === failWrite) throw new Error("synthetic vault write failure");
+    await originalWrite(path, content);
+  };
+  const engine = makeEngine(vault, async () => {
+    persists++;
+    if (failFinalPersist && persists === 2) throw new Error("synthetic checkpoint failure");
+  }, undefined, {
+    async load() { return journal; },
+    async save(next) { journal = next; },
+    async clear() { clears++; journal = null; },
+  });
+  // This fixture exercises the real file/Yjs/journal paths, with a small
+  // microtask mutation queue matching the batching contract of Evolu 7.
+  const e = engine as any;
+  const pending: Array<{ table: string; row: any; options?: { onComplete?: () => void } }> = [];
+  e.evolu.upsert = (table: string, row: any, options?: { onComplete?: () => void }) => {
+    if (failMarker && table.startsWith("_processed")) return { ok: false, error: "synthetic marker failure" };
+    pending.push({ table, row, options });
+    if (pending.length === 1) queueMicrotask(() => {
+      const batch = pending.splice(0);
+      mutationBatches.push(batch.map((item) => item.table));
+      for (const item of batch) {
+        if (item.table === "_fileSnapshot") snapshots.set(item.row.path, item.row.snapshotBase64);
+        if (item.table.startsWith("_processed")) markers.set(item.row.id, item.row);
+        if (item.table === "fileUpdate") outgoing.push(item.row);
+      }
+      for (const item of batch) item.options?.onComplete?.();
+    });
+    return { ok: true };
+  };
+  e.loadLocalSnapshot = async (path: string) => {
+    const snapshot = snapshots.get(path);
+    return snapshot === "DELETED" ? null : snapshot ?? null;
+  };
+  e.loadLatestFileDelete = async () => null;
+  e.scanComplete = true;
+  e.fileInboxInitialized = e.settingInboxInitialized = true;
+  e.inboxProgressTotal = count;
+  for (let i = 0; i < count; i++) {
+    const state = makeYjsTextDoc(`remote ${i}`);
+    const row = {
+      id: `batch-${i}`, path: `batch/${i}.md`, type: null,
+      updateBase64: Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString("base64"),
+      createdAt: "2026-11-27T10:00:00.000Z", sourceVersion: "2026-11-27T10:00:00.000Z",
+    };
+    state.doc.destroy();
+    e.pendingFileInbox.set(`${row.id}:${row.sourceVersion}`, row);
+  }
+  return {
+    e, files, vault, snapshots, markers, outgoing, mutationBatches,
+    get journal() { return journal; }, get persists() { return persists; }, get clears() { return clears; },
+    failWrite(path: string) { failWrite = path; },
+    failMarker(value: boolean) { failMarker = value; },
+    failFinalPersist(value: boolean) { failFinalPersist = value; },
+    destroy() { for (const state of e.states.values()) state.doc.destroy(); },
+  };
+}
+
+test("journal batches markers after all files and snapshots, with one marker mutation group", async () => {
+  const h = makeJournalBatchFixture(50);
+  const upsert = h.e.evolu.upsert;
+  h.e.evolu.upsert = (table: string, row: any, options: any) => {
+    if (table === "_processedFileUpdate") {
+      assert.equal(h.files.size, 50);
+      assert.equal(h.snapshots.size, 50);
+    }
+    return upsert(table, row, options);
+  };
+  try {
+    await h.e.runIncrementalInbox();
+    const batches = h.mutationBatches.filter((batch) => batch.includes("_processedFileUpdate"));
+    assert.equal(batches.length, 1);
+    assert.equal(batches[0].filter((table) => table === "_processedFileUpdate").length, 50);
+    assert.equal(h.markers.size, 50);
+    assert.equal(h.persists, 2); assert.equal(h.clears, 1);
+    assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+test("mid-journal file failure leaves markers uncommitted and replay converges without echo", async () => {
+  const h = makeJournalBatchFixture();
+  try {
+    h.failWrite("batch/1.md");
+    await h.e.runIncrementalInbox();
+    assert.equal(h.files.get("batch/0.md"), "remote 0");
+    assert.equal(h.markers.size, 0);
+    assert.equal(h.clears, 0); assert.ok(h.journal);
+    assert.equal(h.e.pendingFileInbox.size, 3);
+    h.failWrite("");
+    await h.e.runIncrementalInbox();
+    assert.deepEqual([...h.files.values()], ["remote 0", "remote 1", "remote 2"]);
+    assert.equal(h.markers.size, 3); assert.equal(h.clears, 1);
+    assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+test("marker acknowledgements gate final persistence and journal retirement", async () => {
+  const h = makeJournalBatchFixture();
+  const upsert = h.e.evolu.upsert;
+  const acknowledgements: Array<() => void> = [];
+  h.e.evolu.upsert = (table: string, row: any, options: any) => upsert(table, row,
+    table.startsWith("_processed") ? { onComplete: () => acknowledgements.push(options.onComplete) } : options);
+  try {
+    const run = h.e.runIncrementalInbox();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(acknowledgements.length, 3);
+    assert.equal(h.persists, 1); assert.equal(h.clears, 0); assert.ok(h.journal);
+    for (const acknowledge of acknowledgements) acknowledge();
+    await run;
+    assert.equal(h.persists, 2); assert.equal(h.clears, 1);
+  } finally { h.destroy(); }
+});
+
+test("marker failure retains journal and a retry completes without outgoing changes", async () => {
+  const h = makeJournalBatchFixture();
+  try {
+    h.failMarker(true); await h.e.runIncrementalInbox();
+    assert.equal(h.persists, 1); assert.equal(h.clears, 0); assert.ok(h.journal);
+    h.failMarker(false); await h.e.runIncrementalInbox();
+    assert.equal(h.markers.size, 3); assert.equal(h.clears, 1);
+    assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+test("batched markers do not retire journal after a failed final save", async () => {
+  const h = makeJournalBatchFixture();
+  try {
+    h.failFinalPersist(true); await h.e.runIncrementalInbox();
+    assert.equal(h.markers.size, 3);
+    assert.equal(h.clears, 0); assert.ok(h.journal);
+    assert.equal(h.e.pendingFileInbox.size, 3);
+    h.failFinalPersist(false); await h.e.runIncrementalInbox();
+    assert.equal(h.markers.size, 3); assert.equal(h.clears, 1);
+    assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+test("failed remote setting application cannot publish batch markers", async () => {
+  const h = makeJournalBatchFixture(0);
+  h.e.localSyncConfig = { ...h.e.localSyncConfig, syncObsidianSettings: true };
+  h.e.loadSettingSnapshot = async () => null;
+  const row = {
+    id: "setting-failure", path: ".obsidian/app.json", type: null,
+    contentBase64: Buffer.from("{}").toString("base64"), contentHash: "synthetic",
+    encoding: "raw", createdAt: "2026-11-27T10:00:00.000Z", sourceVersion: "2026-11-27T10:00:00.000Z",
+  };
+  h.e.loadLatestSettingUpdateForPath = async () => row;
+  h.e.pendingSettingInbox.set(`${row.id}:${row.sourceVersion}`, row);
+  h.failWrite(row.path);
+  try {
+    await h.e.runIncrementalInbox();
+    assert.equal(h.markers.size, 0); assert.equal(h.clears, 0);
+    assert.ok(h.journal); assert.equal(h.e.pendingSettingInbox.size, 1);
+    h.failWrite(""); await h.e.runIncrementalInbox();
+    assert.equal(h.files.get(row.path), "{}");
+    assert.equal(h.markers.size, 1); assert.equal(h.clears, 1);
+  } finally { h.destroy(); }
+});
+
+test("a newer source version arriving during a journal remains pending for the next checkpoint", async () => {
+  const h = makeJournalBatchFixture(1);
+  const first = [...h.e.pendingFileInbox.values()][0] as any;
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, Buffer.from(first.updateBase64, "base64"));
+  const text = doc.getText("content");
+  text.delete(0, text.length); text.insert(0, "newer remote");
+  const newer = { ...first, sourceVersion: "2026-11-27T10:01:00.000Z", updateBase64: Buffer.from(Y.encodeStateAsUpdate(doc)).toString("base64") };
+  doc.destroy();
+  const write = h.vault.writeText;
+  let delivered = false;
+  h.vault.writeText = async (path, content) => {
+    await write(path, content);
+    if (!delivered) {
+      delivered = true;
+      h.e.pendingFileInbox.set(`${newer.id}:${newer.sourceVersion}`, newer);
+    }
+  };
+  try {
+    await h.e.runIncrementalInbox();
+    assert.equal(h.files.get(first.path), "newer remote");
+    assert.deepEqual([...h.markers.values()].map((row) => row.sourceVersion), [first.sourceVersion, newer.sourceVersion]);
+    assert.equal(h.e.pendingFileInbox.size, 0);
+    assert.equal(h.persists, 4); assert.equal(h.clears, 2);
+    assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+test("successful remote delete replays safely after a later path interrupts the journal", async () => {
+  const h = makeJournalBatchFixture(2);
+  const [first] = [...h.e.pendingFileInbox.values()] as any[];
+  first.type = "delete";
+  const old = makeYjsTextDoc("old content");
+  h.files.set(first.path, "old content");
+  h.snapshots.set(first.path, Buffer.from(Y.encodeStateAsUpdate(old.doc)).toString("base64"));
+  old.doc.destroy();
+  h.e.loadFileUpdateRowsForPath = async () => [first];
+  try {
+    h.failWrite("batch/1.md"); await h.e.runIncrementalInbox();
+    assert.equal(h.files.has(first.path), false);
+    assert.equal(h.snapshots.get(first.path), "DELETED");
+    assert.equal(h.markers.size, 0); assert.ok(h.journal);
+    h.failWrite(""); await h.e.runIncrementalInbox();
+    assert.equal(h.files.has(first.path), false);
+    assert.equal(h.files.get("batch/1.md"), "remote 1");
+    assert.equal(h.markers.size, 2); assert.equal(h.clears, 1);
+    assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+test("large journal marker groups remain bounded to 250 upserts per mutation chunk", async () => {
+  const h = makeJournalBatchFixture(0);
+  h.e.inboxProgressTotal = 501;
+  for (let i = 0; i < 501; i++) {
+    const row = {
+      id: `ignored-${i}`, path: "excluded.bin", updateBase64: "unused", type: null,
+      createdAt: "2026-11-27T10:00:00.000Z", sourceVersion: "2026-11-27T10:00:00.000Z",
+    };
+    h.e.pendingFileInbox.set(`${row.id}:${row.sourceVersion}`, row);
+  }
+  try {
+    await h.e.runIncrementalInbox();
+    const sizes = h.mutationBatches.filter((batch) => batch.includes("_processedFileUpdate")).map((batch) => batch.length);
+    assert.deepEqual(sizes, [250, 250, 1]);
+    assert.equal(h.markers.size, 501); assert.equal(h.persists, 2);
+    assert.equal(h.files.size, 0);
+  } finally { h.destroy(); }
+});
+
+test("100-path checkpoint keeps the same two durability barriers and one journal", async () => {
+  const h = makeJournalBatchFixture(100);
+  h.e.config.inboxCheckpointBatchPaths = 100;
+  try {
+    await h.e.runIncrementalInbox();
+    assert.equal(h.files.size, 100); assert.equal(h.markers.size, 100);
+    assert.equal(h.persists, 2); assert.equal(h.clears, 1);
+    const snapshotWrites = h.mutationBatches.flat().filter((table) => table === "_fileSnapshot").length;
+    assert.equal(snapshotWrites, 100, "eviction must not resave acknowledged unchanged snapshots");
+    assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+test("100-path interrupted checkpoint retries with no skipped rows or outgoing echoes", async () => {
+  const h = makeJournalBatchFixture(100);
+  h.e.config.inboxCheckpointBatchPaths = 100;
+  try {
+    h.failWrite("batch/99.md"); await h.e.runIncrementalInbox();
+    assert.equal(h.files.size, 99); assert.equal(h.markers.size, 0);
+    assert.equal(h.journal.entries.length, 100); assert.equal(h.clears, 0);
+    h.failWrite(""); await h.e.runIncrementalInbox();
+    assert.equal(h.files.size, 100); assert.equal(h.markers.size, 100);
+    assert.equal(h.clears, 1); assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+test("inbox display is monotonic and includes newly discovered backlog", () => {
+  const updates: Array<{ current?: number; total?: number }> = [];
+  const engine = makeEngine(makeVault(new Map(), { writes: [], deletes: [] }), undefined, (p) => {
+    if (p.status === "syncing") updates.push(p);
+  }) as any;
+  engine.inboxProgressDiscovered = 100; engine.inboxProgressTotal = 100;
+  engine.reportInboxProgress(10); engine.reportInboxProgress(0); engine.reportInboxProgress(9);
+  engine.inboxProgressDiscovered = 200; engine.reportInboxProgress(11);
+  assert.deepEqual(updates.map((p) => p.current), [10, 10, 10, 11]);
+  assert.equal(updates.at(-1)?.total, 200);
+});
+
+test("ETA only records a batch after its final save and journal retirement", async (t) => {
+  const h = makeJournalBatchFixture();
+  const recorded = t.mock.method(h.e.syncEta, "complete");
+  try {
+    h.failFinalPersist(true); await h.e.runIncrementalInbox();
+    assert.equal(recorded.mock.callCount(), 0);
+    h.failFinalPersist(false); await h.e.runIncrementalInbox();
+    assert.equal(recorded.mock.callCount(), 1); assert.equal(h.clears, 1);
+  } finally { h.destroy(); }
+});
+
+test("a loaded hidden app continues applying a recoverable journal without training ETA", async () => {
+  const h = makeJournalBatchFixture();
+  try {
+    h.e.setAppVisible(false);
+    assert.equal(h.e.isActive, true);
+    await h.e.runIncrementalInbox();
+    assert.equal(h.files.size, 3); assert.equal(h.markers.size, 3);
+    assert.equal(h.clears, 1); assert.equal(h.e.syncEta.estimateSeconds(1000), undefined);
+  } finally { h.destroy(); }
+});
+
+test("focus loss while still visible preserves sync and an existing ETA sample", (t) => {
+  const h = makeJournalBatchFixture(0);
+  try {
+    // Isolate focus handling from the independent caught-up transition, which
+    // correctly clears an old restore's ETA when there is no pending work.
+    t.mock.method(h.e, "handleHistoryQuietTick", async () => {});
+    h.e.syncEta.complete(h.e.syncEta.begin(0), 100, 60_000);
+    h.e.syncEta.complete(h.e.syncEta.begin(60_000), 100, 120_000);
+    h.e.setAppVisible(true); h.e.setAppVisible(true);
+    assert.equal(h.e.isActive, true);
+    assert.equal(h.e.syncEta.estimateSeconds(1000), 600);
+  } finally { h.destroy(); }
+});
+
+function makeSnapshotCacheFixture() {
+  const path = "cached.md";
+  const files = new Map([[path, "unchanged text"]]);
+  const engine = makeEngine(makeVault(files, { writes: [], deletes: [] })) as any;
+  const { doc, text } = makeYjsTextDoc("unchanged text");
+  const state = engine.createFileStateFromDoc(path, doc, text, text.toString(), false);
+  engine.states.set(path, state);
+  const snapshots: any[] = [], outgoing: any[] = [], acknowledgements: Array<() => void> = [];
+  let hold = false, fail = false;
+  engine.evolu.upsert = (table: string, row: any, options?: { onComplete?: () => void }) => {
+    if (table === "_fileSnapshot") {
+      if (fail) { fail = false; return { ok: false, error: "synthetic snapshot failure" }; }
+      snapshots.push(row);
+      if (hold && options?.onComplete) acknowledgements.push(options.onComplete);
+      else options?.onComplete?.();
+    } else {
+      if (table === "fileUpdate") outgoing.push(row);
+      options?.onComplete?.();
+    }
+    return { ok: true };
+  };
+  return {
+    engine, state, path, snapshots, outgoing, acknowledgements,
+    hold(value: boolean) { hold = value; }, failNext() { fail = true; },
+    destroy() { if (state.flushTimer) clearTimeout(state.flushTimer); doc.destroy(); },
+  };
+}
+
+test("closing an acknowledged unchanged document skips the redundant snapshot", async () => {
+  const h = makeSnapshotCacheFixture();
+  try {
+    await h.engine.saveLocalSnapshot(h.path, h.state);
+    assert.equal(await h.engine.closeDoc(h.path), true);
+    assert.equal(h.snapshots.length, 1);
+  } finally { h.destroy(); }
+});
+
+test("equal text with changed Yjs history still flushes local edits and saves a new snapshot", async () => {
+  const h = makeSnapshotCacheFixture();
+  try {
+    await h.engine.saveLocalSnapshot(h.path, h.state);
+    h.state.doc.transact(() => { h.state.text.insert(0, "x"); h.state.text.delete(0, 1); });
+    assert.equal(h.state.text.toString(), "unchanged text");
+    assert.equal(await h.engine.closeDoc(h.path), true);
+    assert.equal(h.snapshots.length, 2);
+    assert.notEqual(h.snapshots[0].snapshotBase64, h.snapshots[1].snapshotBase64);
+    assert.equal(h.outgoing.length, 1);
+  } finally { h.destroy(); }
+});
+
+test("only the latest acknowledged snapshot permits skipping, including out-of-order callbacks", async () => {
+  const h = makeSnapshotCacheFixture();
+  try {
+    h.hold(true);
+    await h.engine.saveLocalSnapshot(h.path, h.state);
+    await h.engine.saveLocalSnapshot(h.path, h.state, { skipIfUnchanged: true });
+    assert.equal(h.snapshots.length, 2);
+    h.acknowledgements[0]();
+    await h.engine.saveLocalSnapshot(h.path, h.state, { skipIfUnchanged: true });
+    assert.equal(h.snapshots.length, 3);
+    h.acknowledgements[2](); h.acknowledgements[1]();
+    await h.engine.saveLocalSnapshot(h.path, h.state, { skipIfUnchanged: true });
+    assert.equal(h.snapshots.length, 3);
+  } finally { h.destroy(); }
+});
+
+test("snapshot acknowledgement for an old path cannot suppress a renamed-path save", async () => {
+  const h = makeSnapshotCacheFixture();
+  try {
+    await h.engine.saveLocalSnapshot(h.path, h.state);
+    await h.engine.saveLocalSnapshot("renamed.md", h.state, { skipIfUnchanged: true });
+    assert.deepEqual(h.snapshots.map((row) => row.path), [h.path, "renamed.md"]);
+  } finally { h.destroy(); }
+});
+
+test("tombstone invalidates an old pending snapshot acknowledgement", async () => {
+  const h = makeSnapshotCacheFixture();
+  try {
+    h.hold(true); await h.engine.saveLocalSnapshot(h.path, h.state);
+    h.engine.tombstoneSnapshot(h.path); h.acknowledgements[0]();
+    h.hold(false); await h.engine.saveLocalSnapshot(h.path, h.state, { skipIfUnchanged: true });
+    assert.equal(h.snapshots.length, 3);
+    assert.equal(h.snapshots[1].snapshotBase64, "DELETED");
+    assert.notEqual(h.snapshots[2].snapshotBase64, "DELETED");
+  } finally { h.destroy(); }
+});
+
+test("failed snapshot cannot become an acknowledged unchanged state", async () => {
+  const h = makeSnapshotCacheFixture();
+  try {
+    h.failNext();
+    await assert.rejects(h.engine.saveLocalSnapshot(h.path, h.state), /Failed to save/);
+    await h.engine.saveLocalSnapshot(h.path, h.state, { skipIfUnchanged: true });
+    assert.equal(h.snapshots.length, 1);
+  } finally { h.destroy(); }
 });
 
 test("startup scan skips Yjs and snapshot writes when the vault hash matches", async () => {

@@ -35,8 +35,10 @@ export type SqlJsDriverOptions = {
  * file-based persistence via the platform-independent `io` abstraction.
  *
  * 1. On open: loads the existing DB file via `io.readFile()`, or starts fresh.
- * 2. After each mutation: arms a {@link SAVE_DEBOUNCE_MS}-ms debounce write.
- * 3. On `persist()`: immediately awaits a write without sealing the driver.
+ * 2. After each mutation: arms a {@link SAVE_DEBOUNCE_MS}-ms automatic write;
+ *    queued automatic requests coalesce before exporting the database.
+ * 3. On `persist()`: cancels redundant automatic work and awaits its own
+ *    captured snapshot's write without sealing the driver.
  * 4. On `flush()`: cancels the debounce and immediately awaits the write.
  *    Call this on plugin unload to guarantee the cursor and recent mutations
  *    are persisted before the process can be interrupted.
@@ -72,20 +74,51 @@ export function createPersistentSqlJsDriver(
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
     let writeChain: Promise<void> = Promise.resolve();
     let writeGeneration = 0;
+    let mutationRevision = 0;
+    let durableRevision = existingData?.byteLength && !options?.memory ? 0 : -1;
+    let pendingWrites = 0;
 
-    function persistToDisk(data: Uint8Array, force = false): Promise<void> {
+    function cancelScheduledSave(): void {
+      if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+      }
+    }
+
+    function persistToDisk(
+      data: Uint8Array | (() => Uint8Array),
+      force = false,
+      capturedRevision?: number,
+    ): Promise<void> {
       const generation = writeGeneration;
-      writeChain = writeChain.then(async () => {
+      pendingWrites++;
+      const write = writeChain.then(async () => {
         if (!force && (isDisposed || isFlushed || generation !== writeGeneration)) return;
-        await io.writeFile(data);
-      });
-      return writeChain;
+        const revision = capturedRevision ?? mutationRevision;
+        if (revision <= durableRevision) return;
+        try {
+          await io.writeFile(typeof data === "function" ? data() : data);
+          // Mutations arriving during IO remain dirty; only this image is saved.
+          durableRevision = revision;
+        } catch (error) {
+          // Be conservative even if an adapter failed after replacing the file.
+          durableRevision = -1;
+          throw error;
+        }
+      }).finally(() => { pendingWrites--; });
+      // Keep each caller's failure observable, but allow a later explicit
+      // checkpoint to retry after a failed automatic or checkpoint write.
+      writeChain = write.catch(() => {});
+      return write;
     }
 
     function saveToDisk(): void {
       if (isDisposed || isFlushed) return;
-      const data = db.export();
-      persistToDisk(data).catch((e) => {
+      // Supersede older automatic saves still waiting behind the active write.
+      // Export only when this request actually writes, avoiding queued full-DB
+      // buffers. An already-started write is never cancelled.
+      writeGeneration++;
+      persistToDisk(() => db.export()).catch((e) => {
         console.error(logFormatter("ERROR", "Failed to save database", e));
       });
     }
@@ -111,24 +144,30 @@ export function createPersistentSqlJsDriver(
      */
     async function flushToDisk(): Promise<void> {
       if (isDisposed) return;
-      if (saveTimer) {
-        clearTimeout(saveTimer);
-        saveTimer = null;
-      }
+      cancelScheduledSave();
       isFlushed = true; // Seal before IO — prevents new saves from arming.
+      if (mutationRevision === durableRevision && pendingWrites === 0) return;
+      const revision = mutationRevision;
       const data = db.export();
       try {
-        await persistToDisk(data, true);
+        await persistToDisk(data, true, revision);
       } catch (e) {
         console.error(logFormatter("ERROR", "Failed to save database", e));
+        throw e;
       }
     }
 
     async function persistCurrentState(): Promise<void> {
       if (isDisposed || isFlushed) return;
+      cancelScheduledSave();
+      // The explicit snapshot covers earlier pending automatic requests. Never
+      // supersede explicit snapshots: callers await their own durable barrier.
+      writeGeneration++;
+      if (mutationRevision === durableRevision && pendingWrites === 0) return;
+      const revision = mutationRevision;
       const data = db.export();
       try {
-        await persistToDisk(data, true);
+        await persistToDisk(data, true, revision);
       } catch (e) {
         console.error(logFormatter("ERROR", "Failed to save database", e));
         throw e;
@@ -137,10 +176,7 @@ export function createPersistentSqlJsDriver(
 
     function discardPendingWrites(): void {
       if (isDisposed) return;
-      if (saveTimer) {
-        clearTimeout(saveTimer);
-        saveTimer = null;
-      }
+      cancelScheduledSave();
       isFlushed = true;
       writeGeneration++;
     }
@@ -157,6 +193,10 @@ export function createPersistentSqlJsDriver(
         if (isDisposed) return { rows: [], changes: 0 };
 
         if (isMutation) {
+          // Count every attempted mutation, including DDL, transaction control
+          // and failures. False dirtiness costs a save; missed dirtiness could
+          // incorrectly acknowledge data that has never reached storage.
+          mutationRevision++;
           db.run(query.sql, query.parameters as any[]);
           const changes = db.getRowsModified();
           if (changes > 0) scheduleSave();
@@ -189,10 +229,10 @@ export function createPersistentSqlJsDriver(
           clearTimeout(saveTimer);
           saveTimer = null;
         }
-        if (!isFlushed) {
+        if (!isFlushed && !(mutationRevision === durableRevision && pendingWrites === 0)) {
           // Export before closing DB, then write asynchronously.
           const data = db.export();
-          persistToDisk(data).catch((e) => {
+          persistToDisk(data, true, mutationRevision).catch((e) => {
             console.error(logFormatter("ERROR", "Failed to save database", e));
           });
         }

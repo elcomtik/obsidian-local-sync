@@ -13,6 +13,7 @@ import {
 } from "./pathPolicy";
 import { formatLogLine, type LogFormatter } from "./logFormat";
 import type { VaultAdapter, VaultFile } from "./vaultAdapter";
+import { SyncEtaEstimator } from "./syncEta";
 
 /**
  * Logging levels (simple).
@@ -35,7 +36,7 @@ const levelRank: Record<LogLevel, number> = {
 export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES = 100;
 export const DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_MS = 10_000;
 export const DEFAULT_VAULT_SCAN_INFO_PROGRESS_EVERY_MS = 60_000;
-export const DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS = 50;
+export const DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS = 100;
 export const DEFAULT_VAULT_RESCAN_WATCHDOG_MS = 15 * 60_000;
 
 export type ApplyJournalStore = {
@@ -77,6 +78,8 @@ export type SyncProgress =
       message: string;
       current?: number;
       total?: number;
+      unit?: "changes";
+      etaSeconds?: number;
     }
   | {
       status: "caught-up";
@@ -474,6 +477,11 @@ export class YjsEvoluHistoryEngine {
   private inboxProgressKeys = new Set<string>();
   private inboxProgressDiscovered = 0;
   private inboxProgressApplied = 0;
+  private inboxProgressDisplayed = 0;
+  private inboxProgressPhase: "applying" | "saving" = "applying";
+  private readonly syncEta = new SyncEtaEstimator();
+  private readonly acknowledgedSnapshots = new WeakMap<Y.Doc, { path: string; snapshotBase64: string }>();
+  private readonly snapshotSaveTokens = new WeakMap<Y.Doc, object>();
   private inboxProgressTotal: number | null = null;
   private inboxProgressTotalPromise: Promise<void> | null = null;
   private inboxQuietTicks = 0;
@@ -1179,6 +1187,7 @@ export class YjsEvoluHistoryEngine {
   async setActive() {
     if (this.isStopped) return;
     this.isActive = true;
+    this.syncEta.setActive(true);
     this.logInfo("App active");
     this.kickIncrementalInboxes();
     void this.handleHistoryQuietTick();
@@ -1187,13 +1196,24 @@ export class YjsEvoluHistoryEngine {
   /**
    * Pauses remote-history polling.
    *
-   * Called when the Obsidian window loses focus (`window blur` or
-   * `visibilitychange` → hidden). The recurring timer keeps running but each
-   * tick is a no-op while `isActive` is false.
+   * Explicit pause for callers that need to stop remote application. Window
+   * focus and visibility events use setAppVisible instead.
    */
   setInactive() {
     this.isActive = false;
+    this.syncEta.setActive(false);
     this.logInfo("App inactive");
+  }
+
+  /**
+   * Visibility affects ETA sampling, not whether a loaded plugin may sync.
+   * Mobile hosts may suspend execution themselves; journal recovery handles
+   * interruption. Focus loss alone must not impose an additional sync pause.
+   */
+  setAppVisible(visible: boolean) {
+    if (this.isStopped) return;
+    this.syncEta.setActive(visible);
+    if (visible) void this.setActive();
   }
 
   // ---------- vault -> yjs ----------
@@ -1582,15 +1602,24 @@ export class YjsEvoluHistoryEngine {
 
   private reportInboxProgress(current = this.inboxProgressApplied) {
     if (this.inboxProgressDiscovered === 0) return;
+    this.inboxProgressDisplayed = Math.max(this.inboxProgressDisplayed, current);
+    const total = Math.max(this.inboxProgressTotal ?? 0, this.inboxProgressDiscovered, this.inboxProgressDisplayed);
     this.reportSyncProgress?.({
       status: "syncing",
-      message: "LocalSync is applying remote changes. Avoid editing synced notes until catch-up completes.",
-      current,
-      total: this.inboxProgressTotal ?? this.inboxProgressDiscovered,
+      message: this.inboxProgressPhase === "saving"
+        ? "Saving progress…"
+        : "Applying changes",
+      current: this.inboxProgressDisplayed,
+      total,
+      unit: "changes",
+      // Completed, saved batches include both IO barriers. Per-file progress
+      // must not imply a faster durable rate or an already-completed restore.
+      etaSeconds: this.syncEta.estimateSeconds(total - this.inboxProgressApplied),
     });
   }
 
   private reportInboxBlocked() {
+    this.syncEta.reset();
     this.reportSyncProgress?.({
       status: "blocked",
       message: "LocalSync paused: a remote update could not be applied. Check the console.",
@@ -1619,6 +1648,7 @@ export class YjsEvoluHistoryEngine {
         const journal = existingJournal ?? this.createNextApplyJournal();
         if (!journal) break;
         const checkpointStartedAt = Date.now();
+        const etaBatch = this.syncEta.begin();
         const rowCount = journal.entries.reduce((sum, entry) => sum + entry.rows.length, 0);
         let incomingPersistMs = 0;
 
@@ -1626,11 +1656,14 @@ export class YjsEvoluHistoryEngine {
           // The journal references rows in sql.js, so checkpoint their arrival
           // before any vault write can make recovery necessary.
           const incomingPersistStartedAt = Date.now();
+          this.inboxProgressPhase = "saving";
+          this.reportInboxProgress();
           await this.persistLocalDb?.();
           incomingPersistMs = Date.now() - incomingPersistStartedAt;
           await this.applyJournalStore?.save(journal);
         }
         const applyStartedAt = Date.now();
+        this.inboxProgressPhase = "applying";
         const durableApplied = this.inboxProgressApplied;
         if (!(await this.applyJournalEntries(journal.entries, (appliedRows) => {
           this.reportInboxProgress(durableApplied + appliedRows);
@@ -1641,10 +1674,13 @@ export class YjsEvoluHistoryEngine {
         const applyMs = Date.now() - applyStartedAt;
 
         const checkpointPersistStartedAt = Date.now();
+        this.inboxProgressPhase = "saving";
+        this.reportInboxProgress();
         await this.persistLocalDb?.();
         const checkpointPersistMs = Date.now() - checkpointPersistStartedAt;
         await this.applyJournalStore?.clear();
         this.completeApplyJournal(journal);
+        this.syncEta.complete(etaBatch, rowCount);
         this.logInfo("Incremental inbox checkpoint committed", {
           paths: journal.entries.length,
           rows: rowCount,
@@ -1703,14 +1739,25 @@ export class YjsEvoluHistoryEngine {
     reportProgress?: (appliedRows: number) => void,
   ): Promise<boolean> {
     let appliedRows = 0;
+    const fileRows: PendingFileUpdateRow[] = [];
+    const settingRows: PendingSettingUpdateRow[] = [];
     for (const entry of entries) {
       const applied = entry.kind === "file"
-        ? await this.processPendingFilePath(entry.path, entry.rows)
-        : await this.processPendingSettingPath(entry.path, entry.rows);
+        ? await this.processPendingFilePath(entry.path, entry.rows, { markProcessed: false })
+        : await this.processPendingSettingPath(entry.path, entry.rows, { markProcessed: false });
       if (!applied) return false;
+      if (entry.kind === "file") fileRows.push(...entry.rows);
+      else settingRows.push(...entry.rows);
       appliedRows += entry.rows.length;
       reportProgress?.(appliedRows);
     }
+    // Every vault result and snapshot must exist before publishing any marker
+    // from this journal. Queue marker upserts together so Evolu can refresh its
+    // subscribed inbox queries once per chunk instead of once per path.
+    // Failure leaves the journal intact; replay is safe even if some snapshots
+    // or markers reached an automatic save before the final checkpoint.
+    await this.markFileRowsProcessed(fileRows);
+    await this.markSettingRowsProcessed(settingRows);
     return true;
   }
 
@@ -2045,9 +2092,13 @@ export class YjsEvoluHistoryEngine {
     return null;
   }
 
-  private async processPendingFilePath(path: string, rows: PendingFileUpdateRow[]): Promise<boolean> {
+  private async processPendingFilePath(
+    path: string,
+    rows: PendingFileUpdateRow[],
+    { markProcessed = true }: { markProcessed?: boolean } = {},
+  ): Promise<boolean> {
     if (!isTrackedVaultPath(path, this.localSyncConfig)) {
-      await this.markFileRowsProcessed(rows);
+      if (markProcessed) await this.markFileRowsProcessed(rows);
       return true;
     }
 
@@ -2085,7 +2136,7 @@ export class YjsEvoluHistoryEngine {
         }
       }
 
-      await this.markFileRowsProcessed(rows);
+      if (markProcessed) await this.markFileRowsProcessed(rows);
       this.pendingVaultSeed.delete(path);
       this.logInfo("Incremental file updates applied", { path, updates: rows.length });
       return true;
@@ -2158,9 +2209,13 @@ export class YjsEvoluHistoryEngine {
     return { id: rows[0].id as string, createdAt: rows[0].createdAt as string };
   }
 
-  private async processPendingSettingPath(path: string, rows: PendingSettingUpdateRow[]): Promise<boolean> {
+  private async processPendingSettingPath(
+    path: string,
+    rows: PendingSettingUpdateRow[],
+    { markProcessed = true }: { markProcessed?: boolean } = {},
+  ): Promise<boolean> {
     if (!this.localSyncConfig.syncObsidianSettings || !isTrackedSettingPath(path, this.localSyncConfig)) {
-      await this.markSettingRowsProcessed(rows);
+      if (markProcessed) await this.markSettingRowsProcessed(rows);
       return true;
     }
 
@@ -2171,13 +2226,13 @@ export class YjsEvoluHistoryEngine {
       const latest = await this.loadLatestSettingUpdateForPath(path);
       if (current !== null && latest && latest.contentHash === currentHash) {
         this.logInfo("Recovered interrupted remote setting application", { path });
-        await this.applyRemoteSettingUpdate(latest);
+        if (!(await this.applyRemoteSettingUpdate(latest))) return false;
       } else if (current !== null && snapshot?.contentHash !== currentHash) {
         await this.advertiseSettingContent(path, current, currentHash ?? hashText(current));
       } else {
-        if (latest) await this.applyRemoteSettingUpdate(latest);
+        if (latest && !(await this.applyRemoteSettingUpdate(latest))) return false;
       }
-      await this.markSettingRowsProcessed(rows);
+      if (markProcessed) await this.markSettingRowsProcessed(rows);
       this.pendingSettingSeed.delete(path);
       this.logInfo("Incremental setting updates applied", { path, updates: rows.length });
       return true;
@@ -2468,6 +2523,9 @@ export class YjsEvoluHistoryEngine {
     this.inboxProgressKeys.clear();
     this.inboxProgressDiscovered = 0;
     this.inboxProgressApplied = 0;
+    this.inboxProgressDisplayed = 0;
+    this.inboxProgressPhase = "applying";
+    this.syncEta.reset();
     this.inboxProgressTotal = null;
     this.inboxProgressTotalPromise = null;
     this.inboxQuietTicks = 0;
@@ -2612,7 +2670,7 @@ export class YjsEvoluHistoryEngine {
         return false;
       }
 
-      await this.saveLocalSnapshot(path, st);
+      await this.saveLocalSnapshot(path, st, { skipIfUnchanged: true });
 
       st.doc.destroy();
       return true;
@@ -2978,16 +3036,29 @@ export class YjsEvoluHistoryEngine {
     };
   }
 
-  private async saveLocalSnapshot(path: string, st: FileState) {
+  private async saveLocalSnapshot(
+    path: string,
+    st: FileState,
+    { skipIfUnchanged = false }: { skipIfUnchanged?: boolean } = {},
+  ) {
     const snapshotBytes = Y.encodeStateAsUpdate(st.doc);
     const snapshotBase64 = toBase64(snapshotBytes);
+    const acknowledged = this.acknowledgedSnapshots.get(st.doc);
+    if (skipIfUnchanged && acknowledged?.path === path && acknowledged.snapshotBase64 === snapshotBase64) return;
     const id = createIdFromString<"FileSnapshot">(`snapshot:${path}`);
-    this.evolu.upsert("_fileSnapshot", {
+    const token = {};
+    this.snapshotSaveTokens.set(st.doc, token);
+    const result = this.evolu.upsert("_fileSnapshot", {
       id,
       path,
       snapshotBase64,
       contentHash: hashText(st.text.toString()),
-    });
+    }, { onComplete: () => {
+      if (this.snapshotSaveTokens.get(st.doc) === token) {
+        this.acknowledgedSnapshots.set(st.doc, { path, snapshotBase64 });
+      }
+    } });
+    if (result && !result.ok) throw new Error("Failed to save file snapshot");
   }
 
   /**
@@ -2999,6 +3070,11 @@ export class YjsEvoluHistoryEngine {
    * delete row on every subsequent startup.
    */
   private tombstoneSnapshot(path: string) {
+    const state = this.states.get(path);
+    if (state) {
+      this.acknowledgedSnapshots.delete(state.doc);
+      this.snapshotSaveTokens.delete(state.doc);
+    }
     const id = createIdFromString<"FileSnapshot">(`snapshot:${path}`);
     this.evolu.upsert("_fileSnapshot", { id, path, snapshotBase64: "DELETED", contentHash: null });
   }

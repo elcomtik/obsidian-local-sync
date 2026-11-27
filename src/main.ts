@@ -14,6 +14,7 @@ import {
 import { createEvoluClient, generateMnemonic, type CloseEvoluDb, type PersistEvoluDb } from "./evoluClient";
 import type { PlatformIO } from "./sqliteDriver";
 import { Mnemonic } from "@evolu/common";
+import { createProgressNoticeFragment, type ProgressNoticeData } from "./progressNotice";
 import type { Evolu } from "@evolu/common";
 import type { Database } from "../src-core/schema";
 import {
@@ -36,8 +37,9 @@ import {
 } from "../src-core/pathPolicy";
 import { formatLogLine } from "../src-core/logFormat";
 import { ObsidianVaultAdapter } from "./obsidianVaultAdapter";
-import { replaceAdapterFileFromTemp } from "./adapterAtomicFile";
+import { MOBILE_BINARY_CHUNK_BYTES, replaceAdapterBinaryFileFromBytes, replaceAdapterFileFromTemp } from "./adapterAtomicFile";
 import { createDeviceId, createReplacementDeviceId } from "./deviceId";
+import { migrateInboxSettings } from "./inboxSettings";
 
 /**
  * Stop promise from the most recently unloaded plugin instance.
@@ -61,6 +63,7 @@ type PluginSettings = {
   historyPollMs: number;
   historyBatchSize: number;
   inboxCheckpointBatchPaths: number;
+  inboxDefaultsVersion: number;
   outgoingBatchMs: number;
   maxOpenDocs: number;
   vaultScanDebugProgressEveryFiles: number;
@@ -97,6 +100,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
   historyPollMs: 1000,
   historyBatchSize: 500,
   inboxCheckpointBatchPaths: DEFAULT_INBOX_CHECKPOINT_BATCH_PATHS,
+  inboxDefaultsVersion: 1,
   outgoingBatchMs: 500,
   maxOpenDocs: 50,
   vaultScanDebugProgressEveryFiles: DEFAULT_VAULT_SCAN_DEBUG_PROGRESS_EVERY_FILES,
@@ -286,12 +290,6 @@ function logError(message: string, data?: unknown) {
   console.error(formatLogLine("ERROR", message, data));
 }
 
-function exactArrayBuffer(data: Uint8Array): ArrayBuffer {
-  const copy = new Uint8Array(data.byteLength);
-  copy.set(data);
-  return copy.buffer;
-}
-
 function normalizedDirname(path: string): string {
   const slash = path.lastIndexOf("/");
   return slash < 0 ? "" : path.slice(0, slash);
@@ -345,38 +343,9 @@ async function cleanupStaleAdapterTempFiles(
   }
 }
 
-type ResetProgress = {
-  message: string;
-  current?: number;
-  total?: number;
-};
+type ResetProgress = ProgressNoticeData;
 
 type ResetProgressReporter = (progress: ResetProgress) => void;
-
-function createProgressNoticeFragment(progress: ResetProgress): DocumentFragment {
-  const fragment = document.createDocumentFragment();
-  const container = document.createElement("div");
-  container.addClass("localsync-progress-notice");
-
-  const label = document.createElement("div");
-  label.textContent = progress.message;
-  container.appendChild(label);
-
-  if (progress.total !== undefined) {
-    const bar = document.createElement("progress");
-    bar.max = progress.total;
-    bar.value = progress.current ?? 0;
-    container.appendChild(bar);
-
-    const detail = document.createElement("div");
-    detail.addClass("localsync-progress-detail");
-    detail.textContent = `${progress.current ?? 0} / ${progress.total}`;
-    container.appendChild(detail);
-  }
-
-  fragment.appendChild(container);
-  return fragment;
-}
 
 function formatMaterializationRepairSummary(result: MaterializationRepairResult): string {
   const planned = result.files.planned + result.settings.planned;
@@ -481,17 +450,9 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
         const tempPath = `${dbPath}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
         const adapter = this.app.vault.adapter;
         await cleanupStaleAdapterTempFiles(adapter, dbPath);
-        try {
-          await adapter.writeBinary(tempPath, exactArrayBuffer(data));
-          await replaceAdapterFileFromTemp(adapter, tempPath, dbPath);
-        } catch (error) {
-          try {
-            if (await adapter.exists(tempPath)) await adapter.remove(tempPath);
-          } catch {
-            // Best effort cleanup only.
-          }
-          throw error;
-        }
+        await replaceAdapterBinaryFileFromBytes(adapter, tempPath, dbPath, data, {
+          chunkBytes: Platform.isMobile ? MOBILE_BINARY_CHUNK_BYTES : undefined,
+        });
       },
       deleteFile: async () => {
         const adapter = this.app.vault.adapter;
@@ -628,21 +589,13 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
     // ----------------------------
     // Active / inactive tracking
     // ----------------------------
-    this.registerDomEvent(window, "focus", () => {
-      void this.engine?.setActive();
-    });
-
-    this.registerDomEvent(window, "blur", () => {
-      this.engine?.setInactive();
-    });
-
-    this.registerDomEvent(document, "visibilitychange", () => {
-      if (document.visibilityState === "visible") {
-        void this.engine?.setActive();
-      } else {
-        this.engine?.setInactive();
-      }
-    });
+    const updateVisibility = () => {
+      this.engine?.setAppVisible(document.visibilityState === "visible");
+    };
+    this.registerDomEvent(window, "focus", updateVisibility);
+    this.registerDomEvent(window, "blur", updateVisibility);
+    this.registerDomEvent(document, "visibilitychange", updateVisibility);
+    updateVisibility();
   }
 
   onunload() {
@@ -672,8 +625,9 @@ export default class ObsidianLocalSyncPlugin extends Plugin {
 
   async loadSettings() {
     const saved = (await this.loadData()) as Partial<PluginSettings> | null;
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
-    let migrated = false;
+    const inboxSettings = migrateInboxSettings(saved);
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved, inboxSettings);
+    let migrated = saved?.inboxDefaultsVersion !== inboxSettings.inboxDefaultsVersion;
 
     if (
       saved &&
