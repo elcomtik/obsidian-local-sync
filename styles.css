@@ -42,19 +42,69 @@
   width: 100%;
 }
 
-.localsync-progress-notice {
-  min-width: 14rem;
+.notice-container .notice:has(.localsync-progress-notice) {
+  align-items: stretch;
+  border-radius: 10px;
+  padding: 8px 12px;
 }
 
-.localsync-progress-notice progress {
-  display: block;
-  margin-top: 0.5rem;
+.notice-container .notice:has(.localsync-progress-notice) .notice-message {
+  flex: 1 1 0;
+  min-width: 0;
   width: 100%;
 }
 
+.localsync-progress-notice {
+  display: grid;
+  gap: 4px 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  line-height: 1.2;
+  min-width: 0;
+  width: 100%;
+}
+
+.localsync-progress-notice > :nth-child(-n + 3) {
+  grid-column: 1 / -1;
+}
+
+.localsync-progress-notice progress {
+  appearance: none;
+  border: 0;
+  border-radius: 99px;
+  display: block;
+  height: 3px;
+  min-height: 3px;
+  max-height: 3px;
+  margin: 0;
+  width: 100%;
+}
+
+.localsync-progress-notice progress::-webkit-progress-bar {
+  background-color: rgba(127, 127, 127, 0.3);
+  border-radius: 99px;
+}
+
+.localsync-progress-notice progress::-webkit-progress-value {
+  background-color: var(--interactive-accent);
+  border-radius: 99px;
+}
+
 .localsync-progress-detail {
-  color: var(--text-muted);
-  font-size: 0.85em;
-  margin-top: 0.25rem;
+  color: inherit;
+  font-size: 0.8em;
+  margin: 0;
+  opacity: 0.85;
   text-align: right;
+}
+
+.localsync-progress-notice > :nth-child(4) {
+  grid-column: 2;
+  grid-row: 4;
+}
+
+.localsync-progress-notice > :nth-child(5) {
+  grid-column: 1;
+  grid-row: 4;
+  opacity: 0.65;
+  text-align: left;
 }

@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Improve catch-up with ordered inbox indexes, coalesced automatic database
+  saves, clean-checkpoint detection, batched processed markers, and fewer
+  unchanged Yjs snapshot writes.
+- Reload pending inbox pages at checkpoint boundaries instead of after every
+  snapshot mutation, retaining relay delivery and journal recovery ordering.
+- Bound mobile database adapter writes to 256 KiB while retaining journal and
+  persistence barriers. Desktop keeps the single-write adapter path.
+- Raise the checkpoint default from 50 to 100 paths. Existing plugin defaults
+  migrate once; custom sizes and subsequent user choices are preserved.
+- Show compact sync progress with change counts, saving/application phases and
+  an approximate ETA based on fully saved checkpoints.
+- Continue syncing when a loaded Obsidian window loses focus or visibility,
+  while excluding hidden intervals from ETA sampling. Mobile OS suspension
+  can still interrupt execution.
+
+### Fixed
+
+- Include `styles.css` in published plugin ZIPs and installation instructions.
+- Refresh the full pending total at checkpoint boundaries after an initially
+  short inbox page; include saved work and hide ETA when counting fails.
+- Retain pending work after failed remote setting writes.
+- Propagate database flush failures and persist dirty state on driver disposal.
+
 ## 0.8.6 — 2026-11-24
 
 ### Security

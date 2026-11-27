@@ -90,11 +90,12 @@ jobs:
         with:
           name: plugin-dist
           # upload-artifact strips the common dist/ prefix when all paths share it,
-          # so downstream jobs receive main.js, main.js.map, manifest.json at root.
+          # so downstream jobs receive main.js, main.js.map, manifest.json, styles.css at root.
           path: |
             dist/main.js
             dist/main.js.map
             dist/manifest.json
+            dist/styles.css
           retention-days: 7
 
       - uses: actions/upload-artifact@v7
@@ -130,7 +131,8 @@ jobs:
           zip -j "obsidian-local-sync-${{ github.ref_name }}.zip" \
             plugin-dist/main.js \
             plugin-dist/main.js.map \
-            plugin-dist/manifest.json
+            plugin-dist/manifest.json \
+            plugin-dist/styles.css
 
           zip -j "obsidian-local-sync-daemon-${{ github.ref_name }}.zip" \
             daemon-dist/main.js \
@@ -146,8 +148,8 @@ jobs:
             ## Installation
 
             1. Download `obsidian-local-sync-${{ github.ref_name }}.zip`.
-            2. Unzip — you get `main.js`, `main.js.map`, and `manifest.json`.
-            3. Copy all three files to `<vault>/.obsidian/plugins/obsidian-local-sync/`.
+            2. Unzip — you get `main.js`, `main.js.map`, `manifest.json`, and `styles.css`.
+            3. Copy all four files to `<vault>/.obsidian/plugins/obsidian-local-sync/`.
             4. Reload Obsidian → enable the plugin.
 
             ## Daemon

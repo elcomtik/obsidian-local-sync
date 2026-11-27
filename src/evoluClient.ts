@@ -135,6 +135,15 @@ export function createEvoluClient(
     indexes: (create) => [
       create("fileUpdatePathCreatedAt").on("fileUpdate").columns(["path", "createdAt"]),
       create("settingUpdatePathCreatedAt").on("settingUpdate").columns(["path", "createdAt"]),
+      // Inbox subscriptions traverse all paths in history order. The per-path
+      // indexes above cannot serve that ordering, forcing a full scan and sort
+      // on every snapshot/processed-marker mutation during catch-up.
+      create("fileUpdateInboxOrder")
+        .on("fileUpdate")
+        .columns(["isDeleted", "createdAt", "id"]),
+      create("settingUpdateInboxOrder")
+        .on("settingUpdate")
+        .columns(["isDeleted", "createdAt", "id"]),
       create("processedFileUpdateSourceVersion")
         .on("_processedFileUpdate")
         .columns(["sourceId", "sourceVersion"]),
