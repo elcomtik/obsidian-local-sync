@@ -1005,6 +1005,204 @@ test("large journal marker groups remain bounded to 250 upserts per mutation chu
   } finally { h.destroy(); }
 });
 
+function makeSubscribedJournalFixture(count = 3) {
+  const h = makeJournalBatchFixture(count);
+  const remote = new Map([...h.e.pendingFileInbox.values()].map((row: any) => [row.id, row]));
+  const settings = new Map<string, any>();
+  const listeners = new Map<string, Set<() => void>>();
+  const retired: Array<() => void> = [];
+  const rows = new Map<string, any[]>();
+  const loads: string[] = [], subscribedMutations: string[] = [];
+  let failLoad = false;
+  h.e.pendingFileInbox.clear();
+  h.e.localSyncConfig = { ...h.e.localSyncConfig, syncObsidianSettings: true };
+  h.e.createPendingFileUpdateQuery = () => "files";
+  h.e.createPendingSettingUpdateQuery = () => "settings";
+  const unprocessed = (source: Map<string, any>) => [...source.values()].filter((row) =>
+    ![...h.markers.values()].some((marker) => marker.sourceId === row.id && marker.sourceVersion === row.sourceVersion));
+  h.e.evolu.subscribeQuery = (query: string) => (listener: () => void) => {
+    const group = listeners.get(query) ?? new Set(); listeners.set(query, group); group.add(listener);
+    return () => { group.delete(listener); retired.push(listener); };
+  };
+  h.e.evolu.getQueryRows = (query: string) => rows.get(query) ?? [];
+  h.e.evolu.loadQuery = async (query: string) => {
+    if (query !== "files" && query !== "settings") return [];
+    loads.push(query);
+    if (failLoad) { failLoad = false; throw new Error("synthetic inbox reload failure"); }
+    const result = unprocessed(query === "files" ? remote : settings);
+    rows.set(query, result);
+    return result;
+  };
+  const upsert = h.e.evolu.upsert;
+  h.e.evolu.upsert = (table: string, row: any, options: any) => {
+    if ([...listeners.values()].some((group) => group.size)) subscribedMutations.push(table);
+    return upsert(table, row, options);
+  };
+  const originalDestroy = h.destroy;
+  return {
+    ...h, remote, settings, loads, retired, subscribedMutations,
+    // Preserve fixture getters rather than spreading their current values.
+    get journal() { return h.journal; }, get persists() { return h.persists; }, get clears() { return h.clears; },
+    listenerCount: () => [...listeners.values()].reduce((sum, group) => sum + group.size, 0),
+    failReload() { failLoad = true; },
+    async start() {
+      h.e.isActive = false;
+      await h.e.startInboxSubscriptions();
+      h.e.isActive = true;
+    },
+    destroy() { h.e.stopInboxSubscriptions(); originalDestroy(); },
+  };
+}
+
+test("journal application unsubscribes inboxes and awaits one fresh page load per boundary", async () => {
+  const h = makeSubscribedJournalFixture(30);
+  try {
+    await h.start();
+    assert.equal(h.listenerCount(), 2);
+    await h.e.runIncrementalInbox();
+    assert.equal(h.files.size, 30); assert.equal(h.markers.size, 30);
+    assert.deepEqual(h.subscribedMutations, []);
+    assert.deepEqual(h.loads, ["files", "settings", "files", "settings"]);
+    assert.equal(h.listenerCount(), 2); assert.equal(h.e.inboxRefreshNeeded, false);
+    assert.equal(h.persists, 2); assert.equal(h.clears, 1);
+  } finally { h.destroy(); }
+});
+
+test("remote changes arriving while inboxes are detached are discovered at the boundary", async () => {
+  const h = makeSubscribedJournalFixture(1);
+  const first = [...h.remote.values()][0] as any;
+  const doc = new Y.Doc(); Y.applyUpdate(doc, Buffer.from(first.updateBase64, "base64"));
+  doc.getText("content").insert(doc.getText("content").length, " later");
+  const newer = { ...first, sourceVersion: "2026-11-27T11:00:00.000Z", updateBase64: Buffer.from(Y.encodeStateAsUpdate(doc)).toString("base64") };
+  doc.destroy();
+  const write = h.vault.writeText;
+  let delivered = false;
+  h.vault.writeText = async (path, content) => {
+    await write(path, content);
+    if (!delivered) {
+      delivered = true;
+      assert.equal(h.listenerCount(), 0);
+      h.remote.set(newer.id, newer);
+      h.settings.set("late-setting", {
+        id: "late-setting", path: ".obsidian/app.json", contentBase64: Buffer.from("{}").toString("base64"),
+        contentHash: "synthetic", encoding: "raw", type: null,
+        createdAt: "2026-11-27T11:00:00.000Z", sourceVersion: "2026-11-27T11:00:00.000Z",
+      });
+      h.e.loadLatestSettingUpdateForPath = async () => h.settings.get("late-setting");
+    }
+  };
+  try {
+    await h.start(); await h.e.runIncrementalInbox();
+    assert.equal(h.files.get(first.path), "remote 0 later");
+    assert.equal(h.files.get(".obsidian/app.json"), "{}");
+    assert.equal(h.markers.size, 3); assert.equal(h.clears, 2);
+    assert.equal(h.listenerCount(), 2); assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+for (const failure of ["file", "marker", "checkpoint", "journal"] as const) {
+  test(`subscriptions recover after a ${failure} failure without retiring pending work`, async () => {
+    const h = makeSubscribedJournalFixture();
+    const save = h.e.applyJournalStore.save;
+    try {
+      await h.start();
+      if (failure === "file") h.failWrite("batch/1.md");
+      if (failure === "marker") h.failMarker(true);
+      if (failure === "checkpoint") h.failFinalPersist(true);
+      if (failure === "journal") h.e.applyJournalStore.save = async () => { throw new Error("journal write failed"); };
+      await h.e.runIncrementalInbox();
+      assert.equal(h.listenerCount(), 2); assert.equal(h.e.inboxSubscriptionsSuspended, false);
+      assert.equal(h.clears, 0); assert.equal(h.e.pendingFileInbox.size, 3);
+      h.failWrite(""); h.failMarker(false); h.failFinalPersist(false); h.e.applyJournalStore.save = save;
+      await h.e.runIncrementalInbox();
+      assert.equal(h.files.size, 3); assert.equal(h.markers.size, 3);
+      assert.equal(h.clears, 1); assert.deepEqual(h.outgoing, []);
+    } finally { h.destroy(); }
+  });
+}
+
+test("a failed boundary reload blocks caught-up and is retried even with an empty queue", async () => {
+  const h = makeSubscribedJournalFixture(1);
+  const write = h.vault.writeText;
+  h.vault.writeText = async (path, content) => { await write(path, content); h.failReload(); };
+  const statuses: string[] = [];
+  h.e.reportSyncProgress = (p: SyncProgress) => statuses.push(p.status);
+  try {
+    await h.start(); await h.e.runIncrementalInbox();
+    assert.equal(h.e.pendingFileInbox.size, 0); assert.equal(h.e.inboxRefreshNeeded, true);
+    await h.e.handleHistoryQuietTick(); await h.e.handleHistoryQuietTick();
+    assert.equal(statuses.includes("caught-up"), false);
+    await h.e.runIncrementalInbox();
+    assert.equal(h.e.inboxRefreshNeeded, false); assert.equal(h.listenerCount(), 2);
+    assert.equal(h.files.size, 1); assert.equal(h.clears, 1);
+  } finally { h.destroy(); }
+});
+
+test("stopping during a journal cannot resurrect subscriptions or consume retired callbacks", async () => {
+  const h = makeSubscribedJournalFixture(1);
+  const write = h.vault.writeText;
+  let stopped: Promise<void> | undefined;
+  h.vault.writeText = async (path, content) => { await write(path, content); stopped = h.e.stop(false); };
+  try {
+    await h.start(); await h.e.runIncrementalInbox(); await stopped;
+    assert.equal(h.listenerCount(), 0); assert.equal(h.e.inboxSubscriptionsEnabled, false);
+    for (const callback of h.retired) callback();
+    assert.equal(h.e.pendingFileInbox.size, 0); assert.equal(h.files.size, 1);
+  } finally { h.destroy(); }
+});
+
+test("configuration changes during a journal defer subscription restart to its boundary", async () => {
+  const h = makeSubscribedJournalFixture(1);
+  const write = h.vault.writeText;
+  h.vault.writeText = async (path, content) => {
+    await write(path, content);
+    await h.e.updateConfig({ ...h.e.config, historyBatchSize: 1000 });
+    assert.equal(h.listenerCount(), 0);
+  };
+  try {
+    await h.start(); await h.e.runIncrementalInbox();
+    assert.equal(h.listenerCount(), 2); assert.equal(h.e.config.historyBatchSize, 1000);
+  } finally { h.e.stopPollingTimer(); h.destroy(); }
+});
+
+test("late loads and retired listeners cannot requeue rows after subscription replacement", async () => {
+  const h = makeSubscribedJournalFixture(1);
+  const oldRows = [...h.remote.values()];
+  const load = h.e.evolu.loadQuery;
+  let resolveOld!: (rows: any[]) => void;
+  let first = true;
+  h.e.evolu.loadQuery = (query: string) => {
+    if (query === "files" && first) {
+      first = false;
+      return new Promise<any[]>((resolve) => { resolveOld = resolve; });
+    }
+    return load(query);
+  };
+  try {
+    h.e.isActive = false;
+    const oldLoad = h.e.startInboxSubscriptions();
+    h.e.stopInboxSubscriptions(); h.remote.clear();
+    await h.e.startInboxSubscriptions();
+    resolveOld(oldRows); await oldLoad;
+    h.e.evolu.getQueryRows = () => oldRows;
+    for (const callback of h.retired) callback();
+    assert.equal(h.e.pendingFileInbox.size, 0);
+    assert.equal(h.listenerCount(), 2); assert.equal(h.e.inboxRefreshNeeded, false);
+  } finally { h.destroy(); }
+});
+
+test("a rejected initial load is retried without requiring another incoming mutation", async () => {
+  const h = makeSubscribedJournalFixture(1);
+  try {
+    h.failReload();
+    await assert.rejects(h.start(), /inbox reload failure/);
+    h.e.isActive = true;
+    await h.e.runIncrementalInbox();
+    assert.equal(h.files.size, 1); assert.equal(h.clears, 1);
+    assert.equal(h.e.inboxRefreshNeeded, false); assert.equal(h.listenerCount(), 2);
+  } finally { h.destroy(); }
+});
+
 for (const paths of [100, 200]) {
   test(`${paths}-path checkpoint keeps the same two durability barriers and one journal`, async () => {
     const h = makeJournalBatchFixture(paths);

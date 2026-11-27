@@ -279,14 +279,43 @@ exclude concurrent edits; none changed. No note contents were printed or saved
 in the report. This is strong sample evidence, not an exhaustive content audit.
 The private report retains the random seed, sampled paths and hashes.
 
-Recommended next candidate: reduce redundant inbox-query reloads during a journal
-application, then reload at the checkpoint boundary. Relay delivery and canonical
-persistence must remain active. If implemented by temporarily unsubscribing inbox
-queries, explicitly test new source versions/deletes arriving during the interval,
-late query responses, subscription restoration after every error path, startup
-journal replay and absence of skipped work/echoes. This is a proposal, not part of
-the current build. Complete those tests before using another real-vault restore
-to measure it; a reset is unnecessary merely to repeat the current diagnosis.
+### Boundary reload candidate (installed, awaiting phone reset trial)
+
+The installed local test build detaches only the pending file/settings inbox subscriptions
+while applying a journal and performing its persistence barriers. Relay delivery,
+canonical mutations and autosave stay active. After success or failure it restores
+subscriptions and awaits both pending pages before taking more journal work.
+The initial load is drained before detachment because Evolu caches load promises.
+Generation guards ignore retired listeners and late load callbacks. A rejected
+reload prevents `caught-up` and is retried by the existing poll timer even if the
+in-memory pending map is empty. Stop prevents reattachment; configuration changes
+during application take effect at the next boundary. Startup journal recovery
+still occurs before subscriptions are started. Batch timing/ETA include the
+boundary reload.
+
+Tests cover callback retirement, initial and boundary load failure, vault/marker/
+journal/final-save failure, stop during a checkpoint and configuration changes
+while detached. An offline integration test uses real Evolu 7 and the sql.js
+adapter, not a query-cache mock. It injects a newer source version, new file,
+remote delete, setting update and intentional local edit while detached, verifies
+fresh pending pages and final contents, and checks that only the intentional edit
+produces an outgoing update. Snapshot mutations execute no subscribed inbox reads
+in that test. **127 tests pass**, plus typechecking, plugin build and daemon smoke.
+This establishes automated behavior, not a new real-phone throughput result.
+
+The candidate was installed after a graceful stop/flush and private backup.
+Database and settings hashes were preserved during installation. Main bundle
+SHA-256: `078ea6623679f271989f8f186912e052affd0a37d67a5c48110ed6f1921141ef`.
+After restart the phone retained 2,357 Markdown notes, the same owner/device,
+zero phone-origin file updates, two active inbox subscriptions, empty pending
+queues and `caught-up` with no Evolu error. The defaults migration recorded its
+one-time marker and retained checkpoint 100, LRU 50 and inbox page 500. No reset
+was triggered during installation; package/manifest remain unreleased 0.8.6.
+
+The next phone restore should retain checkpoint cap 100, LRU 50 and inbox page
+500. Compare checkpoint phase times and event-loop stalls against the recorded
+baseline, then repeat path/content validation after catch-up. Publish no speedup
+claim until that trial completes.
 
 ## Untried options
 

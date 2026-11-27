@@ -424,6 +424,11 @@ export class YjsEvoluHistoryEngine {
   } | null = null;
   private isStopped = false;
   private unsubscribers: Array<() => void> = [];
+  private inboxSubscriptionsEnabled = false;
+  private inboxSubscriptionsSuspended = false;
+  private inboxSubscriptionGeneration = 0;
+  private inboxRefreshNeeded = false;
+  private inboxLoadPromise: Promise<void> = Promise.resolve();
   /** Resolves when current inbox/manual-repair work completes. Awaited by stop(). */
   private ongoingPoll: Promise<void> = Promise.resolve();
 
@@ -573,7 +578,10 @@ export class YjsEvoluHistoryEngine {
       this.isStopped = false;
       await this.initializeIncrementalInbox();
       await this.recoverApplyJournal();
-      this.startInboxSubscriptions();
+      void this.startInboxSubscriptions().catch((error) => {
+        this.logError("Initial inbox load failed", error);
+        this.reportInboxBlocked();
+      });
       this.startPollingTimer();
       this.startRescanTimer();
       this.logInfo("Engine started", this.config);
@@ -1084,7 +1092,7 @@ export class YjsEvoluHistoryEngine {
       this.config = newConfig;
       this.stopPollingTimer();
       this.startPollingTimer();
-      this.startInboxSubscriptions();
+      await this.startInboxSubscriptions();
       await this.enforceLruLimit();
       this.logInfo("Engine config updated", this.config);
     } catch (e) {
@@ -1312,19 +1320,32 @@ export class YjsEvoluHistoryEngine {
     this.pollTimer = null;
   }
 
-  private startInboxSubscriptions() {
-    this.stopInboxSubscriptions();
+  private startInboxSubscriptions(): Promise<void> {
+    this.inboxSubscriptionsEnabled = true;
+    if (this.isStopped || this.inboxSubscriptionsSuspended) return Promise.resolve();
+    return this.refreshInboxSubscriptions();
+  }
+
+  private refreshInboxSubscriptions(): Promise<void> {
+    this.detachInboxSubscriptions();
+    const generation = this.inboxSubscriptionGeneration;
+    const isCurrent = () => generation === this.inboxSubscriptionGeneration &&
+      !this.isStopped && !this.inboxSubscriptionsSuspended;
+    this.inboxRefreshNeeded = true;
+    this.fileInboxInitialized = false;
+    this.settingInboxInitialized = !this.localSyncConfig.syncObsidianSettings;
 
     const fileQuery = this.createPendingFileUpdateQuery();
     const settingQuery = this.createPendingSettingUpdateQuery();
-
     const consumeFileRows = (rows: ReadonlyArray<any>) => {
+      if (!isCurrent()) return;
       this.fileInboxInitialized = true;
       this.fileInboxPageSaturated = rows.length >= this.config.historyBatchSize;
       this.enqueuePendingFileRows(rows);
       void this.ensureInboxProgressTotal();
     };
     const consumeSettingRows = (rows: ReadonlyArray<any>) => {
+      if (!isCurrent()) return;
       this.settingInboxInitialized = true;
       this.settingInboxPageSaturated = rows.length >= this.config.historyBatchSize;
       this.enqueuePendingSettingRows(rows);
@@ -1342,17 +1363,23 @@ export class YjsEvoluHistoryEngine {
           consumeSettingRows(this.evolu.getQueryRows(settingQuery) as ReadonlyArray<any>);
         }),
       );
-    } else {
-      this.settingInboxInitialized = true;
     }
 
-    void this.evolu.loadQuery(fileQuery).then((rows) => consumeFileRows(rows as ReadonlyArray<any>));
-    if (this.localSyncConfig.syncObsidianSettings) {
-      void this.evolu.loadQuery(settingQuery).then((rows) => consumeSettingRows(rows as ReadonlyArray<any>));
-    }
+    // Await both initial pages before pausing. Evolu caches in-flight loads;
+    // retiring a listener alone does not cancel its promise or its result.
+    this.inboxLoadPromise = Promise.all([
+      this.evolu.loadQuery(fileQuery).then(consumeFileRows),
+      this.localSyncConfig.syncObsidianSettings
+        ? this.evolu.loadQuery(settingQuery).then(consumeSettingRows)
+        : Promise.resolve(),
+    ]).then(() => {
+      if (isCurrent()) this.inboxRefreshNeeded = false;
+    });
+    return this.inboxLoadPromise;
   }
 
-  private stopInboxSubscriptions() {
+  private detachInboxSubscriptions() {
+    this.inboxSubscriptionGeneration++;
     for (const unsubscribe of this.unsubscribers) {
       try {
         unsubscribe();
@@ -1361,6 +1388,12 @@ export class YjsEvoluHistoryEngine {
       }
     }
     this.unsubscribers = [];
+  }
+
+  private stopInboxSubscriptions() {
+    this.inboxSubscriptionsEnabled = false;
+    this.inboxRefreshNeeded = false;
+    this.detachInboxSubscriptions();
   }
 
   private createPendingFileUpdateQuery() {
@@ -1638,10 +1671,17 @@ export class YjsEvoluHistoryEngine {
 
   private async runIncrementalInbox() {
     if (this.inboxRunning || this.isStopped || !this.isActive) return;
-    if (!this.createNextApplyJournal()) return;
+    if (!this.inboxRefreshNeeded && !this.createNextApplyJournal()) return;
 
     this.inboxRunning = true;
     const run = this.ongoingPoll.then(async () => {
+      if (this.inboxSubscriptionsEnabled) {
+        // A rejected initial/boundary load is retried by the quiet timer. Never
+        // treat an unrefreshed empty inbox as proof that catch-up is complete.
+        await this.inboxLoadPromise.catch(() => {});
+        if (this.isStopped) return;
+        if (this.inboxRefreshNeeded) await this.refreshInboxSubscriptions();
+      }
       await this.ensureInboxProgressTotal();
       while (!this.isStopped && this.isActive) {
         const existingJournal = await this.applyJournalStore?.load();
@@ -1651,46 +1691,60 @@ export class YjsEvoluHistoryEngine {
         const etaBatch = this.syncEta.begin();
         const rowCount = journal.entries.reduce((sum, entry) => sum + entry.rows.length, 0);
         let incomingPersistMs = 0;
+        let committedMetrics: { applyMs: number; checkpointPersistMs: number } | undefined;
 
-        if (!existingJournal) {
-          // The journal references rows in sql.js, so checkpoint their arrival
-          // before any vault write can make recovery necessary.
-          const incomingPersistStartedAt = Date.now();
+        // Snapshot/marker mutations would otherwise rerun the history inbox
+        // queries for every path. Relay delivery and automatic saves continue;
+        // reload the latest pending pages after the journal's durable boundary.
+        this.inboxSubscriptionsSuspended = true;
+        this.detachInboxSubscriptions();
+        try {
+          if (!existingJournal) {
+            // The journal references rows in sql.js, so checkpoint their arrival
+            // before any vault write can make recovery necessary.
+            const incomingPersistStartedAt = Date.now();
+            this.inboxProgressPhase = "saving";
+            this.reportInboxProgress();
+            await this.persistLocalDb?.();
+            incomingPersistMs = Date.now() - incomingPersistStartedAt;
+            await this.applyJournalStore?.save(journal);
+          }
+          const applyStartedAt = Date.now();
+          this.inboxProgressPhase = "applying";
+          const durableApplied = this.inboxProgressApplied;
+          if (!(await this.applyJournalEntries(journal.entries, (appliedRows) => {
+            this.reportInboxProgress(durableApplied + appliedRows);
+          }))) {
+            this.reportInboxBlocked();
+            break;
+          }
+          const applyMs = Date.now() - applyStartedAt;
+
+          const checkpointPersistStartedAt = Date.now();
           this.inboxProgressPhase = "saving";
           this.reportInboxProgress();
           await this.persistLocalDb?.();
-          incomingPersistMs = Date.now() - incomingPersistStartedAt;
-          await this.applyJournalStore?.save(journal);
+          const checkpointPersistMs = Date.now() - checkpointPersistStartedAt;
+          await this.applyJournalStore?.clear();
+          this.completeApplyJournal(journal);
+          committedMetrics = { applyMs, checkpointPersistMs };
+        } finally {
+          this.inboxSubscriptionsSuspended = false;
+          if (this.inboxSubscriptionsEnabled && !this.isStopped) {
+            await this.refreshInboxSubscriptions();
+          }
         }
-        const applyStartedAt = Date.now();
-        this.inboxProgressPhase = "applying";
-        const durableApplied = this.inboxProgressApplied;
-        if (!(await this.applyJournalEntries(journal.entries, (appliedRows) => {
-          this.reportInboxProgress(durableApplied + appliedRows);
-        }))) {
-          this.reportInboxBlocked();
-          break;
+        if (committedMetrics) {
+          // Include the boundary reload in completed-batch timing and ETA.
+          this.syncEta.complete(etaBatch, rowCount);
+          this.logInfo("Incremental inbox checkpoint committed", {
+            paths: journal.entries.length, rows: rowCount,
+            recovered: existingJournal !== null && existingJournal !== undefined,
+            incomingPersistMs, ...committedMetrics,
+            elapsedMs: Date.now() - checkpointStartedAt,
+          });
+          this.reportInboxProgress();
         }
-        const applyMs = Date.now() - applyStartedAt;
-
-        const checkpointPersistStartedAt = Date.now();
-        this.inboxProgressPhase = "saving";
-        this.reportInboxProgress();
-        await this.persistLocalDb?.();
-        const checkpointPersistMs = Date.now() - checkpointPersistStartedAt;
-        await this.applyJournalStore?.clear();
-        this.completeApplyJournal(journal);
-        this.syncEta.complete(etaBatch, rowCount);
-        this.logInfo("Incremental inbox checkpoint committed", {
-          paths: journal.entries.length,
-          rows: rowCount,
-          recovered: existingJournal !== null && existingJournal !== undefined,
-          incomingPersistMs,
-          applyMs,
-          checkpointPersistMs,
-          elapsedMs: Date.now() - checkpointStartedAt,
-        });
-        this.reportInboxProgress();
       }
     });
     this.ongoingPoll = run.then(() => undefined, () => undefined);
@@ -2498,7 +2552,7 @@ export class YjsEvoluHistoryEngine {
 
   private async handleHistoryQuietTick() {
     if (this.isStopped || !this.isActive) return;
-    if (!this.fileInboxInitialized || !this.settingInboxInitialized) return;
+    if (this.inboxRefreshNeeded || !this.fileInboxInitialized || !this.settingInboxInitialized) return;
     if (
       this.inboxRunning ||
       this.fileMaterializerRunning ||

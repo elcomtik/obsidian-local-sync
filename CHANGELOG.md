@@ -7,6 +7,8 @@
 - Improve catch-up with ordered inbox indexes, coalesced automatic database
   saves, clean-checkpoint detection, batched processed markers, and fewer
   unchanged Yjs snapshot writes.
+- Reload pending inbox pages at checkpoint boundaries instead of after every
+  snapshot mutation, retaining relay delivery and journal recovery ordering.
 - Bound mobile database adapter writes to 256 KiB while retaining journal and
   persistence barriers. Desktop keeps the single-write adapter path.
 - Raise the checkpoint default from 50 to 100 paths. Existing plugin defaults
