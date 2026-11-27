@@ -1,7 +1,7 @@
 # Mobile Catch-up Performance
 
-Status: unreleased Evolu 7 optimizations, measured on Android on 2026-11-27.
-Proposed release: 0.9.0. Desktop Obsidian 1.15.1 acceptance and real-owner restore checks passed.
+Evolu 7 performance work for 0.9.0, measured on Android on 2026-11-27.
+Release: 0.9.0. Desktop Obsidian 1.15.1 acceptance and real-owner restore checks passed.
 
 ## Where the time went
 
