@@ -342,3 +342,33 @@ A repeat 100-vs-200 checkpoint experiment would need identical input snapshots
 and a page containing enough distinct paths to exercise the cap. Prioritize the
 redundant query-refresh candidate and outstanding compatibility/recovery checks;
 there is no need to delay this release for every remaining optimization.
+
+### Total-refresh correction during the timed reset
+
+The reset started at the user's reported 22:23 Europe/Bratislava. During the
+trial, the initial inbox had only 113 rows while relay delivery continued. The
+engine cached that partial total, then grew it from discovered pages despite
+the database having received more than 12,000 file updates. Early percentage
+and ETA readings were therefore misleading.
+
+The correction refreshes total work after each boundary reload: saved rows plus
+the full pending count when either page is saturated; otherwise saved rows plus
+the pending maps suffice. It retains discovered/displayed lower bounds. Counts
+run at boundaries, not per file. Stale-generation results are ignored, and a
+failed count suppresses ETA until a later refresh succeeds. Regression coverage
+includes a short initial page followed by unseen pending pages, count failure/
+retry and real Evolu pagination. **129 tests**, typechecking, plugin build and
+daemon smoke pass.
+
+The user explicitly authorized replacing the running build during the timed
+restore. Record the upgrade interval separately; total wall time remains from
+22:23, but this is a mixed-build run. Restart preserves durable progress and
+starts the displayed count/ETA window for the remaining work.
+
+The count fix was installed during that restore after a graceful checkpoint/flush
+and verified private backup. Bundle SHA-256:
+`8fd77d54eb98ce07d63fd328ef8f600dd1929841752059cf05b67ba32deed08d`.
+The phone resumed with unchanged owner/peer and 1,721 Markdown notes. Its total
+correctly showed **7,687 remaining**, complementing **5,012 saved** before the
+restart (12,699 overall). Limits stayed 100/50/500; ETA samples restarted. Final
+wall time and content verification remain pending.

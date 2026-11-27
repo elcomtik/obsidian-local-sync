@@ -21,6 +21,8 @@
 
 ### Fixed
 
+- Refresh the full pending total at checkpoint boundaries after an initially
+  short inbox page; include saved work and hide ETA when counting fails.
 - Retain pending work after failed remote setting writes.
 - Propagate database flush failures and persist dirty state on driver disposal.
 

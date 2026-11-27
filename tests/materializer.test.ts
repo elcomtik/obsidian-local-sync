@@ -1018,6 +1018,8 @@ function makeSubscribedJournalFixture(count = 3) {
   h.e.localSyncConfig = { ...h.e.localSyncConfig, syncObsidianSettings: true };
   h.e.createPendingFileUpdateQuery = () => "files";
   h.e.createPendingSettingUpdateQuery = () => "settings";
+  h.e.createPendingFileUpdateCountQuery = () => "file-count";
+  h.e.createPendingSettingUpdateCountQuery = () => "setting-count";
   const unprocessed = (source: Map<string, any>) => [...source.values()].filter((row) =>
     ![...h.markers.values()].some((marker) => marker.sourceId === row.id && marker.sourceVersion === row.sourceVersion));
   h.e.evolu.subscribeQuery = (query: string) => (listener: () => void) => {
@@ -1026,10 +1028,14 @@ function makeSubscribedJournalFixture(count = 3) {
   };
   h.e.evolu.getQueryRows = (query: string) => rows.get(query) ?? [];
   h.e.evolu.loadQuery = async (query: string) => {
+    if (query === "file-count" || query === "setting-count") {
+      loads.push(query);
+      return [{ count: unprocessed(query === "file-count" ? remote : settings).length }];
+    }
     if (query !== "files" && query !== "settings") return [];
     loads.push(query);
     if (failLoad) { failLoad = false; throw new Error("synthetic inbox reload failure"); }
-    const result = unprocessed(query === "files" ? remote : settings);
+    const result = unprocessed(query === "files" ? remote : settings).slice(0, h.e.config.historyBatchSize);
     rows.set(query, result);
     return result;
   };
@@ -1200,6 +1206,58 @@ test("a rejected initial load is retried without requiring another incoming muta
     await h.e.runIncrementalInbox();
     assert.equal(h.files.size, 1); assert.equal(h.clears, 1);
     assert.equal(h.e.inboxRefreshNeeded, false); assert.equal(h.listenerCount(), 2);
+  } finally { h.destroy(); }
+});
+
+test("boundary refresh replaces a short initial total with the full newly arrived backlog", async () => {
+  const h = makeSubscribedJournalFixture(1);
+  h.e.config.historyBatchSize = 3;
+  const write = h.vault.writeText;
+  let delivered = false;
+  h.vault.writeText = async (path, content) => {
+    await write(path, content);
+    if (!delivered) {
+      delivered = true;
+      const state = makeYjsTextDoc("later history");
+      const updateBase64 = Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString("base64"); state.doc.destroy();
+      for (let i = 0; i < 4; i++) h.remote.set(`later-${i}`, {
+        id: `later-${i}`, path: `later/${i}.md`, updateBase64, type: null,
+        createdAt: "2026-11-27T12:00:00.000Z", sourceVersion: "2026-11-27T12:00:00.000Z",
+      });
+      h.e.isActive = false;
+    }
+  };
+  try {
+    await h.start(); assert.equal(h.e.inboxProgressTotal, 1);
+    await h.e.runIncrementalInbox();
+    assert.equal(h.e.inboxProgressApplied, 1);
+    assert.equal(h.e.pendingFileInbox.size, 3, "only the first page is loaded");
+    assert.equal(h.e.inboxProgressTotal, 5, "total includes saved work plus all pending rows, including unseen pages");
+    assert.deepEqual(h.loads.filter((q) => q.endsWith("-count")), ["file-count", "setting-count"]);
+    h.e.isActive = true; await h.e.runIncrementalInbox();
+    assert.equal(h.files.size, 5); assert.equal(h.e.inboxProgressApplied, 5);
+    assert.equal(h.e.inboxProgressTotal, 5); assert.deepEqual(h.outgoing, []);
+  } finally { h.destroy(); }
+});
+
+test("failed full counts hide ETA and a later refresh can recover without changing inbox work", async () => {
+  const h = makeSubscribedJournalFixture(1);
+  const progress: any[] = [];
+  h.e.reportSyncProgress = (p: SyncProgress) => progress.push(p);
+  try {
+    h.e.fileInboxInitialized = h.e.settingInboxInitialized = true;
+    h.e.fileInboxPageSaturated = true;
+    h.e.inboxProgressDiscovered = 30; h.e.inboxProgressApplied = 25;
+    h.e.syncEta.complete(h.e.syncEta.begin(0), 100, 60_000);
+    h.e.syncEta.complete(h.e.syncEta.begin(60_000), 100, 120_000);
+    h.e.loadPendingInboxCount = async () => { throw new Error("count failed"); };
+    await h.e.ensureInboxProgressTotal(true);
+    assert.equal(h.e.inboxProgressTotal, null); assert.equal(progress.at(-1).etaSeconds, undefined);
+    h.e.loadPendingInboxCount = async () => 100;
+    await h.e.ensureInboxProgressTotal(true);
+    assert.equal(h.e.inboxProgressTotal, 125);
+    assert.equal(progress.at(-1).etaSeconds, 60);
+    assert.equal(h.e.pendingFileInbox.size, 0); assert.equal(h.clears, 0);
   } finally { h.destroy(); }
 });
 

@@ -18,6 +18,7 @@ function encoded(content: string) {
 test("real Evolu reloads detached inboxes without losing remote or local changes", { timeout: 10_000 }, async (t) => {
   let driver: any, engine: any;
   let inboxReadsWhileSuspended = 0, inboxReads = 0;
+  const totals: number[] = [];
   const inner = createPersistentSqlJsDriver({ readFile: async () => null, writeFile: async () => {} });
   const deps = {
     console: createConsole(), randomBytes: createRandomBytes(), time: createTime(), reloadApp() {},
@@ -100,11 +101,12 @@ test("real Evolu reloads detached inboxes without losing remote or local changes
   };
   engine = new YjsEvoluHistoryEngine({
     evolu, vault, deviceId: "test-phone", logLevel: "off",
-    config: { historyPollMs: 60_000, historyBatchSize: 500, inboxCheckpointBatchPaths: 100,
+    config: { historyPollMs: 60_000, historyBatchSize: 2, inboxCheckpointBatchPaths: 100,
       outgoingBatchMs: 100, maxOpenDocs: 50, vaultScanDebugProgressEveryFiles: 100,
       vaultScanDebugProgressEveryMs: 10_000, vaultScanInfoProgressEveryMs: 60_000, vaultRescanWatchdogMs: 900_000 },
     localSyncConfig: { ...DEFAULT_LOCAL_SYNC_CONFIG, startupScan: false, syncObsidianSettings: true,
       periodicRescanSeconds: 0, settingsRescanSeconds: 0 },
+    reportSyncProgress: (progress) => { if (progress.status === "syncing" && progress.total !== undefined) totals.push(progress.total); },
     persistLocalDb: async () => { await driver.persist(); },
     applyJournalStore: { async load() { return journal; }, async save(value) { journal = value; }, async clear() { journal = null; } },
   });
@@ -124,6 +126,7 @@ test("real Evolu reloads detached inboxes without losing remote or local changes
   assert.equal(journal, null);
   assert.equal(engine.pendingFileInbox.size + engine.pendingSettingInbox.size, 0);
   assert.equal(engine.inboxRefreshNeeded, false);
+  assert.equal(Math.max(...totals), 6, "full total includes saved work and pending rows outside the current page");
   assert.equal(inboxReadsWhileSuspended, 0, "snapshot mutations must not reload detached inbox queries");
   assert.ok(inboxReads > readsBeforeApply, "boundary must execute fresh inbox reads");
   const authored = await evolu.loadQuery(evolu.createQuery((db) => db.selectFrom("fileUpdate")

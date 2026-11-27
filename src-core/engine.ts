@@ -1372,7 +1372,9 @@ export class YjsEvoluHistoryEngine {
       this.localSyncConfig.syncObsidianSettings
         ? this.evolu.loadQuery(settingQuery).then(consumeSettingRows)
         : Promise.resolve(),
-    ]).then(() => {
+    ]).then(async () => {
+      if (!isCurrent()) return;
+      await this.ensureInboxProgressTotal(true);
       if (isCurrent()) this.inboxRefreshNeeded = false;
     });
     return this.inboxLoadPromise;
@@ -1540,23 +1542,35 @@ export class YjsEvoluHistoryEngine {
     return fileCount + settingCount;
   }
 
-  private async ensureInboxProgressTotal(): Promise<void> {
-    if (this.inboxProgressTotal !== null) return;
+  private async ensureInboxProgressTotal(refresh = false): Promise<void> {
+    // A short first page can precede the rest of relay history. Recount once
+    // per boundary, not per path, instead of caching that early total forever.
+    if (refresh && this.inboxProgressTotalPromise) await this.inboxProgressTotalPromise;
+    if (this.isStopped || (!refresh && this.inboxProgressTotal !== null)) return;
     if (!this.fileInboxInitialized || !this.settingInboxInitialized) return;
     if (!this.fileInboxPageSaturated && !this.settingInboxPageSaturated) {
-      this.inboxProgressTotal = this.inboxProgressDiscovered;
+      this.inboxProgressTotal = Math.max(
+        this.inboxProgressDiscovered, this.inboxProgressDisplayed,
+        this.inboxProgressApplied + this.pendingFileInbox.size + this.pendingSettingInbox.size,
+      );
       this.reportInboxProgress();
       return;
     }
     if (!this.inboxProgressTotalPromise) {
+      const generation = this.inboxSubscriptionGeneration;
       this.inboxProgressTotalPromise = this.loadPendingInboxCount()
         .then((count) => {
-          this.inboxProgressTotal = Math.max(count, this.inboxProgressDiscovered);
+          if (this.isStopped || generation !== this.inboxSubscriptionGeneration) return;
+          this.inboxProgressTotal = Math.max(
+            this.inboxProgressApplied + count, this.inboxProgressDiscovered, this.inboxProgressDisplayed,
+          );
           this.reportInboxProgress();
         })
         .catch((error) => {
+          if (this.isStopped || generation !== this.inboxSubscriptionGeneration) return;
           this.logWarn("Pending inbox count failed", error);
-          this.inboxProgressTotal = this.inboxProgressDiscovered;
+          this.inboxProgressTotal = null;
+          this.reportInboxProgress();
         })
         .finally(() => {
           this.inboxProgressTotalPromise = null;
@@ -1647,7 +1661,9 @@ export class YjsEvoluHistoryEngine {
       unit: "changes",
       // Completed, saved batches include both IO barriers. Per-file progress
       // must not imply a faster durable rate or an already-completed restore.
-      etaSeconds: this.syncEta.estimateSeconds(total - this.inboxProgressApplied),
+      etaSeconds: this.inboxProgressTotal === null
+        ? undefined
+        : this.syncEta.estimateSeconds(total - this.inboxProgressApplied),
     });
   }
 
